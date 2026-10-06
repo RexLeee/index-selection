@@ -1,0 +1,37 @@
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
+
+import pytest
+
+from isel.config import Config, load_config
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "config" / "isel.toml"
+
+
+def replace(cfg: Config, section: str, **values) -> Config:
+    return dataclasses.replace(cfg, **{section: dataclasses.replace(getattr(cfg, section),
+                                                                    **values)})
+
+
+def small_cfg(work_dir: Path) -> Config:
+    cfg = load_config([BASE])
+    cfg = replace(cfg, "run", work_dir=str(work_dir))
+    cfg = replace(cfg, "pull", sample_percent=100.0)
+    cfg = replace(cfg, "dataset", neg_rate=0.5, first_label_batch=2)
+    cfg = replace(cfg, "model", num_boost_round=150, early_stopping_rounds=20,
+                  params={**cfg.model.params, "num_leaves": 15, "min_data_in_leaf": 20,
+                          "num_threads": 2, "learning_rate": 0.1})
+    cfg = replace(cfg, "eval", test_batches=[5, 6, 7, 8], k_values=[500, 1000],
+                  k_headline=1000, fractions=[0.1], gain_curve_k=[250, 1000, 4000],
+                  bootstrap_samples=50)
+    cfg = replace(cfg, "duckdb", threads=2, memory_limit="2GB",
+                  max_temp_directory_size="2GB")
+    return replace(cfg, "manifest", index_shards=4)
+
+
+@pytest.fixture
+def base_cfg() -> Config:
+    return load_config([BASE])

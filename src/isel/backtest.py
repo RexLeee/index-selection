@@ -1,0 +1,233 @@
+"""Experiments: forward-chained backtest, frozen training, forward evaluation, selection."""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+
+from isel.config import Config
+from isel.dataset import to_numpy, train_batches, training_matrix
+from isel.evaluate import calibration, evaluate_batch, golden_by_tag, pooled, render_report
+from isel.features import FeatureStore, resolve_set
+from isel.golden import read_golden
+from isel.io import atomic_write_json, open_duckdb, utc_id
+from isel.manifest import write_run
+from isel.model import (
+    FORWARD_ONLY,
+    RULE_BASELINES,
+    TrainedModel,
+    case_control_offset,
+    fit_lgbm,
+    fit_logreg,
+    rule_score,
+)
+
+
+def _store(cfg: Config, work_dir: Path, next_batch: bool = False) -> FeatureStore:
+    return FeatureStore(cfg, open_duckdb(cfg, work_dir / "duckdb_tmp"), work_dir, next_batch)
+
+
+def _model_name(feature_set: str) -> str:
+    return f"lgbm:{feature_set}"
+
+
+def _importance(model: TrainedModel, top: int) -> list[tuple[str, float]]:
+    if model.booster is None:
+        return []
+    gains = model.booster.feature_importance(importance_type="gain")
+    pairs = sorted(zip(model.features, gains.tolist(), strict=True), key=lambda p: -p[1])
+    return pairs[:top]
+
+
+def _fit_all(cfg: Config, store: FeatureStore, batches: list[int], feature_sets: list[str],
+             baselines: list[str]) -> dict[str, TrainedModel]:
+    sets = list(dict.fromkeys([*feature_sets,
+                               *(["v1_features"] if "v1_features" in baselines else [])]))
+    needed = list(dict.fromkeys(f for s in sets for f in resolve_set(cfg, s)))
+    m = training_matrix(store, batches, needed)
+    offset = case_control_offset(store.rate, cfg.dataset.neg_rate)
+    models = {_model_name(fs): fit_lgbm(cfg, m, resolve_set(cfg, fs), offset)
+              for fs in feature_sets}
+    if "v1_features" in baselines:
+        models["v1_features"] = fit_lgbm(cfg, m, resolve_set(cfg, "v1_features"), offset,
+                                         kind="v1_features")
+    if "logreg" in baselines:
+        models["logreg"] = fit_logreg(cfg, m, resolve_set(cfg, cfg.model.feature_set), offset)
+    return models
+
+
+def _evaluate(cfg: Config, store: FeatureStore, batch: int, models: dict[str, TrainedModel],
+              rules: list[str], reference: str, golden_rows: list[dict[str, Any]]
+              ) -> tuple[dict[str, Any], dict[str, dict[str, set]], dict[str, Any]]:
+    frame = store.frame(batch, "eval")
+    raw = {name: m.raw_score(frame) for name, m in models.items()}
+    scores = {**raw, **{r: rule_score(cfg, r, frame) for r in rules}}
+    golden = golden_by_tag(golden_rows, batch, cfg.golden.tags, key_prefix=batch)
+    result, hits = evaluate_batch(cfg, frame, scores, golden, store.rate, reference)
+    b = store.batch(batch)
+    result.update(
+        as_of=b.as_of, created_at=b.created_at, forward=b.created_at > store.snapshot_at,
+        leaky_in_backtest=[r for r in rules if r in FORWARD_ONLY],
+        calibration={n: calibration(m.probability(raw[n]), frame, store.rate, golden)
+                     for n, m in models.items() if m.booster is not None},
+        models={n: {**m.meta, "importance_gain_top": _importance(m, 15)}
+                for n, m in models.items()})
+    queries = {tag: g.queries for tag, g in golden.items()}
+    return result, hits, queries
+
+
+def run_backtest(cfg: Config, work_dir: Path, feature_sets: list[str],
+                 baselines: list[str]) -> Path:
+    """Trains on batches before each test batch and evaluates every scorer on it."""
+    store = _store(cfg, work_dir)
+    golden_rows = read_golden(work_dir).to_pylist()
+    reference = _model_name(cfg.model.feature_set)
+    if cfg.model.feature_set not in feature_sets:
+        feature_sets = [cfg.model.feature_set, *feature_sets]
+    rules = [b for b in baselines if b in RULE_BASELINES]
+    batches_out: dict[str, Any] = {}
+    all_queries: dict[str, dict] = defaultdict(dict)
+    all_hits: dict[str, dict[str, set]] = defaultdict(lambda: defaultdict(set))
+    for t in cfg.eval.test_batches:
+        train = train_batches(cfg, store, t)
+        if not store.has_history(t):
+            batches_out[str(t)] = {"skipped": "no golden history before this batch"}
+            continue
+        if len(train) < 2:
+            batches_out[str(t)] = {"skipped": f"needs >= 2 training batches, has {train}"}
+            continue
+        models = _fit_all(cfg, store, train, feature_sets, baselines)
+        result, hits, queries = _evaluate(cfg, store, t, models, rules, reference, golden_rows)
+        batches_out[str(t)] = result
+        for tag, q in queries.items():
+            all_queries[tag].update(q)
+        for name, by_tag in hits.items():
+            for tag, found in by_tag.items():
+                all_hits[name][tag] |= {(t, u) for u in found}
+    keyed_queries = {tag: {k: {(k[0], u) for u in urls} for k, urls in q.items()}
+                     for tag, q in all_queries.items()}
+    results = {
+        "title": "Forward-chained backtest",
+        "reference": reference, "k_headline": cfg.eval.k_headline,
+        "sample_rate": store.rate, "snapshot_at": store.snapshot_at,
+        "config_sha256": cfg.sha256(), "batches": batches_out,
+        "pooled": pooled(cfg, keyed_queries, all_hits, reference) if all_queries else {},
+    }
+    out = work_dir / "backtests" / utc_id()
+    atomic_write_json(out / "results.json", results)
+    (out / "report.md").write_text(render_report(results), encoding="utf-8")
+    return out
+
+
+def train_frozen(cfg: Config, work_dir: Path, baselines: list[str]) -> Path:
+    """Trains on every batch visible at the snapshot and saves the models for later."""
+    store = _store(cfg, work_dir, next_batch=True)
+    target = store.batches[-1].batch_id
+    train = train_batches(cfg, store, target)
+    if not train:
+        raise RuntimeError("no batch with golden history is visible at the snapshot")
+    models = _fit_all(cfg, store, train, [cfg.model.feature_set],
+                      [b for b in baselines if b == "v1_features"])
+    out = work_dir / "models" / utc_id()
+    for name, model in models.items():
+        model.meta.update(snapshot_at=store.snapshot_at, trained_at=datetime.now(UTC),
+                          config_sha256=cfg.sha256(), name=name)
+        model.save(out / name.replace(":", "_"))
+    return out
+
+
+def _load_models(model_dir: Path) -> dict[str, TrainedModel]:
+    models = {}
+    for sub in sorted(p for p in model_dir.iterdir() if (p / "meta.json").exists()):
+        model = TrainedModel.load(sub)
+        models[model.meta.get("name", sub.name)] = model
+    if not models:
+        raise FileNotFoundError(f"no models under {model_dir}")
+    return models
+
+
+def forward_eval(cfg: Config, work_dir: Path, model_dir: Path, batch: int,
+                 baselines: list[str]) -> Path:
+    """Evaluates frozen models on a batch created after the snapshot."""
+    store = _store(cfg, work_dir)
+    models = _load_models(model_dir)
+    snapshots = {str(m.meta.get("snapshot_at")) for m in models.values()}
+    if snapshots != {str(store.snapshot_at)}:
+        raise RuntimeError(f"models were trained on snapshot(s) {snapshots}, "
+                           f"but the sample is {store.snapshot_at}")
+    if store.batch(batch).created_at <= store.snapshot_at:
+        raise RuntimeError(f"batch {batch} existed before the snapshot; use backtest")
+    reference = _model_name(cfg.model.feature_set)
+    rules = [b for b in baselines if b in RULE_BASELINES]
+    result, _, _ = _evaluate(cfg, store, batch, models, rules, reference,
+                             read_golden(work_dir).to_pylist())
+    result["leaky_in_backtest"] = []
+    results = {"title": f"Forward evaluation on batch {batch}", "reference": reference,
+               "k_headline": cfg.eval.k_headline, "sample_rate": store.rate,
+               "snapshot_at": store.snapshot_at, "model_dir": str(model_dir),
+               "config_sha256": cfg.sha256(), "batches": {str(batch): result}, "pooled": {}}
+    out = work_dir / "forward_evals" / f"batch={batch}_{utc_id()}"
+    atomic_write_json(out / "results.json", results)
+    (out / "report.md").write_text(render_report(results), encoding="utf-8")
+    return out
+
+
+def _reasons(model: TrainedModel, frame: pa.Table, top_n: int) -> list[list[str]]:
+    if top_n == 0 or model.booster is None:
+        return [[] for _ in range(frame.num_rows)]
+    contrib = model.booster.predict(to_numpy(frame, model.features), pred_contrib=True)[:, :-1]
+    order = np.argsort(-np.abs(contrib), axis=1)[:, :top_n]
+    return [[f"{model.features[j]}:{contrib[i, j]:+.3f}" for j in row]
+            for i, row in enumerate(order)]
+
+
+def select_sample(cfg: Config, work_dir: Path, model_dir: Path, k: int) -> dict[str, Any]:
+    """Selects the sample's share of a K-list and writes it as a manifest run.
+
+    The rows are the sample rows whose rank is within round(K·p); this exercises
+    the manifest contract at sample scale without touching any database.
+    """
+    store = _store(cfg, work_dir, next_batch=True)
+    models = _load_models(model_dir)
+    model = models[_model_name(cfg.model.feature_set)]
+    target = store.batches[-1].batch_id
+    frame = store.frame(target, "eval")
+    frame = frame.filter(frame.column("is_sample"))
+    frame = frame.filter(pc.is_valid(frame.column("dkey")))
+    scores = np.nan_to_num(model.raw_score(frame), nan=-np.inf)
+    h = frame.column("h").to_numpy(zero_copy_only=False).astype(np.uint64)
+    order = np.lexsort((h, -scores))
+    keep = np.sort(order[:max(1, round(k * store.rate))])
+    chosen = frame.take(pa.array(keep))
+    rows = pa.table({
+        "url": chosen.column("url"),
+        "canonical_url": chosen.column("url"),
+        "domain_key": chosen.column("dkey"),
+        "crawl_shard": chosen.column("shard"),
+        "score": pa.array(scores[keep]),
+        "reason": pa.array(_reasons(model, chosen, cfg.manifest.reason_top_n),
+                           pa.list_(pa.string())),
+    })
+    rows = _dedupe(rows)
+    return write_run(cfg, rows, work_dir / "selection", utc_id(),
+                     {"scope": "sample", "k": k, "sample_rate": store.rate,
+                      "snapshot_at": store.snapshot_at, "model_dir": str(model_dir)})
+
+
+def _dedupe(rows: pa.Table) -> pa.Table:
+    """Keeps the best-scored row per canonical URL (cross-shard duplicates)."""
+    order = pc.sort_indices(rows, sort_keys=[("score", "descending")])
+    rows = rows.take(order)
+    seen: set[str] = set()
+    keep = []
+    for i, url in enumerate(rows.column("canonical_url").to_pylist()):
+        if url not in seen:
+            seen.add(url)
+            keep.append(i)
+    return rows.take(pa.array(keep, pa.int64()))

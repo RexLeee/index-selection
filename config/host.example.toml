@@ -1,0 +1,11 @@
+# Host2 (ntu-sa2) overlay. Copy to config/host.toml and pass as the second --config.
+[run]
+work_dir = "/home/r14725023/isel/work"
+
+[model.params]
+num_threads = 48
+
+[duckdb]
+threads = 48
+memory_limit = "200GB"
+max_temp_directory_size = "100GB"
