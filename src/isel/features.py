@@ -5,8 +5,10 @@ Leakage rules (see docs/DESIGN.md):
 * The pool of batch b is the crawled rows with `last_fetch_ok < as_of_b`, where
   `as_of_b = min(created_b - lead_h, snapshot_at)`. Each URL is fetched once,
   so this rebuilds the crawl as it stood before the batch existed.
-* Golden-derived features of batch b only use batches created at or before
-  `as_of_b`, decayed by age.
+* Golden-derived features of batch b only use batches created before b whose
+  rows were available (`available_at`) by `as_of_b`, decayed by age. Pseudo
+  batches are fetched after the official batch they extend, so they only reach
+  batches whose as-of time is later than their fetch time.
 * Columns the crawler derives from golden labels are in `FORBIDDEN` and can
   never enter a feature set.
 """
@@ -22,6 +24,7 @@ import duckdb
 import pyarrow as pa
 
 from isel.config import Config
+from isel.golden import OFFICIAL, golden_files
 from isel.io import read_json, sql_str
 from isel.urlnorm import DomainKeyer
 
@@ -125,6 +128,8 @@ class Batch:
     batch_id: int
     created_at: datetime
     as_of: datetime
+    available_at: datetime
+    official: bool
 
 
 def _ts(value: datetime) -> str:
@@ -168,21 +173,35 @@ class FeatureStore:
             f"regexp_extract(url, {sql_str(PATH_RE)}, 1) AS path, md5_number_lower(url) AS h "
             f"FROM ({' UNION ALL BY NAME '.join(parts)}) "
             "QUALIFY row_number() OVER (PARTITION BY url, shard ORDER BY is_sample DESC) = 1")
-        golden = sql_str(str(self.work_dir / "golden" / "golden.parquet"))
+        files = golden_files(self.work_dir, cfg.golden.use_pseudo)
+        golden = f"[{', '.join(sql_str(str(f)) for f in files)}]"
         excluded = list(cfg.golden.exclude_batches) or [-1]
         rows = con.execute(
-            f"SELECT batch_id, min(batch_created_at) FROM read_parquet({golden}) "
-            f"WHERE batch_id NOT IN ({', '.join(map(str, excluded))}) "
+            f"SELECT batch_id, min(batch_created_at), max(available_at), "
+            f"bool_and(label_source = {sql_str(OFFICIAL)}), count(DISTINCT label_source) "
+            f"FROM read_parquet({golden}) WHERE batch_id NOT IN ({', '.join(map(str, excluded))}) "
             "GROUP BY batch_id ORDER BY batch_id").fetchall()
+        mixed = [int(r[0]) for r in rows if r[4] > 1]
+        if mixed:
+            raise RuntimeError(f"batch ids {mixed} hold both official and pseudo rows; "
+                               "raise pseudo.id_offset")
         lead = timedelta(hours=cfg.golden.lead_h)
-        created = [(int(b), t) for b, t in rows]
+        self.batches = [Batch(int(b), t, min(t - lead, self.snapshot_at), a, bool(o))
+                        for b, t, a, o, _ in rows]
+        missing = [b.batch_id for b in self.batches
+                   if not (self.work_dir / "positives" / f"batch={b.batch_id}.parquet").exists()]
+        if missing:
+            raise RuntimeError(f"positives are missing for batches {missing}; run pull-positives")
         if next_batch:
-            created.append((created[-1][0] + 1 if created else 1, self.snapshot_at + lead))
-        self.batches = [Batch(b, t, min(t - lead, self.snapshot_at)) for b, t in created]
-        con.execute("CREATE OR REPLACE TEMP TABLE batches "
-                    "(batch_id BIGINT, created_at TIMESTAMPTZ, as_of TIMESTAMPTZ)")
-        con.executemany("INSERT INTO batches VALUES (?, ?, ?)",
-                        [(b.batch_id, b.created_at, b.as_of) for b in self.batches])
+            official = [b.batch_id for b in self.batches if b.official]
+            t = self.snapshot_at + lead
+            self.batches.append(Batch(max(official) + 1 if official else 1, t, self.snapshot_at,
+                                      t, True))
+        con.execute("CREATE OR REPLACE TEMP TABLE batches (batch_id BIGINT, "
+                    "created_at TIMESTAMPTZ, as_of TIMESTAMPTZ, available_at TIMESTAMPTZ)")
+        con.executemany("INSERT INTO batches VALUES (?, ?, ?, ?)",
+                        [(b.batch_id, b.created_at, b.as_of, b.available_at)
+                         for b in self.batches])
         con.execute(
             "CREATE OR REPLACE TEMP TABLE gold0 AS SELECT g.batch_id, g.query_id, g.raw_url, "
             "g.canonical_url, list_contains(g.tags, 'head') AS in_head, "
@@ -207,7 +226,7 @@ class FeatureStore:
             "CREATE OR REPLACE TEMP TABLE pairs AS SELECT s.batch_id AS src, d.batch_id AS dst, "
             f"pow(0.5, date_diff('second', s.created_at, d.as_of) / 86400.0 / {half_life}) AS w "
             "FROM batches s JOIN batches d "
-            "ON s.created_at < d.created_at AND s.created_at <= d.as_of")
+            "ON s.created_at < d.created_at AND s.available_at <= d.as_of")
         self._aggregates()
 
     def _host_keys(self) -> None:

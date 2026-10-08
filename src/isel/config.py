@@ -83,7 +83,42 @@ class GoldenCfg:
     lead_h: float
     tags: list[str]
     exclude_batches: list[int]
+    use_pseudo: bool
 
+
+@dataclass(frozen=True)
+class TrendsCfg:
+    geos: list[str]
+    hours: int
+    request_delay_s: float
+
+
+@dataclass(frozen=True)
+class SerpProviderCfg:
+    key_env: str
+    url: str
+    min_interval_s: float
+    budget: int
+    budget_period: str
+
+
+@dataclass(frozen=True)
+class SerpCfg:
+    num: int
+    timeout_s: float
+    retries: int
+    retry_backoff_s: float
+    providers: dict[str, SerpProviderCfg]
+
+
+@dataclass(frozen=True)
+class PseudoCfg:
+    id_offset: int
+    seed: int
+    gate_trend_jaccard: float
+    gate_provider_overlap: float
+    gate_drift_overlap: float
+    gate_positive_ratio: float
 
 
 @dataclass(frozen=True)
@@ -126,6 +161,7 @@ class EvalCfg:
     bootstrap_seed: int
     baselines: list[str]
     v2_formula: dict[str, float]
+    importance_top_n: int
 
 
 @dataclass(frozen=True)
@@ -151,6 +187,9 @@ class Config:
     routing: RoutingCfg
     pull: PullCfg
     golden: GoldenCfg
+    trends: TrendsCfg
+    serp: SerpCfg
+    pseudo: PseudoCfg
     features: FeaturesCfg
     dataset: DatasetCfg
     model: ModelCfg
@@ -173,6 +212,9 @@ class Config:
 
 
 _SCALARS = (int, float, str, bool)
+COURSE_SERP_KEY_ENV = "SERPAPI_KEY"   # the course's quota; never spend it
+SERP_PROVIDERS = ("serpapi", "serper")
+BUDGET_PERIODS = ("month", "total")   # free plan resets monthly; signup credits never do
 KNOWN_BASELINES = (
     "random", "inlinks", "ext", "domain_prior", "logreg", "v1_features",
     "url_score", "v2_baseline_v1",
@@ -310,6 +352,22 @@ def _validate_session(name: str, session: Mapping[str, str], g: GuardCfg, need: 
          f"{name}.session.statement_timeout must not exceed guard.timeout_cap_s")
 
 
+def _validate_serp(s: SerpCfg, need: Any) -> None:
+    need(set(s.providers) == set(SERP_PROVIDERS),
+         f"serp.providers must define exactly {SERP_PROVIDERS}")
+    for name, p in s.providers.items():
+        need(p.key_env != COURSE_SERP_KEY_ENV,
+             f"serp.providers.{name}.key_env must not be {COURSE_SERP_KEY_ENV}: "
+             "that is the course key")
+        need(p.budget >= 0 and p.budget_period in BUDGET_PERIODS,
+             f"serp.providers.{name} needs budget >= 0 and budget_period in {BUDGET_PERIODS}")
+        need(p.min_interval_s >= 0, f"serp.providers.{name}.min_interval_s must be >= 0")
+        need(p.url.startswith("https://"), f"serp.providers.{name}.url must be https")
+    need(s.num > 0 and s.retries >= 1 and s.timeout_s > 0,
+         "serp.num, serp.retries and serp.timeout_s must be > 0")
+    need(s.retry_backoff_s >= 0, "serp.retry_backoff_s must be >= 0")
+
+
 def _validate(cfg: Config) -> None:
     def need(ok: bool, message: str) -> None:
         if not ok:
@@ -329,6 +387,15 @@ def _validate(cfg: Config) -> None:
          "pull.shards must be valid shard ids")
     need(cfg.golden.lead_h >= 0, "golden.lead_h must be >= 0")
     need(bool(cfg.golden.tags), "golden.tags must not be empty")
+    need(bool(cfg.trends.geos) and 1 <= cfg.trends.hours <= 191,
+         "trends.geos must not be empty and trends.hours must be 1-191")
+    need(cfg.trends.request_delay_s >= 0, "trends.request_delay_s must be >= 0")
+    _validate_serp(cfg.serp, need)
+    p = cfg.pseudo
+    need(p.id_offset > 0, "pseudo.id_offset must be > 0")
+    need(all(0 <= g <= 1 for g in (p.gate_trend_jaccard, p.gate_provider_overlap,
+                                   p.gate_drift_overlap)) and p.gate_positive_ratio >= 0,
+         "pseudo overlap gates must be in [0, 1] and gate_positive_ratio >= 0")
     need(cfg.features.half_life_days > 0, "features.half_life_days must be > 0")
     need(cfg.features.eb_pseudo_hits > 0, "features.eb_pseudo_hits must be > 0")
     need(cfg.features.url_len_cap > 0, "features.url_len_cap must be > 0")
@@ -346,6 +413,7 @@ def _validate(cfg: Config) -> None:
     need(all(k > 0 for k in cfg.eval.k_values + cfg.eval.gain_curve_k), "K values must be > 0")
     need(all(0 < f <= 1 for f in cfg.eval.fractions), "eval.fractions must be in (0, 1]")
     need(cfg.eval.bootstrap_samples > 0, "eval.bootstrap_samples must be > 0")
+    need(cfg.eval.importance_top_n >= 0, "eval.importance_top_n must be >= 0")
     unknown = sorted(set(cfg.eval.baselines) - set(KNOWN_BASELINES))
     need(not unknown, f"eval.baselines has unknown names {unknown}")
     v2_keys = {"inlinks_cap", "ext_cap", "prior_cap", "w_inlinks", "w_ext", "w_url", "w_prior"}

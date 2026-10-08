@@ -73,6 +73,40 @@ title_chars = 300                        # page title prefix kept for later text
 lead_h = 30.0                            # as_of = batch created_at - lead_h
 tags = ["head", "random"]
 exclude_batches = []
+use_pseudo = false                       # true only in config/pseudo.toml (model M1)
+
+[trends]                                 # mirrors the official golden pool (WebSearchEngine Metric/)
+geos = ["US", "IN", "JP", "GB", "CA", "DE", "AU", "BR", "FR", "TW"]
+hours = 168
+request_delay_s = 2.0                    # between trendspy requests
+
+[serp]                                   # our own free-tier keys; never the course SERPAPI_KEY
+num = 10                                 # official organic call uses num=10, no gl/hl
+timeout_s = 30.0
+retries = 3                              # every attempt is charged to the ledger
+retry_backoff_s = 15.0
+
+[serp.providers.serpapi]                 # the official golden's own source
+key_env = "ISEL_SERPAPI_KEY"
+url = "https://serpapi.com/search.json"
+min_interval_s = 15.0                    # free plan: 250 searches per hour (checked 2026-10-08)
+budget = 250
+budget_period = "month"                  # the free plan resets monthly
+
+[serp.providers.serper]
+key_env = "ISEL_SERPER_KEY"
+url = "https://google.serper.dev/search"
+min_interval_s = 0.5
+budget = 2500
+budget_period = "total"                  # one-time signup credits
+
+[pseudo]
+id_offset = 10000                        # pseudo batch id = id_offset + n
+seed = 20261008                          # query sampling seed
+gate_trend_jaccard = 0.7                 # trendspy vs SerpApi trending keywords, mean over geos
+gate_provider_overlap = 0.7              # Serper vs SerpApi, same queries, same time
+gate_drift_overlap = 0.5                 # SerpApi now vs stored official URLs
+gate_positive_ratio = 0.6                # pseudo crawled-positive rate / official rate
 
 [features]
 half_life_days = 90.0                    # decay of older batches in golden-derived features
@@ -176,6 +210,7 @@ gain_curve_k = [1000000, 2000000, 4000000, 8000000, 16000000, 32000000, 64000000
 bootstrap_samples = 1000
 bootstrap_seed = 12345
 baselines = ["random", "inlinks", "ext", "domain_prior", "logreg", "v1_features"]
+importance_top_n = 15                    # gain importances kept per model in results
 
 [eval.v2_formula]                        # V2 baseline_v1, for forward-only comparison
 inlinks_cap = 10000.0

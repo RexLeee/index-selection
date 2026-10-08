@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,9 +14,16 @@ import pyarrow.compute as pc
 
 from isel.config import Config
 from isel.dataset import to_numpy, train_batches, training_matrix
-from isel.evaluate import calibration, evaluate_batch, golden_by_tag, pooled, render_report
+from isel.evaluate import (
+    Golden,
+    calibration,
+    evaluate_batch,
+    golden_by_tag,
+    pooled,
+    render_report,
+)
 from isel.features import FeatureStore, resolve_set
-from isel.golden import read_golden
+from isel.golden import PSEUDO, read_golden
 from isel.io import atomic_write_json, open_duckdb, utc_id
 from isel.manifest import write_run
 from isel.model import (
@@ -52,14 +60,37 @@ def _fit_all(cfg: Config, store: FeatureStore, batches: list[int], feature_sets:
     needed = list(dict.fromkeys(f for s in sets for f in resolve_set(cfg, s)))
     m = training_matrix(store, batches, needed)
     offset = case_control_offset(store.rate, cfg.dataset.neg_rate)
-    models = {_model_name(fs): fit_lgbm(cfg, m, resolve_set(cfg, fs), offset)
+    official = [store.batch(b) for b in batches if store.batch(b).official]
+    valid = max(official, key=lambda b: b.created_at).batch_id if official else None
+    models = {_model_name(fs): fit_lgbm(cfg, m, resolve_set(cfg, fs), offset, valid)
               for fs in feature_sets}
     if "v1_features" in baselines:
         models["v1_features"] = fit_lgbm(cfg, m, resolve_set(cfg, "v1_features"), offset,
-                                         kind="v1_features")
+                                         valid, kind="v1_features")
     if "logreg" in baselines:
         models["logreg"] = fit_logreg(cfg, m, resolve_set(cfg, cfg.model.feature_set), offset)
     return models
+
+
+def _batch_result(cfg: Config, store: FeatureStore, batch: int, frame: pa.Table,
+                  models: dict[str, TrainedModel], raw: dict[str, np.ndarray], rules: list[str],
+                  reference: str, golden_rows: list[dict[str, Any]]
+                  ) -> tuple[dict[str, Any], dict[str, dict[str, set]], dict[str, Golden]]:
+    """Scores, metrics, calibration and model notes of one evaluated batch."""
+    scores = {**raw, **{r: rule_score(cfg, r, frame) for r in rules}}
+    golden = golden_by_tag(golden_rows, batch, cfg.golden.tags, key_prefix=batch)
+    result, hits = evaluate_batch(cfg, frame, scores, golden, store.rate, reference)
+    b = store.batch(batch)
+    forward = b.created_at > store.snapshot_at
+    top = cfg.eval.importance_top_n
+    result.update(
+        as_of=b.as_of, created_at=b.created_at, forward=forward,
+        leaky_in_backtest=[] if forward else [r for r in rules if r in FORWARD_ONLY],
+        calibration={n: calibration(m.probability(raw[n]), frame, store.rate, golden)
+                     for n, m in models.items() if m.booster is not None},
+        models={n: {**m.meta, "importance_gain_top": _importance(m, top)}
+                for n, m in models.items()})
+    return result, hits, golden
 
 
 def _evaluate(cfg: Config, store: FeatureStore, batch: int, models: dict[str, TrainedModel],
@@ -67,19 +98,9 @@ def _evaluate(cfg: Config, store: FeatureStore, batch: int, models: dict[str, Tr
               ) -> tuple[dict[str, Any], dict[str, dict[str, set]], dict[str, Any]]:
     frame = store.frame(batch, "eval")
     raw = {name: m.raw_score(frame) for name, m in models.items()}
-    scores = {**raw, **{r: rule_score(cfg, r, frame) for r in rules}}
-    golden = golden_by_tag(golden_rows, batch, cfg.golden.tags, key_prefix=batch)
-    result, hits = evaluate_batch(cfg, frame, scores, golden, store.rate, reference)
-    b = store.batch(batch)
-    result.update(
-        as_of=b.as_of, created_at=b.created_at, forward=b.created_at > store.snapshot_at,
-        leaky_in_backtest=[r for r in rules if r in FORWARD_ONLY],
-        calibration={n: calibration(m.probability(raw[n]), frame, store.rate, golden)
-                     for n, m in models.items() if m.booster is not None},
-        models={n: {**m.meta, "importance_gain_top": _importance(m, 15)}
-                for n, m in models.items()})
-    queries = {tag: g.queries for tag, g in golden.items()}
-    return result, hits, queries
+    result, hits, golden = _batch_result(cfg, store, batch, frame, models, raw, rules, reference,
+                                         golden_rows)
+    return result, hits, {tag: g.queries for tag, g in golden.items()}
 
 
 def run_backtest(cfg: Config, work_dir: Path, feature_sets: list[str],
@@ -137,7 +158,8 @@ def train_frozen(cfg: Config, work_dir: Path, baselines: list[str]) -> Path:
     out = work_dir / "models" / utc_id()
     for name, model in models.items():
         model.meta.update(snapshot_at=store.snapshot_at, trained_at=datetime.now(UTC),
-                          config_sha256=cfg.sha256(), name=name)
+                          config_sha256=cfg.sha256(), name=name,
+                          use_pseudo=cfg.golden.use_pseudo)
         model.save(out / name.replace(":", "_"))
     return out
 
@@ -152,25 +174,79 @@ def _load_models(model_dir: Path) -> dict[str, TrainedModel]:
     return models
 
 
-def forward_eval(cfg: Config, work_dir: Path, model_dir: Path, batch: int,
+def _align(frame: pa.Table, base: pa.Table) -> pa.Table:
+    """Reorders `frame` into the (url, shard) row order of `base`."""
+    keys = list(zip(frame.column("url").to_pylist(), frame.column("shard").to_pylist(),
+                    strict=True))
+    index = {k: i for i, k in enumerate(keys)}
+    base_keys = zip(base.column("url").to_pylist(), base.column("shard").to_pylist(),
+                    strict=True)
+    order = [index.get(k, -1) for k in base_keys]
+    if len(index) != len(keys) or len(order) != len(keys) or -1 in order:
+        raise RuntimeError("the official and pseudo stores built different frames")
+    return frame.take(pa.array(order, pa.int64()))
+
+
+def _pseudo_overlap(work_dir: Path, snapshot_at: datetime, golden: dict[str, Golden],
+                    hits: dict[str, dict[str, set]]) -> dict[str, Any]:
+    """Splits each tag's golden URLs and hits by whether pseudo data known by S0 had them."""
+    rows = read_golden(work_dir, include_pseudo=True)
+    pseudo = rows.filter(pc.and_(pc.equal(rows.column("label_source"), PSEUDO),
+                                 pc.less_equal(rows.column("available_at"),
+                                               pa.scalar(snapshot_at, rows["available_at"].type))))
+    known = set(pseudo.column("raw_url").to_pylist()) | set(
+        pseudo.column("canonical_url").to_pylist())
+    out = {}
+    for tag, g in golden.items():
+        inside = {u for u in g.urls if u in known or g.canonical[u] in known}
+        out[tag] = {"golden_urls": len(g.urls), "in_pseudo": len(inside),
+                    "hits": {name: {"in_pseudo": len(by_tag[tag] & inside),
+                                    "not_in_pseudo": len(by_tag[tag] - inside)}
+                             for name, by_tag in hits.items()}}
+    return out
+
+
+def forward_eval(cfg: Config, work_dir: Path, model_dirs: list[Path], batch: int,
                  baselines: list[str]) -> Path:
-    """Evaluates frozen models on a batch created after the snapshot."""
-    store = _store(cfg, work_dir)
-    models = _load_models(model_dir)
-    snapshots = {str(m.meta.get("snapshot_at")) for m in models.values()}
-    if snapshots != {str(store.snapshot_at)}:
-        raise RuntimeError(f"models were trained on snapshot(s) {snapshots}, "
-                           f"but the sample is {store.snapshot_at}")
-    if store.batch(batch).created_at <= store.snapshot_at:
+    """Evaluates frozen models on a batch created after the snapshot.
+
+    Models trained with pseudo golden (`use_pseudo` in their meta) are scored on
+    features built with pseudo batches and named `<name>+pseudo`; the others use
+    official-only features. Frames are aligned by (url, shard), so every paired
+    difference compares the same rows. Only official golden is evaluated.
+    """
+    groups: dict[bool, dict[str, TrainedModel]] = defaultdict(dict)
+    for model_dir in model_dirs:
+        for name, model in _load_models(model_dir).items():
+            use = bool(model.meta.get("use_pseudo", False))
+            groups[use][f"{name}+pseudo" if use else name] = model
+    stores = {use: _store(replace(cfg, golden=replace(cfg.golden, use_pseudo=use)), work_dir)
+              for use in groups}
+    base_use = False not in stores   # official-only features when present
+    base = stores[base_use]
+    for use, models in groups.items():
+        snapshots = {str(m.meta.get("snapshot_at")) for m in models.values()}
+        if snapshots != {str(stores[use].snapshot_at)}:
+            raise RuntimeError(f"models were trained on snapshot(s) {snapshots}, "
+                               f"but the sample is {stores[use].snapshot_at}")
+    b = base.batch(batch)
+    if b.created_at <= base.snapshot_at:
         raise RuntimeError(f"batch {batch} existed before the snapshot; use backtest")
+    base_frame = base.frame(batch, "eval")
+    frames = {use: base_frame if use == base_use else _align(s.frame(batch, "eval"), base_frame)
+              for use, s in stores.items()}
+    raw = {name: m.raw_score(frames[use]) for use, models in groups.items()
+           for name, m in models.items()}
+    rules = [r for r in baselines if r in RULE_BASELINES]
     reference = _model_name(cfg.model.feature_set)
-    rules = [b for b in baselines if b in RULE_BASELINES]
-    result, _, _ = _evaluate(cfg, store, batch, models, rules, reference,
-                             read_golden(work_dir).to_pylist())
-    result["leaky_in_backtest"] = []
+    reference = reference if reference in raw else next(iter(raw))
+    models = {name: m for ms in groups.values() for name, m in ms.items()}
+    result, hits, golden = _batch_result(cfg, base, batch, base_frame, models, raw, rules,
+                                         reference, read_golden(work_dir).to_pylist())
+    result["pseudo_overlap"] = _pseudo_overlap(work_dir, base.snapshot_at, golden, hits)
     results = {"title": f"Forward evaluation on batch {batch}", "reference": reference,
-               "k_headline": cfg.eval.k_headline, "sample_rate": store.rate,
-               "snapshot_at": store.snapshot_at, "model_dir": str(model_dir),
+               "k_headline": cfg.eval.k_headline, "sample_rate": base.rate,
+               "snapshot_at": base.snapshot_at, "model_dirs": [str(d) for d in model_dirs],
                "config_sha256": cfg.sha256(), "batches": {str(batch): result}, "pooled": {}}
     out = work_dir / "forward_evals" / f"batch={batch}_{utc_id()}"
     atomic_write_json(out / "results.json", results)

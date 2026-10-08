@@ -43,7 +43,14 @@ selection/run=<id>/manifest  →  (future) fetcher → WARC → text → BM25 in
 
 | 路徑 | 內容 | 寫入者 |
 |---|---|---|
-| `golden/golden.parquet`、`summary.json` | 全部 golden 列和每批統計 | `pull-golden` |
+| `golden/golden.parquet`、`summary.json` | 全部官方 golden 列和每批統計 | `pull-golden` |
+| `golden/pool.parquet` | 每批完整的 trending 池（`metric_queries`，含沒被選的 query） | `pull-golden` |
+| `golden/pseudo/batch=<id>.parquet`、`.json` | 偽 golden 列；JSON 只放數字 | `pseudo-batch` |
+| `trends/snapshot=<id>/` | 10 個 geo 的 trending 原始列和 `_meta.json` | `trends-snapshot` |
+| `trends/compare/<a>_vs_<b>.json` | 兩份快照的每個 geo 的 keyword Jaccard 和 volume 等級相關；只放數字 | `trends-compare` |
+| `pseudo/serp/<run>/<provider>.jsonl` | 每次執行一份 SERP 快取（只存 query、link 和抓取時間）。續跑同一個 run 不會重付 | `pseudo-*` |
+| `pseudo/ledger.json` | 每個供應商在每個額度期間的呼叫次數 | `pseudo-*`、`trends-snapshot --source serpapi` |
+| `pseudo/calibration/batch=<b>_<tag>.{json,parquet}` | 校準結果；query 文字只在 Parquet | `pseudo-calibrate` |
 | `dims/split_hosts.parquet` | `shard_split_subdomain` 白名單 | `pull-dims` |
 | `sample/shard=NNN.parquet`、`_meta.json` | 1% block sample；`snapshot_at` 是 S0；`finished_at` 只在全部 shard 完成後出現，`shards_failed` 列出待重試的 shard | `pull-sample` |
 | `positives/batch=<id>.parquet` | 每批 golden 的原始與 canonical 拼法查到的列 | `pull-positives` |
@@ -61,7 +68,8 @@ selection/run=<id>/manifest  →  (future) fetcher → WARC → text → BM25 in
 
 - 每個 batch b 有一個 as-of 時間：`as_of_b = min(created_b − lead_h, S0)`。`lead_h` 預設 30 小時，S0 是 sample 的快照時間。
 - **候選池：** pool_b = {`last_fetch_ok` < as_of_b}。每個 URL 只爬一次，所以這等於重建 batch 出現前的爬取狀態。
-- **golden 衍生特徵：** batch b 只用 `created_b′ < created_b` 且 `created_b′ ≤ as_of_b` 的 batch b′。
+- **golden 衍生特徵：** batch b 只用 `created_b′ < created_b` 且 `available_b′ ≤ as_of_b` 的 batch b′。官方 batch 的 `available_at` 等於建立時間；偽 batch 的 `available_at` 是 SERP 抓取時間（§5.1）。
+- **訓練 batch：** 也用 `available_at ≤ 測試 batch 的 as_of` 判斷。所以 10 月才抓的偽 golden 不會進入 B18、B19 的回測，只會影響 batch 20 的前瞻評估。
 - **衰減權重：** w(b′, b) = 0.5 ^ ((as_of_b − created_b′) / 天 / `half_life_days`)。
 - **前瞻 batch：** 建立時間晚於 S0 的 batch，as_of 就是 S0，所以它只能看到 S0 之前的資訊。
 
@@ -141,6 +149,34 @@ lift_x = ln(r_x / r_global)
 
 ---
 
+### 5.1 偽 golden（`pseudo.py`）
+
+官方 golden 太少（batch 10–17 是空的）。偽 golden 用免費額度照官方規則再產生一批標籤，只拿來訓練和計算特徵，**永遠不拿來評估**。
+
+| 步驟 | 做法 |
+|---|---|
+| trending 池 | `trends-snapshot`：10 個 geo、168 小時；用完整字串去重，frequency 是各 geo volume 的總和（照抄 `WebSearchEngine/Metric/RawDataReader/DatabaseRawDataReader.py`） |
+| 選 query | 回填：從官方 batch 的池中、官方沒選到的 query 均勻抽樣，標 `random`。前瞻：對新快照跑官方規則，head 取前 N、random 從全池均勻抽 |
+| SERP | `engine=google, q, num=10`，不帶 `gl`/`hl`，只留 `link`，rank 是過濾後的位置（照抄 `Metric/Query/QueryStrategy.py`） |
+| 列 | id 是 `pseudo.id_offset + n`；`batch_created_at` 決定候選池（回填用原官方 batch 的時間）；`available_at` 是最後抓取時間；`label_source = "pseudo"` |
+| 權重 | 和官方列相同（λ = 1，事先寫定，不調參）。early stopping 只看最後一個官方 batch |
+
+**額度：**
+
+- 每個供應商的設定都在 `[serp.providers.<name>]`：key 的環境變數、URL、最小間隔、`budget` 和 `budget_period`。
+- key 只從 `ISEL_SERPAPI_KEY`、`ISEL_SERPER_KEY` 讀。config 拒絕 `SERPAPI_KEY`；執行時若 key 值等於課程的 `SERPAPI_KEY` 也拒絕。
+- 每一次 HTTP 嘗試送出前都先記入 `pseudo/ledger.json`，包含重試。原因是我方逾時的請求，供應商可能已經計費。
+- SerpApi 的 `budget_period = "month"`，每個日曆月重算。Serper 的註冊額度只送一次，所以是 `"total"`，永不重算。
+- `pseudo-batch` 和 `pseudo-calibrate` 開始前先預檢：剩餘額度不夠付還沒快取的 query，就一次都不花，直接停止。預檢只保證每個 query 至少一次呼叫，重試仍會用掉餘裕。
+- Serper 分配：校準 150、回填 B19 800、B18 500、前瞻批次 950（head 500 + random 450）、10-16 同步檢查 50，留約 50 次給重試。
+
+**事先寫定的校準門檻（不過就停掉該部分）：**
+
+0. `trends-compare`：同一時間的 trendspy 和 SerpApi 快照，每個 geo 的 keyword Jaccard 平均 ≥ `gate_trend_jaccard`（0.7）。沒過時，前瞻批次改用 `trends-snapshot --source serpapi`。
+1. `pseudo-calibrate`：同一個 query 由 SerpApi 和 Serper 接連各抓一次，平均 overlap@10 ≥ `gate_provider_overlap`（0.7）。
+2. 同一個指令：現在的 SerpApi 和官方存的 URL，平均 overlap@10 ≥ `gate_drift_overlap`（0.5）。B19、B18 分別判定，決定要不要回填。
+3. `pseudo-gate`：回填批次的已爬正例率 ≥ 原官方 batch 的 `gate_positive_ratio`（0.6）倍。前瞻批次比凍結的爬取狀態新，不判定。
+
 ## 6. 評估（`evaluate.py`、`backtest.py`）
 
 **recall@K 估計：**
@@ -164,6 +200,13 @@ lift_x = ln(r_x / r_global)
 **採用規則（事先寫定）：** 在 t−1 調參、在 t 報告；和最強 baseline 的配對 95% CI 下界 > 0 才採用。
 
 **前瞻評估：** `train` 在 S0 凍結模型；新 batch 出現後，`pull-positives --batches <b>` 再 `forward-eval`。模型的 `snapshot_at` 必須等於 sample 的 S0，batch 必須晚於 S0，否則拒絕執行。
+
+**M0 對 M1（batch 20，事先寫定）：**
+
+- M0 用 `config/isel.toml` 訓練，M1 再加 `config/pseudo.toml`（`golden.use_pseudo = true`）。
+- `forward-eval --model-dir <M0> --model-dir <M1>`：依模型 meta 的 `use_pseudo` 各建一個 FeatureStore，依 (url, shard) 對齊 frame；M1 的名稱加 `+pseudo`，配對差異以 M0 為參考。
+- 採用 M1 的條件：每個 tag 的 M1 − M0 配對 95% CI 下界 > 0。
+- `pseudo_overlap` 把 batch 20 的 golden 和命中拆成「偽 golden 已出現過」和「沒出現過」。前者屬於 nowcasting（用最新熱門預測下一批），要分開報告。
 
 ---
 
@@ -248,7 +291,7 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 | 搶資源 | 語句之間至少間隔 `pull.min_interval_s` |
 | 讀取時機 | **讀 crawlerdb 前要取得助教同意**（2026-10-08 已同意）。`ReadGuard` 在 crawlerdb 和 metricdb 的每條語句前檢查：語句跑滿逾時也不會進入 golden 建立與量測日（1、16 日 00:00–20:00 UTC）、accounting/gc 時段（02:50–04:40 UTC）或每小時 :55–:10；`pg_stat_activity` 中等待 IO 的連線數（3 次取中位數）超過 `max_io_waiters` 就暫停。IO 探測本身要 2 秒，所以探測完再檢查一次時段才放行。每次等待都寫進 log。時段和門檻都在 `[guard]` |
 | S0 的意義 | `pull-sample` 開始時記下 `frozen_probe`（server 啟動時間加 `url_state_current_*` 累計寫入列數）。`advance-snapshot` 只接受已完成的 sample，再量一次，完全相同才把 S0 移到現在，否則拒絕 |
-| 資料不完整 | `FeatureStore` 拒絕沒有 `finished_at` 的 sample |
+| 資料不完整 | `FeatureStore` 拒絕三種狀況：sample 沒有 `finished_at`、任何 batch 缺 `positives/batch=<id>.parquet`、同一個 batch id 同時有官方和偽 golden 列 |
 | 憑證外洩 | DSN 只放環境變數；所有 JSON 輸出經過 `assert_no_secrets` |
 
 ---
@@ -279,12 +322,24 @@ uv run isel $C validate-sample              # refetched_share: how often "fetche
 uv run isel $C validate-routing             # expect candidate_rate >= 0.99
 uv run isel $C build-dataset
 uv run isel $C backtest --feature-sets full,no_inlinks,no_domain,no_history
+# --- pseudo golden (SERP calls run on a laptop with ISEL_SERPAPI_KEY / ISEL_SERPER_KEY) ---
+uv run isel $C trends-snapshot --source trendspy
+uv run isel $C trends-snapshot --source serpapi       # same hour, 10 SerpApi calls
+uv run isel $C trends-compare --a <trendspy id> --b <serpapi id>
+uv run isel $C pseudo-calibrate --batch 19 --tag random --n 100
+uv run isel $C pseudo-calibrate --batch 18 --tag random --n 50
+uv run isel $C pseudo-batch --source official:19 --batch-id 10019 --random 800 --provider serper
+uv run isel $C pseudo-batch --source snapshot:<id> --batch-id 10100 --head 500 --random 450 --provider serper  # keeps ~50 Serper calls for retries
+P="$C --config config/pseudo.toml"
+uv run isel $P pull-positives --batches 10019,10100
+uv run isel $P build-dataset && uv run isel $P pseudo-gate --batch-id 10019
 uv run isel $C advance-snapshot             # only if crawlerdb is unchanged since the sample
-uv run isel $C train                        # freeze before 2026-10-16 12:00 UTC
+uv run isel $C train                        # M0; freeze with S0 <= 2026-10-15 06:00 UTC
+uv run isel $P train                        # M1
 # after batch 20 exists:
 uv run isel $C pull-golden
 uv run isel $C pull-positives --batches 20
-uv run isel $C forward-eval --model-dir work/models/<id> --batch 20
+uv run isel $C forward-eval --model-dir work/models/<M0> --model-dir work/models/<M1> --batch 20
 ```
 
 ---
@@ -296,4 +351,7 @@ uv run isel $C forward-eval --model-dir work/models/<id> --batch 20
 - **跨 shard 重複：** 同一 URL 出現在兩個 shard 時，sample 排名會算兩次。影響可忽略。
 - **拼法：** 清單目前輸出 crawler 的拼法。過去 golden 的原始拼法若和 canonical 不同，exact 比對會漏掉；`indexed_canonical_rate` 顯示這部分的損失。
 - **每個 URL 只爬一次：** §3 依賴這個假設。sample 帶回 `num_fetch_ok_90d` 只為了檢查它（`FORBIDDEN` 擋住它進模型，`FeatureStore` 也不載入它和 `title`）。`validate-sample` 的 `refetched_share` 偏高時，pool 會把重抓的頁誤當成 batch 之後才爬到。
+- **偽 golden 的雜訊：** 回填批次的 SERP 比官方晚 1–3 週抓，供應商預設值也可能不同（§5.1 校準）。爬取狀態凍結在 2026-10-05，所以偏新的頁面不會成為正例。`history_batches` 在 M1 的評分時會多出幾批，訓練列中只有前瞻批次看得到同樣的範圍。
+- **免費額度只夠一次：** Serper 的 2,500 次只送一次，之後只剩 SerpApi 每月 250 次。M1 的做法不能每兩週持續；報告要寫明。
+- **trendspy 是非官方 API：** 失效時改用 `trends-snapshot --source serpapi`（每次 10 次呼叫）。
 - **batch 10–17 是空的：** 測試 batch 18 時，最近的訓練 batch 是 3 個月前的 batch 8 或 9。

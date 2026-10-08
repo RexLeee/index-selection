@@ -4,13 +4,22 @@ from datetime import UTC, datetime
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 from conftest import replace
 
 from isel.dataset import tag_weights
 from isel.evaluate import Golden, Ranker, _per_query, bootstrap, paired_bootstrap, rates
-from isel.golden import golden_table, summarize
+from isel.golden import (
+    OFFICIAL,
+    PSEUDO,
+    golden_table,
+    pool_table,
+    pseudo_batch_path,
+    read_golden,
+    summarize,
+)
 from isel.manifest import ManifestError, validate_run, write_run
 
 
@@ -93,6 +102,37 @@ def test_golden_summary_reports_drift_and_recurrence():
     assert summary["1"]["head"]["raw_ne_canonical_rate"] == 1.0
     assert summary["2"]["recurring_canonical_rate"] == 1.0
     assert summary["1"]["random"]["queries"] == 1
+
+
+def test_official_golden_is_available_when_created():
+    t1 = datetime(2026, 2, 1, tzinfo=UTC)
+    table = golden_table([(1, t1, 1, "k", 10, ["head"], 1, "https://a.com/")])
+    assert table.column("available_at").to_pylist() == [t1]
+    assert table.column("label_source").to_pylist() == ["official"]
+
+
+def test_pool_keeps_every_trending_query():
+    t1 = datetime(2026, 2, 1, tzinfo=UTC)
+    pool = pool_table([(1, t1, 7, "k", 10, ["head"]), (1, t1, 8, "z", None, None)])
+    assert pool.column("keyword").to_pylist() == ["k", "z"]
+    assert pool.column("tags").to_pylist() == [["head"], []]
+    assert pool.column("frequency").to_pylist() == [10, None]
+
+
+def test_read_golden_adds_pseudo_batches_only_on_request(tmp_path):
+    t1 = datetime(2026, 2, 1, tzinfo=UTC)
+    t2 = datetime(2026, 2, 9, tzinfo=UTC)
+    official = golden_table([(1, t1, 1, "k", 10, ["head"], 1, "https://a.com/")])
+    pseudo = golden_table([(10001, t1, 2, "z", 3, ["random"], 1, "https://b.com/")],
+                          label_source=PSEUDO, available_at=t2)
+    pseudo_batch_path(tmp_path, 10001).parent.mkdir(parents=True)
+    pq.write_table(official, tmp_path / "golden" / "golden.parquet")
+    pq.write_table(pseudo, pseudo_batch_path(tmp_path, 10001))
+    assert read_golden(tmp_path, include_pseudo=False).num_rows == 1
+    both = read_golden(tmp_path, include_pseudo=True)
+    assert sorted(both.column("label_source").to_pylist()) == [OFFICIAL, PSEUDO]
+    assert both.filter(pc.equal(both.column("batch_id"), 10001)).column(
+        "available_at").to_pylist() == [t2]
 
 
 def _rows(urls, scores):

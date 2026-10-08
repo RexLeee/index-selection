@@ -81,8 +81,8 @@ def _columns(m: Matrix, features: list[str]) -> np.ndarray:
 
 
 def fit_lgbm(cfg: Config, m: Matrix, features: list[str], offset: float,
-             kind: str = "lgbm") -> TrainedModel:
-    """Trains LightGBM; the last training batch picks the number of rounds."""
+             valid_batch: int | None, kind: str = "lgbm") -> TrainedModel:
+    """Trains LightGBM; `valid_batch` (the latest official batch) picks the rounds."""
     x = _columns(m, features)
     categorical = [f for f in features if FEATURES[f].categorical]
     params = dict(cfg.model.params)
@@ -94,8 +94,8 @@ def fit_lgbm(cfg: Config, m: Matrix, features: list[str], offset: float,
 
     rounds = cfg.model.num_boost_round
     best = rounds
-    if len(batches) >= 2:
-        valid = m.batch == batches[-1]
+    if len(batches) >= 2 and valid_batch is not None:
+        valid = m.batch == valid_batch
         booster = lgb.train(params, dataset(~valid), num_boost_round=rounds,
                             valid_sets=[dataset(valid)],
                             callbacks=[lgb.early_stopping(cfg.model.early_stopping_rounds,
@@ -105,7 +105,7 @@ def fit_lgbm(cfg: Config, m: Matrix, features: list[str], offset: float,
             booster = lgb.train(params, dataset(np.ones(len(m.y), bool)), num_boost_round=best)
     else:
         booster = lgb.train(params, dataset(np.ones(len(m.y), bool)), num_boost_round=rounds)
-    meta = {"best_iteration": best, "train_batches": batches,
+    meta = {"best_iteration": best, "train_batches": batches, "valid_batch": valid_batch,
             "rows": len(m.y), "positives": int(m.y.sum())}
     return TrainedModel(kind, features, offset, booster=booster, meta=meta)
 
