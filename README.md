@@ -21,17 +21,20 @@
 uv sync
 uv run ruff check src tests
 uv run pytest                                   # synthetic data, no network
+uv run pytest -m integration                    # local postgres:16 container via Docker
 
 set -a; source .env; set +a                     # ISEL_CRAWLERDB_DSN, ISEL_METRICDB_DSN
 C="--config config/isel.toml --config config/host.toml"
 uv run isel $C pull-golden
 uv run isel $C pull-dims                        # crawlerdb: needs TA approval
 uv run isel $C pull-positives
-uv run isel $C pull-sample --dry-run
-uv run isel $C pull-sample
+uv run isel $C pull-sample --dry-run            # per-shard pages and timeouts, next no-read window
+uv run isel $C pull-sample                      # guarded: read windows + IO load; resumable
+uv run isel $C validate-sample                  # share of sample rows fetched more than once
 uv run isel $C validate-routing
 uv run isel $C build-dataset
 uv run isel $C backtest --feature-sets full,no_inlinks,no_domain,no_history
+uv run isel $C advance-snapshot                 # move S0 if crawlerdb is unchanged
 uv run isel $C train
 uv run isel $C forward-eval --model-dir work/models/<id> --batch 20
 uv run isel $C select-sample --model-dir work/models/<id>
@@ -45,7 +48,7 @@ uv run isel $C validate-manifest --run-dir work/selection/run=<id>
 | 模組 | 職責 |
 |---|---|
 | `config.py` | 嚴格的 TOML 設定 |
-| `pg.py` | 唯讀 session、SQL 白名單、限速 |
+| `pg.py` | 唯讀 session、會照 PostgreSQL 詞法掃描的 SQL gate、限速、讀取時段與 IO 負載防護 |
 | `io.py` | 原子寫入、DuckDB 連線、憑證檢查 |
 | `urlnorm.py` | canonical URL、shard key、shard 路由 |
 | `golden.py` | metricdb → golden |

@@ -1,13 +1,15 @@
 """Read-only pulls from crawlerdb: the split table, a block sample and golden lookups.
 
 Every statement is a single read through `ReadOnlySession`, paced by
-`pull.min_interval_s`. The sample is one `COPY ... TABLESAMPLE SYSTEM` per
-shard, so each statement reads about `sample_percent` of the shard's pages and
-never sorts or aggregates on the server.
+`pull.min_interval_s` and held by the read guard. The sample is one
+`COPY ... TABLESAMPLE SYSTEM` per shard, so each statement reads about
+`sample_percent` of the shard's pages and never sorts or aggregates on the server.
 """
 
 from __future__ import annotations
 
+import logging
+import math
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
@@ -15,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+from psycopg import errors
 
 from isel.config import Config
 from isel.io import AtomicParquetWriter, atomic_write_json, read_json, write_parquet_atomic
@@ -27,7 +30,9 @@ _ARROW = {BOOL: pa.bool_(), INT2: pa.int16(), INT4: pa.int32(), INT8: pa.int64()
 
 # (column, SQL expression, type OID). Every expression casts, so the binary COPY
 # types are fixed without a catalog lookup. `url_score` and `source` are pulled
-# only for the forward-only baselines; `features.FORBIDDEN` keeps them out of models.
+# only for the forward-only baselines and `num_fetch_ok_90d` only to check that a
+# URL is fetched once; `features.FORBIDDEN` keeps all three out of models. `title`
+# is kept for later text features; `{title_chars}` is filled from the config.
 CRAWL_COLUMNS: tuple[tuple[str, str, int], ...] = (
     ("url", "url::text", TEXT),
     ("domain_id", "domain_id::int8", INT8),
@@ -46,13 +51,19 @@ CRAWL_COLUMNS: tuple[tuple[str, str, int], ...] = (
     ("inlink_count_external", "inlink_count_external::int8", INT8),
     ("url_score", "url_score::float8", FLOAT8),
     ("source", "source::int2", INT2),
+    ("num_fetch_ok_90d", "num_fetch_ok_90d::int4", INT4),
+    ("title", "left(title, {title_chars})::text", TEXT),
 )
 CRAWL_SCHEMA = pa.schema(
     [(name, _ARROW[oid]) for name, _, oid in CRAWL_COLUMNS] + [("shard", pa.int16())]
 )
-_SELECT_LIST = ", ".join(f"{expr} AS {name}" for name, expr, _ in CRAWL_COLUMNS)
 _OIDS = [oid for _, _, oid in CRAWL_COLUMNS]
 _BATCH_ROWS = 200_000
+PAGE_BYTES = 8192
+# A shard that hits its timeout or lock_timeout is retried on the next run.
+_RETRYABLE = (errors.QueryCanceled, errors.LockNotAvailable)
+
+log = logging.getLogger(__name__)
 
 
 def _table(rows: Sequence[tuple], shard: int) -> pa.Table:
@@ -71,6 +82,40 @@ def _table_name(cfg: Config, shard: int) -> str:
     return cfg.crawlerdb.url_table_fmt.format(shard)
 
 
+def _select_list(cfg: Config) -> str:
+    return ", ".join(f"{expr.format(title_chars=int(cfg.pull.title_chars))} AS {name}"
+                     for name, expr, _ in CRAWL_COLUMNS)
+
+
+def _table_size(cfg: Config, session: ReadOnlySession, shard: int) -> tuple[int, int]:
+    """(reltuples, relpages) of a shard table from `pg_class`; (0, 0) if it is missing."""
+    r = session.fetchone("SELECT reltuples::int8, relpages::int8 FROM pg_class "
+                         "WHERE oid = to_regclass(%s)", (_table_name(cfg, shard),))
+    return (max(int(r[0]), 0), int(r[1])) if r is not None else (0, 0)
+
+
+def timeout_for(cfg: Config, relpages: int) -> int:
+    """Statement timeout for sampling a table of `relpages` at the worst-case read speed."""
+    g = cfg.guard
+    seconds = math.ceil(relpages * cfg.sample_rate * PAGE_BYTES / (g.min_mb_s * 1_000_000))
+    return min(max(seconds, g.timeout_floor_s), g.timeout_cap_s)
+
+
+def probe_frozen(cfg: Config, session: ReadOnlySession, now: datetime) -> dict[str, Any]:
+    """Server start time and cumulative row writes on the URL tables.
+
+    Two equal probes mean no row of `url_state_current_*` was inserted, updated or
+    deleted in between, so a sample taken earlier also describes the later time.
+    """
+    prefix = cfg.crawlerdb.url_table_fmt.split("{", 1)[0]
+    started, changes = session.fetchone(
+        "SELECT pg_postmaster_start_time(), "
+        "coalesce(sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::int8 "
+        "FROM pg_stat_user_tables WHERE starts_with(relname, %s)", (prefix,))
+    return {"postmaster_start": started.isoformat(), "tuple_changes": int(changes),
+            "probed_at": now.isoformat()}
+
+
 def pull_dims(cfg: Config, session: ReadOnlySession, out_dir: Path) -> dict[str, Any]:
     """Writes the split-subdomain whitelist (host, migrated_at)."""
     rows = session.fetchall(
@@ -84,7 +129,7 @@ def pull_dims(cfg: Config, session: ReadOnlySession, out_dir: Path) -> dict[str,
 
 
 def sample_sql(cfg: Config, shard: int) -> str:
-    return (f"COPY (SELECT {_SELECT_LIST} FROM {_table_name(cfg, shard)} "
+    return (f"COPY (SELECT {_select_list(cfg)} FROM {_table_name(cfg, shard)} "
             f"TABLESAMPLE SYSTEM ({cfg.pull.sample_percent!r}) "
             f"REPEATABLE ({int(cfg.pull.sample_seed)}) "
             f"WHERE last_fetch_ok IS NOT NULL) TO STDOUT (FORMAT BINARY)")
@@ -92,54 +137,115 @@ def sample_sql(cfg: Config, shard: int) -> str:
 
 def estimate_sample(cfg: Config, session: ReadOnlySession,
                     shards: Iterable[int] | None = None) -> dict[str, Any]:
-    """Reads only `pg_class` to estimate rows and pages the sample will touch."""
-    rows = pages = 0
+    """Reads only `pg_class` to estimate rows, pages and the timeout of every shard."""
+    per_shard: dict[int, dict[str, int]] = {}
     for shard in _shards(cfg, shards):
-        r = session.fetchone("SELECT reltuples::int8, relpages::int8 FROM pg_class "
-                             "WHERE oid = to_regclass(%s)", (_table_name(cfg, shard),))
-        if r is not None:
-            rows += max(int(r[0]), 0)
-            pages += int(r[1])
+        rows, pages = _table_size(cfg, session, shard)
+        per_shard[shard] = {"rows": rows, "pages": pages, "timeout_s": timeout_for(cfg, pages)}
     rate = cfg.sample_rate
-    return {"table_rows": rows, "table_pages": pages, "sample_rows_upper": int(rows * rate),
-            "sample_pages": int(pages * rate), "sample_heap_bytes": int(pages * rate * 8192)}
+    pages = sum(v["pages"] for v in per_shard.values())
+    timeouts = {s: v["timeout_s"] for s, v in per_shard.items()}
+    slowest = max(timeouts, key=timeouts.get) if timeouts else None
+    return {"table_rows": sum(v["rows"] for v in per_shard.values()), "table_pages": pages,
+            "sample_rows_upper": int(sum(v["rows"] for v in per_shard.values()) * rate),
+            "sample_pages": int(pages * rate),
+            "sample_heap_bytes": int(pages * rate * PAGE_BYTES),
+            "timeout_s_sum": sum(timeouts.values()),
+            "timeout_s_max": timeouts.get(slowest), "slowest_shard": slowest,
+            "shards": {str(s): v for s, v in per_shard.items()}}
+
+
+def _pull_shard(cfg: Config, session: ReadOnlySession, out_dir: Path, shard: int) -> int:
+    """Streams one shard's sample into `shard=NNN.parquet`; returns its row count."""
+    session.set_statement_timeout(timeout_for(cfg, _table_size(cfg, session, shard)[1]))
+    with AtomicParquetWriter(out_dir / f"shard={shard:03d}.parquet", CRAWL_SCHEMA) as writer:
+        buffer: list[tuple] = []
+        for row in session.copy_rows(sample_sql(cfg, shard), _OIDS):
+            buffer.append(row)
+            if len(buffer) >= _BATCH_ROWS:
+                writer.write(_table(buffer, shard))
+                buffer = []
+        writer.write(_table(buffer, shard))
+    return writer.rows
 
 
 def pull_sample(cfg: Config, session: ReadOnlySession, out_dir: Path,
-                shards: Iterable[int] | None = None) -> dict[str, Any]:
+                shards: Iterable[int] | None = None,
+                now: datetime | None = None) -> dict[str, Any]:
     """Writes `shard=NNN.parquet` per shard plus `_meta.json`; skips finished shards.
 
-    `_meta.json` keeps the first start time as `snapshot_at` (S0). Pools are
-    filtered by `last_fetch_ok < as_of <= S0`, so a shard read later in the pull
-    cannot add rows that a forward evaluation must not see.
+    `_meta.json` keeps the first start time as `snapshot_at` (S0) and a
+    `frozen_probe` taken at that time. Pools are filtered by
+    `last_fetch_ok < as_of <= S0`, so a shard read later in the pull cannot add
+    rows that a forward evaluation must not see. Each shard's statement gets a
+    timeout sized to the pages it reads; a shard that times out is recorded in
+    `shards_failed` and retried by the next run. `finished_at` is set only once
+    every configured shard is done, whatever `shards` selects.
     """
+    now = now or datetime.now(UTC)
     meta_path = out_dir / "_meta.json"
     meta = read_json(meta_path) or {}
     if meta and (meta.get("sample_percent") != cfg.pull.sample_percent
                  or meta.get("sample_seed") != cfg.pull.sample_seed):
         raise RuntimeError("existing sample used a different sample_percent or sample_seed")
-    meta.setdefault("snapshot_at", datetime.now(UTC).isoformat())
+    if "snapshot_at" not in meta:
+        meta["snapshot_at"] = now.isoformat()
+        meta["frozen_probe"] = probe_frozen(cfg, session, now)
     meta.update(sample_percent=cfg.pull.sample_percent, sample_seed=cfg.pull.sample_seed)
     done = set(meta.get("shards_done", []))
-    for shard in _shards(cfg, shards):
-        final = out_dir / f"shard={shard:03d}.parquet"
-        if shard in done and final.exists():
-            continue
-        with AtomicParquetWriter(final, CRAWL_SCHEMA) as writer:
-            buffer: list[tuple] = []
-            for row in session.copy_rows(sample_sql(cfg, shard), _OIDS):
-                buffer.append(row)
-                if len(buffer) >= _BATCH_ROWS:
-                    writer.write(_table(buffer, shard))
-                    buffer = []
-            writer.write(_table(buffer, shard))
-        done.add(shard)
+    failed: dict[str, str] = meta.get("shards_failed", {})
+    todo = [s for s in _shards(cfg, shards)
+            if not (s in done and (out_dir / f"shard={s:03d}.parquet").exists())]
+    for i, shard in enumerate(todo, start=1):
+        done.discard(shard)   # a done shard whose file is gone is pulled again
+        try:
+            rows = _pull_shard(cfg, session, out_dir, shard)
+        except _RETRYABLE as exc:
+            failed[str(shard)] = type(exc).__name__
+            log.warning("shard %03d failed (%s); it is retried on the next run",
+                        shard, type(exc).__name__)
+        else:
+            done.add(shard)
+            failed.pop(str(shard), None)
+            meta.setdefault("rows", {})[str(shard)] = rows
+            log.info("shard %03d: %d rows (%d/%d)", shard, rows, i, len(todo))
         meta["shards_done"] = sorted(done)
-        meta.setdefault("rows", {})[str(shard)] = writer.rows
+        meta["shards_failed"] = failed
         atomic_write_json(meta_path, meta)
-    meta["finished_at"] = datetime.now(UTC).isoformat()
+    missing = sorted(set(_shards(cfg, None)) - done)
+    if missing:
+        meta.pop("finished_at", None)
+    else:
+        meta.setdefault("finished_at", datetime.now(UTC).isoformat())
     atomic_write_json(meta_path, meta)
-    return {"shards_done": len(done), "rows": sum(meta.get("rows", {}).values())}
+    return {"shards_done": len(done), "shards_missing": len(missing),
+            "shards_failed": sorted(int(s) for s in failed),
+            "rows": sum(meta.get("rows", {}).values())}
+
+
+def advance_snapshot(cfg: Config, session: ReadOnlySession, out_dir: Path,
+                     now: datetime | None = None) -> dict[str, Any]:
+    """Moves S0 to now if crawlerdb has not changed since the sample started.
+
+    Raises:
+        RuntimeError: If the sample is unfinished or the frozen probe differs.
+    """
+    now = now or datetime.now(UTC)
+    meta_path = out_dir / "_meta.json"
+    meta = read_json(meta_path) or {}
+    if "finished_at" not in meta or "frozen_probe" not in meta:
+        raise RuntimeError("the sample is not finished; run pull-sample until no shard is missing")
+    probe = probe_frozen(cfg, session, now)
+    first = meta["frozen_probe"]
+    if any(probe[k] != first[k] for k in ("postmaster_start", "tuple_changes")):
+        raise RuntimeError(f"crawlerdb changed since {meta['snapshot_at']}; S0 is not moved "
+                           f"(was {first}, now {probe})")
+    previous = meta["snapshot_at"]
+    meta.setdefault("snapshot_initial", previous)
+    meta["snapshot_at"] = probe["probed_at"]
+    meta["snapshot_probe"] = probe
+    atomic_write_json(meta_path, meta)
+    return {"snapshot_at": meta["snapshot_at"], "previous": previous}
 
 
 def probes(router: ShardRouter, urls: Iterable[str]) -> dict[int, list[str]]:
@@ -151,13 +257,17 @@ def probes(router: ShardRouter, urls: Iterable[str]) -> dict[int, list[str]]:
     return {s: sorted(u) for s, u in sorted(by_shard.items())}
 
 
+def lookup_sql(cfg: Config, shard: int) -> str:
+    return f"SELECT {_select_list(cfg)} FROM {_table_name(cfg, shard)} WHERE url = ANY(%s)"
+
+
 def lookup_rows(cfg: Config, session: ReadOnlySession, router: ShardRouter,
                 urls: Iterable[str]) -> pa.Table:
     """Primary-key lookups of `urls` in their candidate shards (crawled or not)."""
     tables = []
     chunk = cfg.pull.lookup_chunk
     for shard, items in probes(router, urls).items():
-        text = f"SELECT {_SELECT_LIST} FROM {_table_name(cfg, shard)} WHERE url = ANY(%s)"
+        text = lookup_sql(cfg, shard)
         for i in range(0, len(items), chunk):
             rows = session.fetchall(text, (items[i:i + chunk],))
             if rows:

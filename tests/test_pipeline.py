@@ -10,7 +10,7 @@ from isel.backtest import forward_eval, run_backtest, select_sample, train_froze
 from isel.dataset import train_batches
 from isel.features import FeatureStore
 from isel.golden import golden_table
-from isel.io import open_duckdb, read_json, write_parquet_atomic
+from isel.io import atomic_write_json, open_duckdb, read_json, write_parquet_atomic
 from isel.manifest import validate_run
 
 
@@ -70,6 +70,14 @@ def test_training_batches_precede_the_test_batch(work):
         chosen = train_batches(cfg, store, t)
         assert chosen and t not in chosen
         assert all(store.batch(b).created_at <= test.as_of for b in chosen)
+
+
+def test_store_refuses_an_unfinished_sample(work):
+    meta = read_json(work / "sample" / "_meta.json")
+    del meta["finished_at"]
+    atomic_write_json(work / "sample" / "_meta.json", meta)
+    with pytest.raises(RuntimeError, match="unfinished"):
+        _store(small_cfg(work), work)
 
 
 def test_decay_weights_fall_with_age(work):

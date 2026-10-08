@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from collections import Counter
 from pathlib import Path
@@ -72,14 +73,34 @@ def cmd_pull_dims(cfg: Config, args: argparse.Namespace) -> Any:
 
 
 def cmd_pull_sample(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.pg import open_crawlerdb
+    from datetime import UTC, datetime
+
+    from isel.pg import next_allowed_start, next_forbidden_window, open_crawlerdb
     from isel.pull import estimate_sample, pull_sample
 
     session = open_crawlerdb(cfg)
     try:
         if args.dry_run:
-            return estimate_sample(cfg, session, _ids(args.shards))
+            estimate = estimate_sample(cfg, session, _ids(args.shards))
+            now = datetime.now(UTC)
+            longest = estimate["timeout_s_max"] or 0
+            window = next_forbidden_window(now, cfg.guard)
+            return {**estimate, "io_waiters_now": session.io_waiters(),
+                    "forbidden_window_next": [t.isoformat() for t in window],
+                    "next_start_for_longest": next_allowed_start(
+                        now, longest, cfg.guard).isoformat()}
         return pull_sample(cfg, session, cfg.work_dir / "sample", _ids(args.shards))
+    finally:
+        session.close()
+
+
+def cmd_advance_snapshot(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.pg import open_crawlerdb
+    from isel.pull import advance_snapshot
+
+    session = open_crawlerdb(cfg)
+    try:
+        return advance_snapshot(cfg, session, cfg.work_dir / "sample")
     finally:
         session.close()
 
@@ -96,6 +117,20 @@ def cmd_pull_positives(cfg: Config, args: argparse.Namespace) -> Any:
                               cfg.work_dir / "positives", _ids(args.batches), args.force)
     finally:
         session.close()
+
+
+def cmd_validate_sample(cfg: Config, args: argparse.Namespace) -> Any:
+    """Checks the pool rebuild's premise that each URL is fetched once (`num_fetch_ok_90d`)."""
+    con = open_duckdb(cfg, cfg.work_dir / "duckdb_tmp")
+    glob = sql_str(str(cfg.work_dir / "sample" / "shard=*.parquet"))
+    rows, refetched, no_title = con.execute(
+        "SELECT count(*), count(*) FILTER (WHERE num_fetch_ok_90d > 1), "
+        f"count(*) FILTER (WHERE title IS NULL) FROM read_parquet({glob})").fetchone()
+    return {"rows": rows, "refetched_rows": refetched,
+            "refetched_share": refetched / rows if rows else None,
+            "title_null_share": no_title / rows if rows else None,
+            "meta": {k: v for k, v in (read_json(cfg.work_dir / "sample" / "_meta.json") or {}
+                                       ).items() if k != "rows"}}
 
 
 def cmd_validate_routing(cfg: Config, args: argparse.Namespace) -> Any:
@@ -209,10 +244,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pull-sample")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--shards")
+    sub.add_parser("advance-snapshot")
     p = sub.add_parser("pull-positives")
     p.add_argument("--batches")
     p.add_argument("--force", action="store_true")
     sub.add_parser("validate-routing")
+    sub.add_parser("validate-sample")
     sub.add_parser("build-dataset")
     p = sub.add_parser("backtest")
     p.add_argument("--feature-sets")
@@ -238,8 +275,10 @@ COMMANDS = {
     "pull-golden": cmd_pull_golden,
     "pull-dims": cmd_pull_dims,
     "pull-sample": cmd_pull_sample,
+    "advance-snapshot": cmd_advance_snapshot,
     "pull-positives": cmd_pull_positives,
     "validate-routing": cmd_validate_routing,
+    "validate-sample": cmd_validate_sample,
     "build-dataset": cmd_build_dataset,
     "backtest": cmd_backtest,
     "report": cmd_report,
@@ -252,6 +291,8 @@ COMMANDS = {
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         cfg = load_config(args.config)
     except ConfigError as exc:

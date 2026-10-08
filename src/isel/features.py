@@ -93,6 +93,8 @@ FORBIDDEN = frozenset({
 })
 ID_COLUMNS = ("url", "shard", "h", "dkey", "is_sample", "label", "in_head", "in_random",
               "url_score", "source")
+# Pulled for diagnostics and later text features; never loaded into the store.
+UNLOADED_COLUMNS = ("num_fetch_ok_90d", "title")
 LEVELS = ("tld", "dkey", "host", "hp")
 
 
@@ -140,6 +142,8 @@ class FeatureStore:
         meta = read_json(work_dir / "sample" / "_meta.json")
         if not meta:
             raise RuntimeError("sample/_meta.json is missing; run pull-sample first")
+        if "finished_at" not in meta:
+            raise RuntimeError("the sample is unfinished; rerun pull-sample until it finishes")
         self.rate = float(meta["sample_percent"]) / 100.0
         self.snapshot_at = datetime.fromisoformat(meta["snapshot_at"])
         self.batches: list[Batch] = []
@@ -153,8 +157,10 @@ class FeatureStore:
         sample = self._files("sample/shard=*.parquet")
         if not sample:
             raise RuntimeError("no sample files; run pull-sample first")
-        parts = [f"SELECT *, true AS is_sample FROM read_parquet({sql_str(f)})" for f in sample]
-        parts += [f"SELECT *, false AS is_sample FROM read_parquet({sql_str(f)})"
+        skip = ", ".join(UNLOADED_COLUMNS)
+        parts = [f"SELECT * EXCLUDE ({skip}), true AS is_sample FROM read_parquet({sql_str(f)})"
+                 for f in sample]
+        parts += [f"SELECT * EXCLUDE ({skip}), false AS is_sample FROM read_parquet({sql_str(f)})"
                   for f in self._files("positives/batch=*.parquet")]
         con.execute(
             "CREATE OR REPLACE TEMP TABLE crawl0 AS SELECT *, "

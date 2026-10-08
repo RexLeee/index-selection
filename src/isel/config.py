@@ -30,6 +30,22 @@ class RunCfg:
 
 
 @dataclass(frozen=True)
+class GuardCfg:
+    month_days: list[int]
+    month_window: list[str]
+    daily_window: list[str]
+    hourly_window: list[int]
+    max_io_waiters: int
+    probes: int
+    probe_interval_s: float
+    probe_ttl_s: float
+    pause_s: float
+    min_mb_s: float
+    timeout_floor_s: int
+    timeout_cap_s: int
+
+
+@dataclass(frozen=True)
 class CrawlerDbCfg:
     dsn_env: str
     connect_timeout_s: int
@@ -59,6 +75,7 @@ class PullCfg:
     lookup_chunk: int
     min_interval_s: float
     shards: list[int]
+    title_chars: int
 
 
 @dataclass(frozen=True)
@@ -66,6 +83,7 @@ class GoldenCfg:
     lead_h: float
     tags: list[str]
     exclude_batches: list[int]
+
 
 
 @dataclass(frozen=True)
@@ -127,6 +145,7 @@ class DuckDbCfg:
 @dataclass(frozen=True)
 class Config:
     run: RunCfg
+    guard: GuardCfg
     crawlerdb: CrawlerDbCfg
     metricdb: MetricDbCfg
     routing: RoutingCfg
@@ -231,21 +250,81 @@ def _build(cls: type, data: Any, where: str) -> Any:
     return cls(**kwargs)
 
 
+def hhmm_minutes(text: str) -> int:
+    """Parses `HH:MM` (00:00-24:00) into minutes after midnight.
+
+    Raises:
+        ConfigError: If `text` is not a valid time of day.
+    """
+    hours, sep, minutes = text.partition(":")
+    if not (sep and hours.isdigit() and minutes.isdigit() and len(minutes) == 2):
+        raise ConfigError(f"expected HH:MM, got {text!r}")
+    value = int(hours) * 60 + int(minutes)
+    if int(minutes) >= 60 or value > 24 * 60:
+        raise ConfigError(f"expected HH:MM, got {text!r}")
+    return value
+
+
+def hourly_open_s(g: GuardCfg) -> int:
+    """Seconds per hour outside the hourly forbidden window."""
+    return (60 - (g.hourly_window[1] - g.hourly_window[0]) % 60) * 60
+
+
+def timeout_seconds(session: Mapping[str, str]) -> int:
+    """The session `statement_timeout`, written as whole seconds such as `'120s'`.
+
+    Raises:
+        ConfigError: If the value is missing or not whole seconds.
+    """
+    value = session.get("statement_timeout", "")
+    if not (value.endswith("s") and value[:-1].isdigit() and int(value[:-1]) > 0):
+        raise ConfigError(f"statement_timeout must be whole seconds such as '120s', got {value!r}")
+    return int(value[:-1])
+
+
+def _validate_guard(g: GuardCfg, need: Any) -> None:
+    for name in ("month_window", "daily_window"):
+        window = getattr(g, name)
+        need(len(window) == 2, f"guard.{name} must be [start, end]")
+        start, end = (hhmm_minutes(v) for v in window)
+        need(start < end, f"guard.{name} must not wrap past midnight")
+    need(all(1 <= d <= 31 for d in g.month_days), "guard.month_days must be 1-31")
+    need(len(g.hourly_window) == 2 and all(0 <= m < 60 for m in g.hourly_window),
+         "guard.hourly_window must be [start_minute, end_minute]")
+    need(0 < g.timeout_floor_s <= g.timeout_cap_s < hourly_open_s(g),
+         "guard timeouts must satisfy 0 < floor <= cap < the hourly open gap")
+    need(g.max_io_waiters >= 0, "guard.max_io_waiters must be >= 0")
+    need(g.probes >= 1, "guard.probes must be >= 1")
+    need(min(g.probe_interval_s, g.probe_ttl_s) >= 0 and g.pause_s > 0,
+         "guard intervals must be >= 0 and pause_s > 0")
+    need(g.min_mb_s > 0, "guard.min_mb_s must be > 0")
+
+
+def _validate_session(name: str, session: Mapping[str, str], g: GuardCfg, need: Any) -> None:
+    need(session.get("default_transaction_read_only") == "on",
+         f"{name}.session.default_transaction_read_only must be 'on'")
+    # The client-side SQL gate lexes strings with standard (non-backslash) quoting.
+    need(session.get("standard_conforming_strings") == "on",
+         f"{name}.session.standard_conforming_strings must be 'on'")
+    need(timeout_seconds(session) <= g.timeout_cap_s,
+         f"{name}.session.statement_timeout must not exceed guard.timeout_cap_s")
+
+
 def _validate(cfg: Config) -> None:
     def need(ok: bool, message: str) -> None:
         if not ok:
             raise ConfigError(message)
 
     need(cfg.crawlerdb.num_shards > 0, "crawlerdb.num_shards must be > 0")
-    need(cfg.crawlerdb.session.get("default_transaction_read_only") == "on",
-         "crawlerdb.session.default_transaction_read_only must be 'on'")
-    need(cfg.metricdb.session.get("default_transaction_read_only") == "on",
-         "metricdb.session.default_transaction_read_only must be 'on'")
+    _validate_guard(cfg.guard, need)
+    _validate_session("crawlerdb", cfg.crawlerdb.session, cfg.guard, need)
+    _validate_session("metricdb", cfg.metricdb.session, cfg.guard, need)
     need(all(0 <= s < cfg.crawlerdb.num_shards for s in cfg.routing.overrides.values()),
          "routing.overrides must map to valid shards")
     need(0 < cfg.pull.sample_percent <= 100, "pull.sample_percent must be in (0, 100]")
     need(cfg.pull.lookup_chunk > 0, "pull.lookup_chunk must be > 0")
     need(cfg.pull.min_interval_s >= 0, "pull.min_interval_s must be >= 0")
+    need(cfg.pull.title_chars > 0, "pull.title_chars must be > 0")
     need(all(0 <= s < cfg.crawlerdb.num_shards for s in cfg.pull.shards),
          "pull.shards must be valid shard ids")
     need(cfg.golden.lead_h >= 0, "golden.lead_h must be >= 0")

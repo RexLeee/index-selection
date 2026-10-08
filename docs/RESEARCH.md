@@ -223,6 +223,66 @@
 
 ---
 
+## 10. 補充調研（2026-10-08）
+
+### 10.1 伺服器現況（唯讀 SSH）
+
+| 項目 | 結果 |
+|---|---|
+| crawlerdb 當機 | 10-05 15:21 到 10-06 08:03 UTC，`pg_wal ... No space left on device` |
+| crawler | Host2 `crawler` 在 10-06 08:02 UTC 以 exit 137 停止（不是 OOM），到 10-08 都沒恢復，所以爬取狀態凍結 |
+| 磁碟與 IO | Host1 `/data` 剩 385 GB，每小時少約 0.7 GB；IO PSI avg10 6–14% |
+| PG 設定 | 16.11；`data_checksums`、`wal_log_hints` 都是 off；沒有 replication slot；`wal_level=replica`。所以抽樣讀取不產生 WAL |
+| 新容器 | 10-07 兩台主機各有一個 YugabyteDB 2026.1.2.0 節點，Host1 另有 `YugabyteDB-Voyager`（閒置） |
+| trending 池 | metricdb 存了每批完整的池：batch 18 有 14,761 個 query（選 985），batch 19 有 7,118 個（選 1,860），batch 1–9 每批 1.0–1.7 萬 |
+
+### 10.2 Google Trends 能拿到什麼
+
+1. **Trends 只產生 query 池，拿不到 golden URL。** golden 的標籤是 Google organic 前 10 名的 URL，只能從 SERP API 拿。信心 HIGH。
+2. **trending 池的免費來源：** `trendspy` 的 `trending_now(geo, hours)` 打 Google Trends 的 batchexecute，hours 可到 191，回傳 keyword、volume、起訖時間。這是非官方 API，最後 push 是 2024-12。信心 MED。
+3. **RSS 太小：** `trends.google.com/trending/rss?geo=US` 實測只有 10 筆，每筆 3 則新聞。信心 HIGH。
+4. **官方 Trends API（alpha，2025-07）** 只給搜尋熱度時間序列，要申請。信心 HIGH。
+5. **pytrends** 在 2025-04 封存。信心 HIGH。
+
+### 10.3 SERP 的免費額度
+
+| 供應商 | 免費 | 備註 | 信心 |
+|---|---|---|---|
+| SerpApi | 每月 250 次，每小時 250 次（2026-10-08 用免費的 Account API 實測；公開文章寫的 50 次已過時） | 官方 golden 的來源；無結果時回 `error` 欄位 | HIGH |
+| Serper.dev | 註冊送 2,500 次，一次性 | `POST /search`、`X-API-KEY`；回應會帶出它用的 `gl`/`hl`，所以要先和 SerpApi 校準 | MED |
+| Custom Search JSON API | 不收新用戶，2027-01-01 停用 | 不能用 | HIGH |
+| 自己爬 Google | 違反 ToS；Google 在 2025-12 控告 SerpApi | 不做 | HIGH |
+
+- Google 在 2025-09 不再支援 `num=100`。官方用 `num=10`，所以不受影響。信心 HIGH。
+- 預期效果：免費額度約多 2,400–3,200 個正例（+8–10%），只靠多出的訓練列預期提升 0.1–0.3 個百分點；batch 20 每個 tag 的配對 CI 半寬約 ±0.7 個百分點。比較可能看到的是前瞻批次 head query 的 nowcasting 效果。信心 LOW（推論）。
+
+### 10.4 YugabyteDB 讀取端
+
+- YSQL 支援 `TABLESAMPLE SYSTEM`，演算法由 `yb_sampling_algorithm` 決定（block-based 或全表掃描），「block」是 DocDB 的區塊，和 PG heap 頁不同。信心 MED。
+- `yb_hash_code(col)` 的範圍條件會下推到 DocDB，只送到持有該 hash 範圍的 tablet。前提是欄位是 HASH 主鍵。信心 MED。
+- follower reads 需要 `yb_read_from_followers = true` 加唯讀交易，而且要 RF > 1。兩個節點只能 RF 1。信心 HIGH。
+- `yb_read_time` 可讀過去時間點，預設歷史保留 900 秒（`timestamp_history_retention_interval_sec`）。信心 MED。
+- Voyager live migration 需要 `wal_level=logical`；fall-forward 需要第三份副本。信心 HIGH。
+
+### 10.5 來源（存取日期 2026-10-08）
+
+| 來源 | 信心 |
+|---|---|
+| [SerpApi Trending Now API](https://serpapi.com/google-trends-trending-now) | HIGH |
+| [SerpApi 免費方案整理](https://costbench.com/software/web-scraping/serpapi/free-plan/)、[免費 SERP 額度實測](https://apiserpent.com/blog/free-google-search-api-tested) | MED |
+| [Serper 額度說明](https://apiserpent.com/blog/serper-pricing-credits-explained) | MED |
+| [Google 控告 SerpApi](https://ppc.land/google-sues-serpapi-over-search-scraping-in-copyright-lawsuit/)（2025-12） | HIGH |
+| [Custom Search JSON API 停用](https://brave.com/learn/google-api-shutdown/) | HIGH |
+| [Google Trends API alpha](https://developers.google.com/search/blog/2025/07/trends-api)（2025-07-24） | HIGH |
+| [trendspy（DeepWiki）](https://deepwiki.com/sdil87/trendspy)、[PyPI](https://pypi.org/project/trendspy)；本機原始碼 0.1.6 | MED |
+| [num=100 移除](https://serpapi.com/blog/google-experiments-with-restricting-results-per-page/)（2025-09） | HIGH |
+| [YugabyteDB：TABLESAMPLE、yb_hash_code、follower reads、yb_read_time（DeepWiki）](https://deepwiki.com/yugabyte/yugabyte-db) | MED |
+| [Voyager live migration](https://docs.yugabyte.com/stable/yugabyte-voyager/migrate/live-migrate/) | HIGH |
+| [PostgreSQL 16 TABLESAMPLE](https://www.postgresql.org/docs/16/sql-select.html)、[REL_16 `system.c`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/tablesample/system.c)（SYSTEM ≥ 1% 用 bulkread 緩衝區） | HIGH |
+| 官方 golden 程式：`WebSearchEngine/Metric/RawDataReader/DatabaseRawDataReader.py`、`Metric/Query/QueryStrategy.py` | HIGH |
+
+---
+
 ## 9. 來源（存取日期 2026-10-06，除非另註）
 
 - Hendriksen et al., "The Open Web Index," ECIR 2024 — https://downloads.webis.de/publications/papers/hendriksen_2024.pdf

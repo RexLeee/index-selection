@@ -89,7 +89,8 @@ def write_work_dir(world: World, work_dir: Path, sample_percent: float = 100.0) 
                              work_dir / "sample" / f"shard={shard:03d}.parquet")
     atomic_write_json(work_dir / "sample" / "_meta.json", {
         "sample_percent": sample_percent, "sample_seed": 7,
-        "snapshot_at": SNAPSHOT.isoformat(), "shards_done": [0, 1, 2, 3]})
+        "snapshot_at": SNAPSHOT.isoformat(), "shards_done": [0, 1, 2, 3],
+        "finished_at": SNAPSHOT.isoformat()})
     golden = golden_table(world.golden_rows)
     write_parquet_atomic(golden, work_dir / "golden" / "golden.parquet")
     by_url = {p["url"]: p for p in clean}

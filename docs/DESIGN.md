@@ -45,7 +45,7 @@ selection/run=<id>/manifest  →  (future) fetcher → WARC → text → BM25 in
 |---|---|---|
 | `golden/golden.parquet`、`summary.json` | 全部 golden 列和每批統計 | `pull-golden` |
 | `dims/split_hosts.parquet` | `shard_split_subdomain` 白名單 | `pull-dims` |
-| `sample/shard=NNN.parquet`、`_meta.json` | 1% block sample；`snapshot_at` 是 S0 | `pull-sample` |
+| `sample/shard=NNN.parquet`、`_meta.json` | 1% block sample；`snapshot_at` 是 S0；`finished_at` 只在全部 shard 完成後出現，`shards_failed` 列出待重試的 shard | `pull-sample` |
 | `positives/batch=<id>.parquet` | 每批 golden 的原始與 canonical 拼法查到的列 | `pull-positives` |
 | `datasets/summary.json` | 每批的候選池大小、正例數、有無歷史 | `build-dataset` |
 | `backtests/<id>/` | `results.json`、`report.md` | `backtest` |
@@ -242,14 +242,25 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 
 | 風險 | 做法 |
 |---|---|
-| 寫入 crawlerdb（帳號是 superuser） | 每條連線設 `default_transaction_read_only=on`；用戶端 `assert_read_only_sql` 只放行單一讀取語句 |
-| 長查詢 | `statement_timeout` 120 秒；sample 每個 shard 一條語句，只讀約 1% 的頁 |
+| 寫入 crawlerdb（帳號是 superuser） | 每條連線設 `default_transaction_read_only=on` 和 `standard_conforming_strings=on`。用戶端 `assert_read_only_sql` 先用 `normalize_sql` 照 PostgreSQL 的詞法掃一遍：字串（含 `E''`、`$$`）收成 `''`，巢狀註解拿掉，引號識別字還原成名稱，`U&"..."` 直接拒絕，非 ASCII 字母也算識別字字元。`%s` 不能緊接在識別字或 `$` 後面，因為 psycopg 送出時會把它改寫成 `$1`。之後只放行單一讀取語句：COPY 必須正好是 `COPY (SELECT/WITH 查詢) TO STDOUT [[WITH] (選項)]`，伺服器端檔案或 PROGRAM 目標一律拒絕；`SELECT ... INTO` 也拒絕。關鍵字和函式的檢查一律涵蓋整段語句，並拒絕會改伺服器狀態或代執行 SQL 字串的函式族（`set_config`、`pg_terminate_backend`、replication slot、`pg_stat_*reset*`、advisory lock、`lo_*`、`brin_summarize_*`、`gin_clean_pending_list`、`pg_prewarm`、`query_to_xml` 等）。`statement_timeout` 只能經 `ReadOnlySession.set_statement_timeout` 以整數參數設定 |
+| 長查詢 | 預設 `statement_timeout` 120 秒，不能超過 `guard.timeout_cap_s`。sample 每個 shard 一條語句，只讀約 1% 的頁；逾時依 `pg_class.relpages` 和 `guard.min_mb_s` 計算，介於 `timeout_floor_s` 和 `timeout_cap_s` 之間（`pull.timeout_for`）。撞到逾時或 `lock_timeout` 的 shard 記進 `shards_failed`，其他 shard 繼續，下次執行再重試 |
 | 伺服器端暫存檔 | 不做 server 端排序或彙總；`temp_file_limit=0`、`work_mem=16MB`、不開平行 worker |
 | 搶資源 | 語句之間至少間隔 `pull.min_interval_s` |
-| 讀取時機 | **讀 crawlerdb 前要取得助教同意。** 避開量測日（1、16 日 00:00–20:00 UTC）和 accounting/gc 時段（02:50–04:40 UTC） |
+| 讀取時機 | **讀 crawlerdb 前要取得助教同意**（2026-10-08 已同意）。`ReadGuard` 在 crawlerdb 和 metricdb 的每條語句前檢查：語句跑滿逾時也不會進入 golden 建立與量測日（1、16 日 00:00–20:00 UTC）、accounting/gc 時段（02:50–04:40 UTC）或每小時 :55–:10；`pg_stat_activity` 中等待 IO 的連線數（3 次取中位數）超過 `max_io_waiters` 就暫停。IO 探測本身要 2 秒，所以探測完再檢查一次時段才放行。每次等待都寫進 log。時段和門檻都在 `[guard]` |
+| S0 的意義 | `pull-sample` 開始時記下 `frozen_probe`（server 啟動時間加 `url_state_current_*` 累計寫入列數）。`advance-snapshot` 只接受已完成的 sample，再量一次，完全相同才把 S0 移到現在，否則拒絕 |
+| 資料不完整 | `FeatureStore` 拒絕沒有 `finished_at` 的 sample |
 | 憑證外洩 | DSN 只放環境變數；所有 JSON 輸出經過 `assert_no_secrets` |
 
 ---
+
+### 9.1 crawlerdb 若遷移到 YugabyteDB（只規劃，未實作）
+
+1. **觸發條件：** 助教確認切換日期之後才動工。
+2. **先看 schema：** 從 Voyager 產生的 DDL 確認 `url` 是 HASH 主鍵的第一欄，以及 256 張表是否保留。
+3. **抽樣：** 改用 `WHERE yb_hash_code(url) < floor(65536 × p)`。條件會下推到 DocDB，只讀對應的 hash 範圍，抽到的是列層均勻樣本，沒有區塊群聚。先用 `EXPLAIN` 確認下推。`_meta.json` 記錄抽樣方式；hash 樣本和 TABLESAMPLE 樣本不能混用。
+4. **設定：** session GUC 依 engine 分開。`pg_class.relpages` 沒有意義，改用 `reltuples × p` 估讀取量。`yb_read_time` 預設只保留 900 秒歷史，不能拿來固定 S0；仍用 `frozen_probe`。兩個節點只能 RF 1，沒有 follower reads 可以分流。
+5. **驗證：** 本機用同版本 YugabyteDB 容器跑合約測試。PG 和 YB 並存時，golden URL 的主鍵查詢要逐筆一致，樣本只比較分布。
+6. **要提醒助教的風險：** Voyager export 目錄和 YB 資料目錄都在 Host1 `/data`（2026-10-08 剩 385 GB，crawlerdb 6.6 TB）。live migration 要把 `wal_level` 改成 logical（需重啟），replication slot 卡住會累積 WAL，可能再次寫滿 `/data`。
 
 ## 10. 執行手冊（Host2）
 
@@ -262,11 +273,13 @@ uv run isel $C pull-golden                  # metricdb only
 # --- needs TA approval from here ---
 uv run isel $C pull-dims
 uv run isel $C pull-positives
-uv run isel $C pull-sample --dry-run
-uv run isel $C pull-sample                  # ~16.6M rows, resumable per shard
+uv run isel $C pull-sample --dry-run        # pg_class only: pages, timeouts, next window
+uv run isel $C pull-sample                  # ~16.6M rows, resumable per shard, guarded; rerun until shards_missing = 0
+uv run isel $C validate-sample              # refetched_share: how often "fetched once" fails
 uv run isel $C validate-routing             # expect candidate_rate >= 0.99
 uv run isel $C build-dataset
 uv run isel $C backtest --feature-sets full,no_inlinks,no_domain,no_history
+uv run isel $C advance-snapshot             # only if crawlerdb is unchanged since the sample
 uv run isel $C train                        # freeze before 2026-10-16 12:00 UTC
 # after batch 20 exists:
 uv run isel $C pull-golden
@@ -282,4 +295,5 @@ uv run isel $C forward-eval --model-dir work/models/<id> --batch 20
 - **block sample：** TABLESAMPLE SYSTEM 以頁為單位抽，同一頁的列常來自同一網域。小網域的 `*_size` 和 `rel_*` 估計較吵。
 - **跨 shard 重複：** 同一 URL 出現在兩個 shard 時，sample 排名會算兩次。影響可忽略。
 - **拼法：** 清單目前輸出 crawler 的拼法。過去 golden 的原始拼法若和 canonical 不同，exact 比對會漏掉；`indexed_canonical_rate` 顯示這部分的損失。
+- **每個 URL 只爬一次：** §3 依賴這個假設。sample 帶回 `num_fetch_ok_90d` 只為了檢查它（`FORBIDDEN` 擋住它進模型，`FeatureStore` 也不載入它和 `title`）。`validate-sample` 的 `refetched_share` 偏高時，pool 會把重抓的頁誤當成 batch 之後才爬到。
 - **batch 10–17 是空的：** 測試 batch 18 時，最近的訓練 batch 是 3 個月前的 batch 8 或 9。
