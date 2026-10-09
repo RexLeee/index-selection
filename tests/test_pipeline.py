@@ -249,3 +249,11 @@ def test_backtest_batch_before_snapshot_is_rejected_for_forward_eval(work):
     model_dir = train_frozen(cfg, work, [])
     with pytest.raises(RuntimeError, match="existed before the snapshot"):
         forward_eval(cfg, work, [model_dir], 8, ["random"])
+
+
+def test_training_frames_have_a_stable_row_order(work):
+    # LightGBM bagging picks rows by position, so row order decides the model.
+    cfg = small_cfg(work)
+    a = _store(cfg, work).frame(5, "train")
+    b = FeatureStore(cfg, open_duckdb(cfg, work / "tmp2"), work).frame(5, "train")
+    assert a.column("url").equals(b.column("url"))

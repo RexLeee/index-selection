@@ -347,10 +347,12 @@ class FeatureStore:
             batch_id: The batch whose pool, label and as-of time apply.
             mode: "eval" keeps every sample row in the pool plus the batch's golden
                 rows; "train" keeps the golden rows plus a hashed subsample of the
-                other sample rows at rate `dataset.neg_rate`.
+                other sample rows at rate `dataset.neg_rate`, ordered by (url, shard)
+                because LightGBM bagging picks rows by position.
         """
         if mode not in ("eval", "train"):
             raise ValueError(f"unknown mode {mode!r}")
+        order = "ORDER BY c.url, c.shard" if mode == "train" else ""
         b = self.batch(batch_id)
         a = float(self.cfg.features.eb_pseudo_hits)
         ppm = round(self.cfg.dataset.neg_rate * 1_000_000)
@@ -409,6 +411,7 @@ LEFT JOIN (SELECT * FROM expo_host WHERE batch_id = {batch_id}) hs ON hs.k = c.h
 LEFT JOIN (SELECT * FROM dem_dkey WHERE batch_id = {batch_id}) dd ON dd.k = c.dkey
 LEFT JOIN (SELECT * FROM dem_host WHERE batch_id = {batch_id}) dh ON dh.k = c.host
 LEFT JOIN (SELECT * FROM uhist WHERE batch_id = {batch_id}) u ON u.url = c.url
+{order}
 """
 
     def frame(self, batch_id: int, mode: str) -> pa.Table:

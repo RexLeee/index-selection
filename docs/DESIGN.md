@@ -132,6 +132,7 @@ lift_x = ln(r_x / r_global)
 **訓練：**
 
 - 訓練 batch：`first_label_batch` 之後、在測試 batch 的 as-of 之前已存在、而且有 golden 歷史。
+- train frame 依 (url, shard) 排序。LightGBM 的 bagging 依列的位置抽樣，DuckDB 平行查詢的列順序又不固定，不排序的話，同樣的輸入每次會訓練出不同的模型。
 - early stopping 只看最後一個訓練 batch。`refit_on_all = true` 時，用最佳輪數在全部訓練 batch 上重訓。
 - 測試 batch 永遠不參與調參。
 
