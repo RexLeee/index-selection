@@ -281,6 +281,46 @@
 | [PostgreSQL 16 TABLESAMPLE](https://www.postgresql.org/docs/16/sql-select.html)、[REL_16 `system.c`](https://github.com/postgres/postgres/blob/REL_16_STABLE/src/backend/access/tablesample/system.c)（SYSTEM ≥ 1% 用 bulkread 緩衝區） | HIGH |
 | 官方 golden 程式：`WebSearchEngine/Metric/RawDataReader/DatabaseRawDataReader.py`、`Metric/Query/QueryStrategy.py` | HIGH |
 
+### 10.6 負例：「現在沒進 golden」能不能當負例（2026-10-09）
+
+**問題：** 負例是沒進 golden(b) 的已爬頁，但它可能在之後的 batch 進 golden。
+
+**結論：**
+
+1. 標籤是每個 batch 各自定義的，模型估 P(url ∈ golden(b) | as_of_b)。官方 metric 量的正是下一批的觀測標籤，所以不做 PU 修正。信心 HIGH。
+2. 在 SCAR 下，「已標記 vs 未標記」分類器的分數只和真實機率差常數倍，排序不變（Elkan & Noto 2008）。random tag 由官方從 trending 池均勻抽，接近 SCAR；head 依搜尋量挑，屬於 SAR，但 head 本身就是指標的一部分。信心 HIGH。
+3. 過去 golden 在下一批重複出現 0.6–2.7%，比一般頁高 400 倍以上（§3.5）。推算一般已爬頁進入下一批的機率上限約 7×10⁻⁵，`build-dataset` 的 `later_golden_share` 會實測。信心 LOW（推論）。
+4. 延遲回饋（Chapelle 2014）處理「同一事件的標籤晚到」；golden(b) 在建立時就完整，所以不適用。改用「未來 H 批內出現」的標籤才會遇到截斷，batch 10–17 空白讓它更嚴重。信心 MED。
+5. RocketQA 指出從檢索前幾名挑的難負例常是未標記的正例；本專案的負例是雜湊隨機抽樣，假負例不會集中。信心 MED。
+6. 官方 metric 是原始字串完全比對；crawler 存 redirect 之後的 `canonicalize_url(response.url)`，不合併 http/https、`www`、尾斜線。所以同一頁的拼法變體是真負例，而只靠 canonical 拼法配上的正例在官方 metric 下拿不到分。信心 HIGH（讀過程式碼）。
+
+**做法（DESIGN §5）：** 維持標籤定義；`build-dataset` 輸出稽核欄位；`later_unlabeled` 回測實驗依事先寫定的規則判定。
+
+**程式位置（本機 clone，2026-10-09 讀取）：**
+
+| 內容 | 位置 |
+|---|---|
+| 官方 indexed 判定：完全比對 | `WebSearchEngine/Metric/Measure/CrawlerAllMetricMeasure.py:79-84, 207-209` |
+| golden URL 是 SerpApi 原始 `link` | `WebSearchEngine/Metric/Query/QueryStrategy.py:36` |
+| crawler 存 `canonicalize_url(response.url)` | `WebCrawler/containers/crawler/crawler/spiders/spider.py:361, 364, 421`；同目錄 `settings.py:95`（`REDIRECT_ENABLED`） |
+| golden 原始拼法直接寫入 crawlerdb | `WebCrawler/scripts/golden_inject.py:179-206` |
+
+**來源：**
+
+| 來源 | 日期 | 信心 |
+|---|---|---|
+| [Elkan & Noto, Learning Classifiers from Only Positive and Unlabeled Data](https://cseweb.ucsd.edu/~elkan/posonly.pdf) | KDD 2008 | HIGH |
+| [Bekker & Davis, Learning from positive and unlabeled data: a survey](https://arxiv.org/pdf/1811.04820) | Machine Learning 109, 2020 | HIGH |
+| [Bekker, Robberechts & Davis, Beyond the SCAR Assumption](https://arxiv.org/pdf/1809.03207) | ECML PKDD 2019 | MED |
+| [Kiryo et al., PU Learning with Non-Negative Risk Estimator](https://arxiv.org/pdf/1703.00593) | NeurIPS 2017 | HIGH |
+| [Chapelle, Modeling delayed feedback in display advertising](https://unpaywall.org/10.1145%2F2623330.2623634) | KDD 2014 | HIGH |
+| [Weng & Engelhard, Bridging mixture cure models and PU learning](https://arxiv.org/abs/2609.19370)（預印本） | 2026-09-16 | MED |
+| [Liang et al., Modeling User Exposure in Recommendation](https://arxiv.org/pdf/1510.07025) | WWW 2016 | HIGH |
+| [Qu et al., RocketQA](https://arxiv.org/pdf/2010.08191) | NAACL 2021 | HIGH |
+| [Fithian & Hastie, Finite-sample equivalence in models for presence-only data](https://arxiv.org/pdf/1207.6950)：presence-only 資料只能估相對強度 | AoAS 2013 | HIGH |
+| [Altingovde, Ozcan & Ulusoy, Static index pruning with query views](https://repository.bilkent.edu.tr/items/addf8e2a-5543-4e87-8785-8fa37531b952) | TOIS 30(1), 2012 | HIGH |
+| [Anagnostopoulos et al., Stochastic query covering](https://ir.webis.de/anthology/2011.wsdm_conference-2011.80/) | WSDM 2011 | MED |
+
 ---
 
 ## 9. 來源（存取日期 2026-10-06，除非另註）

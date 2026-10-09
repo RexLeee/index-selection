@@ -69,6 +69,11 @@ def _fit_all(cfg: Config, store: FeatureStore, batches: list[int], feature_sets:
                                          valid, kind="v1_features")
     if "logreg" in baselines:
         models["logreg"] = fit_logreg(cfg, m, resolve_set(cfg, cfg.model.feature_set), offset)
+    if "later_unlabeled" in baselines:
+        # Ablation: negatives that turn golden in a later training batch leave the data.
+        models["later_unlabeled"] = fit_lgbm(cfg, m.subset(~m.later_golden),
+                                             resolve_set(cfg, cfg.model.feature_set), offset,
+                                             valid)
     return models
 
 

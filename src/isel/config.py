@@ -217,7 +217,7 @@ SERP_PROVIDERS = ("serpapi", "serper")
 BUDGET_PERIODS = ("month", "total")   # free plan resets monthly; signup credits never do
 KNOWN_BASELINES = (
     "random", "inlinks", "ext", "domain_prior", "logreg", "v1_features",
-    "url_score", "v2_baseline_v1",
+    "url_score", "v2_baseline_v1", "later_unlabeled",
 )
 
 

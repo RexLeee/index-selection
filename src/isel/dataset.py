@@ -18,7 +18,13 @@ class Matrix:
     y: np.ndarray
     w: np.ndarray
     batch: np.ndarray
+    later_golden: np.ndarray   # negative whose URL is golden in a later training batch
     features: list[str]
+
+    def subset(self, keep: np.ndarray) -> Matrix:
+        """The rows where `keep` is true."""
+        return Matrix(self.x[keep], self.y[keep], self.w[keep], self.batch[keep],
+                      self.later_golden[keep], self.features)
 
 
 def to_numpy(table: pa.Table, features: list[str]) -> np.ndarray:
@@ -60,10 +66,21 @@ def tag_weights(in_head: np.ndarray, in_random: np.ndarray) -> np.ndarray:
 
 
 def training_matrix(store: FeatureStore, batches: list[int], features: list[str]) -> Matrix:
-    xs, ys, ws, bs = [], [], [], []
+    """Stacks the train frames of `batches`.
+
+    `later_golden` marks negatives whose URL is golden in a batch of `batches`
+    created after their own. Those labels are known wherever `batches` is a valid
+    training set, so masking them does not leak (the `later_unlabeled` baseline).
+    """
+    created = {b: store.batch(b).created_at for b in batches}
+    xs, ys, ws, bs, ls = [], [], [], [], []
     for batch in batches:
         table = store.frame(batch, "train")
         y = table.column("label").to_numpy(zero_copy_only=False).astype(np.int8)
+        later = [b for b in batches if created[b] > created[batch]]
+        golden = (pc.is_in(table.column("url"), value_set=store.golden_spellings(later))
+                  .to_numpy(zero_copy_only=False) if later else np.zeros(len(y), bool))
+        ls.append(golden & (y == 0))
         w = np.ones(len(y), dtype=np.float64)
         pos = y == 1
         head = table.column("in_head").to_numpy(zero_copy_only=False)[pos]
@@ -76,4 +93,4 @@ def training_matrix(store: FeatureStore, batches: list[int], features: list[str]
     if not xs:
         raise ValueError("no training batches")
     return Matrix(np.vstack(xs), np.concatenate(ys), np.concatenate(ws), np.concatenate(bs),
-                  list(features))
+                  np.concatenate(ls), list(features))

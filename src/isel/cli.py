@@ -15,7 +15,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from isel.config import SERP_PROVIDERS, Config, ConfigError, load_config
+from isel.config import KNOWN_BASELINES, SERP_PROVIDERS, Config, ConfigError, load_config
 from isel.features import FeatureStore
 from isel.io import atomic_write_json, open_duckdb, read_json, sql_str
 
@@ -33,6 +33,15 @@ def _ids(text: str | None) -> list[int] | None:
 
 def _names(text: str | None, default: list[str]) -> list[str]:
     return [n for n in text.split(",") if n] if text else list(default)
+
+
+def _baselines(text: str | None, cfg: Config) -> list[str]:
+    """Baseline names from `--baselines` (default `eval.baselines`); unknown names exit."""
+    names = _names(text, cfg.eval.baselines)
+    unknown = sorted(set(names) - set(KNOWN_BASELINES))
+    if unknown:
+        raise SystemExit(f"unknown baselines {unknown}; known: {', '.join(KNOWN_BASELINES)}")
+    return names
 
 
 def _print(obj: Any) -> None:
@@ -194,14 +203,21 @@ def cmd_validate_routing(cfg: Config, args: argparse.Namespace) -> Any:
 
 
 def cmd_build_dataset(cfg: Config, args: argparse.Namespace) -> Any:
-    """Writes per-batch pool sizes, label counts and history flags for inspection."""
+    """Writes per-batch pool sizes, label counts, label audit and history flags.
+
+    `canonical_only_positives` are positives whose crawler URL matches only the
+    canonical spelling; the official metric compares the raw spelling, so it can
+    never count them as indexed.
+    """
     store = FeatureStore(cfg, open_duckdb(cfg, cfg.work_dir / "duckdb_tmp"), cfg.work_dir)
     summary = {}
     for b in store.batches:
-        (positives, head, rand) = store.con.execute(
+        (positives, head, rand, canonical_only) = store.con.execute(
             f"SELECT count(*), count(*) FILTER (WHERE l.in_head), "
-            f"count(*) FILTER (WHERE l.in_random) FROM crawl c JOIN label_urls l "
-            f"ON l.url = c.url AND l.batch_id = {b.batch_id} "
+            f"count(*) FILTER (WHERE l.in_random), count(*) FILTER (WHERE r.url IS NULL) "
+            f"FROM crawl c JOIN label_urls l ON l.url = c.url AND l.batch_id = {b.batch_id} "
+            f"LEFT JOIN (SELECT DISTINCT raw_url AS url FROM gold "
+            f"WHERE batch_id = {b.batch_id}) r ON r.url = c.url "
             f"WHERE c.last_fetch_ok < '{b.as_of.isoformat()}'::TIMESTAMPTZ").fetchone()
         (golden_urls,) = store.con.execute(
             f"SELECT count(DISTINCT raw_url) FROM gold WHERE batch_id = {b.batch_id}").fetchone()
@@ -210,7 +226,9 @@ def cmd_build_dataset(cfg: Config, args: argparse.Namespace) -> Any:
             "available_at": b.available_at, "golden_urls": golden_urls,
             "pool_rows_est": store.pool_size(b.batch_id) / store.rate,
             "positive_rows": positives, "head_rows": head, "random_rows": rand,
+            "canonical_only_positives": canonical_only,
             "has_history": store.has_history(b.batch_id),
+            **(store.label_audit(b.batch_id) if b.official else {}),
         }
     atomic_write_json(cfg.work_dir / "datasets" / "summary.json", summary)
     return summary
@@ -231,7 +249,7 @@ def cmd_backtest(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.backtest import run_backtest
 
     out = run_backtest(cfg, cfg.work_dir, _names(args.feature_sets, [cfg.model.feature_set]),
-                       _names(args.baselines, cfg.eval.baselines))
+                       _baselines(args.baselines, cfg))
     return {"results": str(out / "results.json"), "report": str(out / "report.md")}
 
 
@@ -249,14 +267,14 @@ def cmd_train(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.backtest import train_frozen
 
     return {"model_dir": str(train_frozen(cfg, cfg.work_dir,
-                                          _names(args.baselines, cfg.eval.baselines)))}
+                                          _baselines(args.baselines, cfg)))}
 
 
 def cmd_forward_eval(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.backtest import forward_eval
 
     out = forward_eval(cfg, cfg.work_dir, [Path(d) for d in args.model_dir], args.batch,
-                       _names(args.baselines, cfg.eval.baselines))
+                       _baselines(args.baselines, cfg))
     return {"results": str(out / "results.json"), "report": str(out / "report.md")}
 
 

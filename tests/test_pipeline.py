@@ -1,20 +1,25 @@
 from __future__ import annotations
 
+from argparse import Namespace
 from datetime import UTC, datetime, timedelta
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import pytest
 from conftest import replace, small_cfg
 from synth import SNAPSHOT, make_world, write_pseudo, write_work_dir
 
 from isel.backtest import forward_eval, run_backtest, select_sample, train_frozen
-from isel.dataset import train_batches
-from isel.features import FeatureStore
+from isel.cli import cmd_backtest, cmd_build_dataset
+from isel.dataset import train_batches, training_matrix
+from isel.features import FeatureStore, resolve_set
 from isel.golden import PSEUDO, golden_table, pseudo_batch_path
 from isel.io import atomic_write_json, open_duckdb, read_json, write_parquet_atomic
 from isel.manifest import validate_run
+from isel.pull import CRAWL_SCHEMA
+from isel.urlnorm import canonicalize
 
 
 @pytest.fixture(scope="module")
@@ -249,6 +254,123 @@ def test_backtest_batch_before_snapshot_is_rejected_for_forward_eval(work):
     model_dir = train_frozen(cfg, work, [])
     with pytest.raises(RuntimeError, match="existed before the snapshot"):
         forward_eval(cfg, work, [model_dir], 8, ["random"])
+
+
+def _add_golden(work, world, extra):
+    """Rewrites golden.parquet as `world`'s rows plus `{batch: [url, ...]}`."""
+    rows = list(world.golden_rows)
+    for qid, (batch, urls) in enumerate(extra.items(), start=990_000):
+        rows += [(batch, world.batches[batch], qid, f"extra{qid}", 1, ["random"], rank, u)
+                 for rank, u in enumerate(urls, start=1)]
+    write_parquet_atomic(golden_table(rows), work / "golden" / "golden.parquet")
+
+
+def _never_golden(world, fetched_before, n=1):
+    golden = {u for r in world.golden_rows for u in (r[7], canonicalize(r[7]))}
+    return [p["url"] for p in world.pages
+            if p["url"] not in golden and p["last_fetch_ok"] < fetched_before][:n]
+
+
+def _flagged(m, batch):
+    return int(m.later_golden[m.batch == batch].sum())
+
+
+def test_label_audit_counts_negatives_that_turn_golden_later(work, world):
+    cfg = small_cfg(work)
+    before = cmd_build_dataset(cfg, Namespace())
+    (url,) = _never_golden(world, world.batches[5] - timedelta(days=2))
+    _add_golden(work, world, {7: [url]})
+    after = cmd_build_dataset(cfg, Namespace())
+
+    def delta(batch, key):
+        return after[str(batch)][key] - before[str(batch)][key]
+
+    assert (delta(5, "neg_later_golden"), delta(5, "neg_next_golden"),
+            delta(5, "neg_rows")) == (1, 0, 0)
+    assert (delta(6, "neg_later_golden"), delta(6, "neg_next_golden")) == (1, 1)
+    assert (delta(7, "neg_rows"), delta(7, "positive_rows")) == (-1, 1)
+    assert [delta(8, k) for k in ("neg_rows", "neg_later_golden", "neg_next_golden")] == [0] * 3
+    assert after["9"]["neg_next_golden"] is None
+    assert after["5"]["later_golden_share"] == pytest.approx(
+        after["5"]["neg_later_golden"] / after["5"]["neg_rows"])
+    assert read_json(work / "datasets" / "summary.json")["7"]["neg_rows"] == after["7"]["neg_rows"]
+
+
+def test_label_audit_counts_positives_matched_only_by_canonical_spelling(work, world):
+    cfg = small_cfg(work)
+    summary = cmd_build_dataset(cfg, Namespace())
+    store = _store(cfg, work)
+    for batch in (5, 8):
+        as_of = store.batch(batch).as_of
+        crawled = {p["url"] for p in world.pages if p["last_fetch_ok"] < as_of}
+        raws = {r[7] for r in world.golden_rows if r[0] == batch}
+        expected = len(({canonicalize(u) for u in raws} - raws) & crawled)
+        assert expected > 0
+        assert summary[str(batch)]["canonical_only_positives"] == expected
+
+
+def test_label_audit_counts_other_spellings_of_golden_pages(work, world):
+    cfg = small_cfg(work)
+    before = cmd_build_dataset(cfg, Namespace())
+    early = world.batches[5] - timedelta(days=2)
+    raws = {r[7] for r in world.golden_rows if r[0] == 5}
+    page = next(p for p in world.pages if p["url"] in raws and p["last_fetch_ok"] < early)
+    variant = {k: v for k, v in page.items() if not k.startswith("_")}
+    variant.update(url=page["url"].replace("https://www.", "http://"), shard=0)
+    path = work / "sample" / "shard=000.parquet"
+    write_parquet_atomic(pa.Table.from_pylist([*pq.read_table(path).to_pylist(), variant],
+                                              schema=CRAWL_SCHEMA), path)
+    after = cmd_build_dataset(cfg, Namespace())
+    assert after["5"]["neg_variant_golden"] - before["5"]["neg_variant_golden"] == 1
+
+
+def test_training_matrix_flags_negatives_golden_in_a_later_training_batch(work, world):
+    cfg = replace(small_cfg(work), "dataset", neg_rate=1.0)
+    features = resolve_set(cfg, cfg.model.feature_set)
+    base = training_matrix(_store(cfg, work), [4, 5, 6], features)
+    (url,) = _never_golden(world, world.batches[4] - timedelta(days=2))
+    _add_golden(work, world, {6: [url]})
+    m = training_matrix(_store(cfg, work), [4, 5, 6], features)
+    assert [_flagged(m, b) - _flagged(base, b) for b in (4, 5)] == [1, 1]
+    assert _flagged(m, 6) == 0
+    assert not m.later_golden[m.y == 1].any()
+    kept = m.subset(~m.later_golden)
+    assert len(kept.y) == len(m.y) - int(m.later_golden.sum())
+    assert kept.y.sum() == m.y.sum() and not kept.later_golden.any()
+
+
+def test_later_golden_flags_ignore_batches_outside_the_training_set(work, world):
+    cfg = replace(small_cfg(work), "dataset", neg_rate=1.0)
+    features = resolve_set(cfg, cfg.model.feature_set)
+    store = _store(cfg, work)
+    train = train_batches(cfg, store, 8)
+    base = training_matrix(store, train, features)
+    urls = _never_golden(world, world.batches[2], n=5)
+    _add_golden(work, world, {8: urls[:3], 9: urls[3:]})
+    store = _store(cfg, work)
+    assert train_batches(cfg, store, 8) == train
+    m = training_matrix(store, train, features)
+    for b in train:
+        assert _flagged(m, b) == _flagged(base, b)
+        assert int(m.y[m.batch == b].sum()) == int(base.y[base.batch == b].sum())
+
+
+def test_backtest_reports_the_later_unlabeled_variant(work):
+    cfg = replace(small_cfg(work), "eval", test_batches=[8])
+    out = run_backtest(cfg, work, ["full"], ["later_unlabeled"])
+    results = read_json(out / "results.json")
+    models = results["batches"]["8"]["models"]
+    ref, variant = models["lgbm:full"], models["later_unlabeled"]
+    assert variant["train_batches"] == ref["train_batches"]
+    assert variant["positives"] == ref["positives"] and variant["rows"] < ref["rows"]
+    assert "diff_vs_reference_ci95" in results["pooled"]["head"]["scorers"]["later_unlabeled"]
+    assert "later_unlabeled" in (out / "report.md").read_text()
+
+
+def test_cli_rejects_unknown_baseline_names(work):
+    with pytest.raises(SystemExit, match="later_unlabled"):
+        cmd_backtest(small_cfg(work), Namespace(feature_sets=None,
+                                                baselines="random,later_unlabled"))
 
 
 def test_training_frames_have_a_stable_row_order(work):

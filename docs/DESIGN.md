@@ -54,7 +54,7 @@ selection/run=<id>/manifest  →  (future) fetcher → WARC → text → BM25 in
 | `dims/split_hosts.parquet` | `shard_split_subdomain` 白名單 | `pull-dims` |
 | `sample/shard=NNN.parquet`、`_meta.json` | 1% block sample；`snapshot_at` 是 S0；`finished_at` 只在全部 shard 完成後出現，`shards_failed` 列出待重試的 shard | `pull-sample` |
 | `positives/batch=<id>.parquet` | 每批 golden 的原始與 canonical 拼法查到的列 | `pull-positives` |
-| `datasets/summary.json` | 每批的候選池大小、正例數、有無歷史 | `build-dataset` |
+| `datasets/summary.json` | 每批的候選池大小、正例數、有無歷史、標籤稽核（§5） | `build-dataset` |
 | `backtests/<id>/` | `results.json`、`report.md` | `backtest` |
 | `models/<id>/` | 凍結的 LightGBM 模型和 meta | `train` |
 | `forward_evals/batch=<b>_<id>/` | 前瞻評估結果 | `forward-eval` |
@@ -127,13 +127,28 @@ lift_x = ln(r_x / r_global)
 - 負例：sample ∩ pool_b 中其他列，用 `md5(url + salt + b)` 雜湊再抽 `neg_rate`。
 - 正例權重依 tag 平衡，讓 head 和 random 的總權重相同。
 
+**標籤的意義：** 標籤是每個 batch 各自定義的，模型估的是 P(url ∈ golden(b) | as_of_b 的特徵)。
+
+- 一頁在 batch 3 是負例、batch 7 是正例，是這個機率的正常結果，不是標錯。官方 metric 量的也是「下一批 golden 有沒有被收錄」，所以目標就是這個觀測到的標籤過程。
+- PU learning 的修正估的是「潛在相關」，會偏離官方 metric，所以不做。就算改估「未來會不會進」，在 SCAR（已標記的正例是全部正例的隨機子集）下，Elkan & Noto (2008) 證明分數只差常數倍，top-K 排序不變。
+- 官方只認原始拼法（§6）。同一頁的 http/https、`www`、尾斜線變體在 crawlerdb 是不同列，選它們拿不到分，所以它們是真負例。
+- `build-dataset` 的稽核欄位，每個官方 batch 一組：
+
+| 欄位 | 意義 |
+|---|---|
+| `neg_rows` | pool_b 中的 sample 負例數 |
+| `neg_later_golden`、`neg_next_golden` | 其中 URL 在之後任一個／下一個官方 batch 是 golden 的列數。用到未來資訊，只做診斷 |
+| `later_golden_share` | `neg_later_golden / neg_rows`，即母體比例的估計 |
+| `neg_variant_golden` | 和 golden(b) 某個拼法只差 scheme、開頭 `www.` 或結尾 `/` 的 sample 負例 |
+| `canonical_only_positives` | 只靠 canonical 拼法配上的正例。原始拼法和 canonical 不同時，原始那列不會被爬到，官方 metric 永遠不會算它命中 |
+
 **case-control 修正：** 負例的總抽樣率是 p·q。母體 logit = 模型 logit + ln(p·q)。修正只平移分數，不改 top-K 排序；它用來做校準檢查。
 
 **訓練：**
 
 - 訓練 batch：`first_label_batch` 之後、在測試 batch 的 as-of 之前已存在、而且有 golden 歷史。
 - train frame 依 (url, shard) 排序。LightGBM 的 bagging 依列的位置抽樣，DuckDB 平行查詢的列順序又不固定，不排序的話，同樣的輸入每次會訓練出不同的模型。
-- early stopping 只看最後一個訓練 batch。`refit_on_all = true` 時，用最佳輪數在全部訓練 batch 上重訓。
+- early stopping 只看最後一個官方訓練 batch。`refit_on_all = true` 時，用最佳輪數在全部訓練 batch 上重訓。
 - 測試 batch 永遠不參與調參。
 
 **baseline：**
@@ -147,6 +162,16 @@ lift_x = ln(r_x / r_global)
 | `v1_features` | V1 複製版：URL 形狀加 `dem_dkey` 的 LightGBM | 是 |
 | `url_score` | crawler 的 ranker 分數 | **只在前瞻評估** |
 | `v2_baseline_v1` | V2 公式 `tier + (inlinks + ext + url_score + 2·prior)/5` | **只在前瞻評估** |
+| `later_unlabeled` | 同 `full` 的 LightGBM，但訓練 batch b 的負例中，URL 在同一個訓練清單裡、建立時間晚於 b 的 batch 是 golden 的列不參與訓練 | 是；`train` 不會訓練它 |
+
+**`later_unlabeled` 實驗（事先寫定，2026-10-14 20:10 凍結前判定）：**
+
+- 它直接檢驗「之後會進 golden 的頁不該當負例」。訓練清單只含測試 as-of 前可用的 batch，所以沒有洩漏。
+- 變體和 `lgbm:full` 用同一個訓練矩陣，只遮掉被標記的列，負例抽樣、特徵和列順序都相同。
+- 執行：`backtest --baselines random,later_unlabeled`。判定用預設 `eval.test_batches` 的 pooled 結果，B18、B19 另外列出。
+- 採用條件：每個 tag 的 `later_unlabeled − lgbm:full` 配對 95% CI 下界都 > 0。被拿掉的列數（兩者 meta 的 `rows` 差）要和 CI 並列；拿掉的列很少卻判定通過時，視為訓練隨機性，不採用。原因是配對 CI 只重抽 query，不包含 LightGBM bagging 的變異。
+- 沒通過就維持現狀，結果照樣寫進報告。通過時才加 `dataset` 設定開關，讓 M0 和 M1 一起改用。
+- 限制：最新的官方訓練 batch 沒有「之後」，所以它的負例永遠不會被拿掉。
 
 ---
 
@@ -189,8 +214,8 @@ lift_x = ln(r_x / r_global)
 
 **指標：**
 
-- `indexed_exact_rate`：原始字串完全比對，等於官方 metric。
-- `indexed_canonical_rate`：原始或 canonical 拼法有一個入選就算。
+- `indexed_exact_rate`：原始字串完全比對，等於官方 metric。官方用 SerpApi 原始 `link` 對 `selected_urls_current.url` 做完全比對，沒有任何正規化（`WebSearchEngine/Metric/Measure/CrawlerAllMetricMeasure.py:79-84, 207-209`）。
+- `indexed_canonical_rate`：原始拼法或 canonical 拼法的字串有一個入選就算。它不涵蓋 http/https、`www` 這類等價拼法。
 - `crawled_exact_rate`、`crawled_canonical_rate`：as-of 時已爬的上限。
 - 三種 K：`k_values`、`fractions`（pool 的比例）、`gain_curve_k`。
 
@@ -321,8 +346,9 @@ uv run isel $C pull-sample --dry-run        # pg_class only: pages, timeouts, ne
 uv run isel $C pull-sample                  # ~16.6M rows, resumable per shard, guarded; rerun until shards_missing = 0
 uv run isel $C validate-sample              # refetched_share: how often "fetched once" fails
 uv run isel $C validate-routing             # expect candidate_rate >= 0.99
-uv run isel $C build-dataset
+uv run isel $C build-dataset                # also the label audit (DESIGN §5)
 uv run isel $C backtest --feature-sets full,no_inlinks,no_domain,no_history
+uv run isel $C backtest --feature-sets full --baselines random,later_unlabeled  # pre-registered §5
 # --- pseudo golden (SERP calls run on a laptop with ISEL_SERPAPI_KEY / ISEL_SERPER_KEY) ---
 uv run isel $C trends-snapshot --source trendspy
 uv run isel $C trends-snapshot --source serpapi       # same hour, 10 SerpApi calls
@@ -350,7 +376,8 @@ uv run isel $C forward-eval --model-dir work/models/<M0> --model-dir work/models
 - **inlinks 膨脹：** 回測的 inlink 特徵在 batch 之後量測，可能被 patrol 膨脹。前瞻評估能排除這點；為了縮短落差，新 batch 出現後要盡快跑 `pull-positives`。
 - **block sample：** TABLESAMPLE SYSTEM 以頁為單位抽，同一頁的列常來自同一網域。小網域的 `*_size` 和 `rel_*` 估計較吵。
 - **跨 shard 重複：** 同一 URL 出現在兩個 shard 時，sample 排名會算兩次。影響可忽略。
-- **拼法：** 清單目前輸出 crawler 的拼法。過去 golden 的原始拼法若和 canonical 不同，exact 比對會漏掉；`indexed_canonical_rate` 顯示這部分的損失。
+- **拼法：** crawler 存 `canonicalize_url(response.url)`，清單也輸出這個拼法；官方只認 SerpApi 的原始拼法。原始拼法和 canonical 不同時，原始那列沒有 `last_fetch_ok`，不會進 pool，exact 比對永遠配不到；`canonical_only_positives` 和 `indexed_canonical_rate` 顯示這部分的大小。同一頁的 http/https、`www`、尾斜線變體是不同列，它們是真負例（§5）。
+- **redirect：** crawler 存 redirect 之後的網址（`WebCrawler/containers/crawler/crawler/settings.py` 的 `REDIRECT_ENABLED`）。golden 原始網址若會 redirect，原始那列永遠沒被爬到，抓到的內容記在目標網址名下。
 - **每個 URL 只爬一次：** §3 依賴這個假設。sample 帶回 `num_fetch_ok_90d` 只為了檢查它（`FORBIDDEN` 擋住它進模型，`FeatureStore` 也不載入它和 `title`）。`validate-sample` 的 `refetched_share` 偏高時，pool 會把重抓的頁誤當成 batch 之後才爬到。
 - **偽 golden 的雜訊：** 回填批次的 SERP 比官方晚 1–3 週抓，供應商預設值也可能不同（§5.1 校準）。爬取狀態凍結在 2026-10-05，所以偏新的頁面不會成為正例。`history_batches` 在 M1 的評分時會多出幾批，訓練列中只有前瞻批次看得到同樣的範圍。
 - **免費額度只夠一次：** Serper 的 2,500 次只送一次，之後只剩 SerpApi 每月 250 次。M1 的做法不能每兩週持續；報告要寫明。

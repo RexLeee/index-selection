@@ -424,6 +424,47 @@ LEFT JOIN (SELECT * FROM uhist WHERE batch_id = {batch_id}) u ON u.url = c.url
             f"AND last_fetch_ok < {_ts(self.batch(batch_id).as_of)}").fetchone()
         return int(n)
 
+    def golden_spellings(self, batch_ids: list[int]) -> pa.Array:
+        """Every URL that labels a row positive in any of `batch_ids` (raw or canonical)."""
+        ids = ", ".join(map(str, batch_ids)) or "NULL"
+        return self.con.execute(
+            f"SELECT DISTINCT url FROM label_urls WHERE batch_id IN ({ids})"
+        ).to_arrow_table().column(0).combine_chunks()
+
+    def label_audit(self, batch_id: int) -> dict[str, int | float | None]:
+        """Counts sample negatives of `batch_id` that look like golden URLs.
+
+        `neg_later_golden` and `neg_next_golden` count negatives whose URL is
+        golden in any later official batch or in the next one. `neg_variant_golden`
+        counts negatives that differ from a golden spelling of this batch only by
+        scheme, a leading `www.` or a trailing `/`; the official metric compares
+        raw strings, so those rows are true negatives. Later batches are future
+        information, so this is a diagnostic and never feeds a model.
+        """
+        b = self.batch(batch_id)
+        later = sorted((x for x in self.batches if x.official and x.created_at > b.created_at),
+                       key=lambda x: x.created_at)
+        ids = ", ".join(str(x.batch_id) for x in later) or "NULL"
+        nxt = later[0].batch_id if later else "NULL"
+
+        def loose(col: str) -> str:
+            return f"regexp_replace(regexp_replace({col}, '^https?://(www\\.)?', ''), '/$', '')"
+
+        neg, later_n, next_n, variant = self.con.execute(f"""
+SELECT count(*), count(f.url), count(*) FILTER (WHERE f.nxt), count(v.k)
+FROM crawl c
+LEFT JOIN (SELECT url, bool_or(batch_id = {nxt}) AS nxt FROM label_urls
+           WHERE batch_id IN ({ids}) GROUP BY url) f ON f.url = c.url
+LEFT JOIN (SELECT DISTINCT {loose('url')} AS k FROM label_urls WHERE batch_id = {batch_id}) v
+  ON v.k = {loose('c.url')}
+WHERE c.is_sample AND c.last_fetch_ok < {_ts(b.as_of)}
+  AND NOT EXISTS (SELECT 1 FROM label_urls l WHERE l.batch_id = {batch_id} AND l.url = c.url)
+""").fetchone()
+        return {"neg_rows": neg, "neg_later_golden": later_n,
+                "neg_next_golden": next_n if later else None,
+                "later_golden_share": later_n / neg if neg else None,
+                "neg_variant_golden": variant}
+
     def has_history(self, batch_id: int) -> bool:
         """True when some earlier batch with crawled golden feeds this batch's priors."""
         row = self.con.execute(
