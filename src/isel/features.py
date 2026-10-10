@@ -30,6 +30,9 @@ from isel.urlnorm import DomainKeyer
 
 HOST_RE = r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/?#]*@)?([^:/?#]+)"
 PATH_RE = r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*([^?#]*)"
+# DuckDB threads add a group's rows in no fixed order. DOUBLE sums then differ in
+# the last bits from run to run, while DECIMAL sums are exact (|x| < 1e20).
+EXACT = "DECIMAL(38, 18)"
 
 
 @dataclass(frozen=True)
@@ -134,6 +137,10 @@ class Batch:
 
 def _ts(value: datetime) -> str:
     return f"{sql_str(value.isoformat())}::TIMESTAMPTZ"
+
+
+def _exact_sum(expr: str) -> str:
+    return f"sum(({expr})::{EXACT})::DOUBLE"
 
 
 class FeatureStore:
@@ -257,8 +264,8 @@ class FeatureStore:
             "c.host, c.hp, c.dkey, c.tld FROM spell s JOIN crawl c ON c.url = s.url "
             "JOIN batches b ON b.batch_id = s.batch_id WHERE c.last_fetch_ok < b.as_of")
         for lvl in LEVELS:
-            extra = (", avg(ln(1 + c.inlink_count_approx)) AS mean_li, "
-                     "avg(ln(1 + c.inlink_count_external)) AS mean_le, "
+            extra = (f", sum(ln(1 + c.inlink_count_approx)::{EXACT}) AS sum_li, "
+                     f"sum(ln(1 + c.inlink_count_external)::{EXACT}) AS sum_le, "
                      "avg((c.inlink_count_external > 0)::DOUBLE) AS ext_share"
                      if lvl == "dkey" else "")
             con.execute(
@@ -270,7 +277,7 @@ class FeatureStore:
                 "count(DISTINCT canonical_url) AS g FROM matches GROUP BY ALL")
             con.execute(
                 f"CREATE OR REPLACE TEMP TABLE lvl_{lvl} AS SELECT k, dst AS batch_id, "
-                f"sum(w * n) / {rate!r} AS e, sum(w * g) AS g FROM ("
+                f"{_exact_sum('w * n')} / {rate!r} AS e, {_exact_sum('w * g')} AS g FROM ("
                 f"SELECT e.k, p.dst, p.w, e.n, 0 AS g FROM expo_{lvl} e "
                 "JOIN pairs p ON p.src = e.batch_id UNION ALL "
                 f"SELECT h.k, p.dst, p.w, 0, h.g FROM hits_{lvl} h "
@@ -278,12 +285,13 @@ class FeatureStore:
         for lvl in ("dkey", "host"):
             con.execute(
                 f"CREATE OR REPLACE TEMP TABLE dem_{lvl} AS SELECT d.k, p.dst AS batch_id, "
-                f"sum(p.w * d.n) AS dem FROM (SELECT {lvl} AS k, batch_id, "
+                f"{_exact_sum('p.w * d.n')} AS dem FROM (SELECT {lvl} AS k, batch_id, "
                 "count(DISTINCT canonical_url) AS n FROM gold GROUP BY ALL) d "
                 "JOIN pairs p ON p.src = d.batch_id GROUP BY ALL")
         con.execute(
             "CREATE OR REPLACE TEMP TABLE glob_stats AS SELECT p.dst AS batch_id, "
-            f"sum(p.w * coalesce(x.n, 0)) / {rate!r} AS e, sum(p.w * coalesce(m.g, 0)) AS g, "
+            f"{_exact_sum('p.w * coalesce(x.n, 0)')} / {rate!r} AS e, "
+            f"{_exact_sum('p.w * coalesce(m.g, 0)')} AS g, "
             "count(*) AS hb FROM pairs p "
             "LEFT JOIN (SELECT batch_id, sum(n) AS n FROM expo_tld GROUP BY ALL) x "
             "ON x.batch_id = p.src "
@@ -291,7 +299,7 @@ class FeatureStore:
             "GROUP BY ALL) m ON m.batch_id = p.src GROUP BY ALL")
         con.execute(
             "CREATE OR REPLACE TEMP TABLE uhist AS SELECT l.url, p.dst AS batch_id, "
-            "sum(p.w) AS hist_decayed, max(l.in_head::INT) AS hist_head, "
+            f"{_exact_sum('p.w')} AS hist_decayed, max(l.in_head::INT) AS hist_head, "
             "max(l.in_random::INT) AS hist_random, "
             "min(date_diff('second', s.created_at, d.as_of)) / 86400.0 AS hist_days_since "
             "FROM label_urls l JOIN pairs p ON p.src = l.batch_id "
@@ -395,8 +403,8 @@ SELECT c.url, c.shard, c.h, c.dkey, c.is_sample, c.label::INT AS label, c.in_hea
   c.url_score, c.source,
   {self._static_sql()},
   date_diff('second', c.last_fetch_ok, {_ts(b.as_of)}) / 86400.0 AS fetch_age_days,
-  ln(1 + c.inlink_count_approx) - ds.mean_li AS rel_inlinks,
-  ln(1 + c.inlink_count_external) - ds.mean_le AS rel_ext,
+  (ln(1 + c.inlink_count_approx)::{EXACT} * ds.n - ds.sum_li)::DOUBLE / ds.n AS rel_inlinks,
+  (ln(1 + c.inlink_count_external)::{EXACT} * ds.n - ds.sum_le)::DOUBLE / ds.n AS rel_ext,
   coalesce(u.hist_decayed, 0) AS hist_decayed, coalesce(u.hist_head, 0) AS hist_head,
   coalesce(u.hist_random, 0) AS hist_random, u.hist_days_since,
   ln(c.r_tld / c.rg) AS lift_tld, ln(c.r_dkey / c.rg) AS lift_dkey,

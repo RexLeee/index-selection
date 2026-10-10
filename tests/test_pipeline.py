@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from argparse import Namespace
 from datetime import UTC, datetime, timedelta
 
@@ -373,9 +374,28 @@ def test_cli_rejects_unknown_baseline_names(work):
                                                 baselines="random,later_unlabled"))
 
 
-def test_training_frames_have_a_stable_row_order(work):
-    # LightGBM bagging picks rows by position, so row order decides the model.
-    cfg = small_cfg(work)
-    a = _store(cfg, work).frame(5, "train")
-    b = FeatureStore(cfg, open_duckdb(cfg, work / "tmp2"), work).frame(5, "train")
-    assert a.column("url").equals(b.column("url"))
+def test_training_frames_do_not_depend_on_the_order_of_crawl_rows(work, world):
+    # LightGBM bagging picks rows by position and bins exact zeros apart, so the
+    # row order and the last bit of every feature both decide the model.
+    other = work / "reversed"
+    write_work_dir(world, other)
+    for path in (other / "sample").glob("shard=*.parquet"):
+        table = pq.read_table(path)
+        write_parquet_atomic(table.take(np.arange(table.num_rows)[::-1]), path)
+    a = _store(replace(small_cfg(work), "duckdb", threads=8), work).frame(5, "train")
+    b = _store(replace(small_cfg(other), "duckdb", threads=8), other).frame(5, "train")
+    assert a.num_rows == b.num_rows
+    assert [c for c in a.column_names if not a.column(c).equals(b.column(c))] == []
+
+
+def test_relative_inlinks_are_zero_for_pages_at_the_domain_mean(tmp_path, world):
+    flat = {f"site{d}.com" for d in range(10)}
+    pages = [{**p, "inlink_count_approx": 37, "inlink_count_external": 11}
+             if p["url"].split("/")[2].removeprefix("www.") in flat else p
+             for p in world.pages]
+    write_work_dir(dataclasses.replace(world, pages=pages), tmp_path)
+    frame = _store(small_cfg(tmp_path), tmp_path).frame(5, "eval")
+    rows = [r for r in frame.select(["dkey", "rel_inlinks", "rel_ext"]).to_pylist()
+            if r["dkey"] in flat]
+    assert rows
+    assert [r for r in rows if r["rel_inlinks"] != 0 or r["rel_ext"] != 0] == []

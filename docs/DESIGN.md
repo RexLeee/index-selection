@@ -117,6 +117,8 @@ lift_x = ln(r_x / r_global)
 
 `rel_inlinks = ln(1 + inlinks) − mean_{dkey, pool_b}(ln(1 + inlinks))`，`rel_ext` 同理。這讓頁面層可以比較「同網域內誰的連入比較多」，而不是只看絕對值。
 
+程式用精確的 DECIMAL 算 `(n·x − Σx) / n`，不直接減浮點平均。頁面值等於網域平均時，結果正好是 0。
+
 ---
 
 ## 5. 模型（`model.py`、`dataset.py`）
@@ -148,6 +150,10 @@ lift_x = ln(r_x / r_global)
 
 - 訓練 batch：`first_label_batch` 之後、在測試 batch 的 as-of 之前已存在、而且有 golden 歷史。
 - train frame 依 (url, shard) 排序。LightGBM 的 bagging 依列的位置抽樣，DuckDB 平行查詢的列順序又不固定，不排序的話，同樣的輸入每次會訓練出不同的模型。
+- 跨列的浮點加總都先轉 `DECIMAL(38, 18)` 再加。範圍包括 `rel_*` 的網域加總、`lvl_*`、`dem_*`、`glob_stats` 和 `hist_decayed`。
+  - DuckDB 平行加總 DOUBLE 時，相加順序不固定，每次結果差約 10⁻¹⁵。
+  - LightGBM 把 0 單獨放一個 bin。應該是 0 的值變成 ±4×10⁻¹⁶ 時，模型就會不同。
+  - DECIMAL 加總是整數運算，結果和相加順序無關。
 - early stopping 只看最後一個官方訓練 batch。`refit_on_all = true` 時，用最佳輪數在全部訓練 batch 上重訓。
 - 測試 batch 永遠不參與調參。
 
