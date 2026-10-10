@@ -4,6 +4,7 @@
 
 - 調研（現況、論文、方法選型、未來架構）：[`docs/RESEARCH.md`](docs/RESEARCH.md)
 - 設計（時間點、特徵、模型、評估、manifest、recrawl 介面）：[`docs/DESIGN.md`](docs/DESIGN.md)
+- 實驗紀錄（真實資料的讀取、回測結果和判定）：[`docs/experiments/`](docs/experiments/)
 
 ## 方法一句話
 

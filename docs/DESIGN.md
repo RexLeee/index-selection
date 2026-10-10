@@ -337,7 +337,7 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 5. **驗證：** 本機用同版本 YugabyteDB 容器跑合約測試。PG 和 YB 並存時，golden URL 的主鍵查詢要逐筆一致，樣本只比較分布。
 6. **要提醒助教的風險：** Voyager export 目錄和 YB 資料目錄都在 Host1 `/data`（2026-10-08 剩 385 GB，crawlerdb 6.6 TB）。live migration 要把 `wal_level` 改成 logical（需重啟），replication slot 卡住會累積 WAL，可能再次寫滿 `/data`。
 
-## 10. 執行手冊（Host2）
+## 10. 執行手冊（Host2 和 Mac）
 
 ```bash
 cd ~/isel/repo && uv sync
@@ -374,6 +374,17 @@ uv run isel $C pull-golden
 uv run isel $C pull-positives --batches 20
 uv run isel $C forward-eval --model-dir work/models/<M0> --model-dir work/models/<M1> --batch 20
 ```
+
+### 10.1 在 Mac 執行
+
+2026-10-09 已實測：Mac 經 CSIE VPN 可以直連兩個 DB。伺服器上不需要任何檔案。
+
+- `.env` 放在 repo 根目錄，權限 600。DSN 的 host 和 `.env.example` 相同。兩個 DB 的 `pg_hba.conf` 接受任何來源的 scram-sha-256 登入。
+- 只用 `config/isel.toml`，不加 `config/host.toml`。base 設定就是 Mac 的規模：8 threads、DuckDB 16 GB。
+- 長指令用 `caffeinate -i` 執行，Mac 要接電源並保持 VPN 連線。
+- VPN 曾在幾分鐘內重設連線多次，指令會因 `OperationalError` 結束。重跑同一個指令即可續傳：`pull-sample` 從沒完成的 shard 繼續，`pull-positives` 跳過已有檔案的 batch。
+- 實測量（2026-10-09）：`pull-positives` 每個 batch 約 2 分鐘；`pull-sample` 讀 33.9 GB 的頁、1,648 萬列，約 47 分鐘（含一次每小時禁讀時段）；讀取期間 Host1 的 IO PSI avg10 最高 17.9%。
+- 直連失敗時，改用 `ssh -N -L 127.0.0.1:15432:127.0.0.1:5432 -L 127.0.0.1:15433:127.0.0.1:5433 ntu-sa1`，DSN 改成這兩個本機 port。
 
 ---
 
