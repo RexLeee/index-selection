@@ -1,0 +1,59 @@
+# Host2 (ntu-sa2): isel batch jobs, one container per command. See DESIGN §12.
+#   GIT_SHA=<short sha> docker compose -f deploy/compose.compute.yaml build --build-arg GIT_SHA=<short sha> isel
+#   docker compose -f deploy/compose.compute.yaml run --rm isel pull-full --dry-run
+#   docker compose -f deploy/compose.compute.yaml --profile job down    # removes the network
+# Never run `docker system/image/volume prune` on the shared hosts.
+name: idxsel_r14725023
+
+services:
+  isel:
+    build:
+      context: ..
+      target: runtime
+    image: isel_r14725023:${GIT_SHA:-dev}
+    profiles: [job]                     # never started by `up`; only `run --rm`
+    entrypoint: ["isel", "--config", "/app/config/isel.toml",
+                 "--config", "/app/config/container.toml"]
+    command: ["check-config"]
+    init: true                          # forwards Ctrl-C and `docker stop` to isel
+    user: "1014:1015"
+    environment:                        # DSNs come from secret files, never from env values
+      ISEL_CRAWLERDB_DSN_FILE: /run/secrets/crawlerdb_dsn
+      ISEL_METRICDB_DSN_FILE: /run/secrets/metricdb_dsn
+      ISEL_SELECTDB_ADMIN_DSN_FILE: /run/secrets/selectdb_admin_dsn
+      ISEL_SELECTDB_READER_DSN_FILE: /run/secrets/selectdb_reader_dsn
+      ISEL_SELECTDB_READER_PASSWORD_FILE: /run/secrets/selectdb_reader_password
+    secrets: [crawlerdb_dsn, metricdb_dsn, selectdb_admin_dsn, selectdb_reader_dsn,
+              selectdb_reader_password]
+    volumes:
+      - ${ISEL_WORK_DIR:-/home/r14725023/isel/work}:/work
+    read_only: true
+    tmpfs: [/tmp]
+    mem_limit: 64g
+    memswap_limit: 64g                  # no swap
+    cpus: 16
+    cpu_shares: 256                     # the crawler wins under contention
+    pids_limit: 512
+    oom_score_adj: 1000                 # we are killed first
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}
+
+secrets:
+  crawlerdb_dsn:
+    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/crawlerdb_dsn
+  metricdb_dsn:
+    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/metricdb_dsn
+  selectdb_admin_dsn:
+    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/selectdb_admin_dsn
+  selectdb_reader_dsn:
+    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/selectdb_reader_dsn
+  selectdb_reader_password:
+    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/selectdb_reader_password
+
+# Pin the bridge subnet: Docker's next free range can collide with VPN clients (172.24.x.x).
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.20.251.0/24

@@ -1,6 +1,6 @@
 # Index selection: every tunable lives here. Loading rejects unknown keys,
 # missing keys and wrong types. Host-specific values go into an overlay file
-# passed as a second --config (see config/host.example.toml).
+# passed as a second --config (see config/container.toml).
 
 [run]
 work_dir = "work"
