@@ -1,27 +1,28 @@
 # Weekly Report — 2026/10/11 (10/05–10/11) — Index Selection
 
 - **Role:** Index Infra (index selection). **Repository:** `index-selection` (package `isel`), 23 commits this week (`0f6593b` … `f17e9ac`).
-- **Times:** UTC. **Status at 13:26:** the production run is in progress. The full table is exported, and `score-full` has scored 74 % of it.
+- **Times:** UTC. **Status at 14:20:** the full read, `score-full` and `select-full` are done (exactly 128,000,000 URLs). A model bug found right after scoring (§1.10) means this list will **not** be published. M0 will be fixed and refrozen before 10-15 06:00.
 
 ## Brief Summary
 
-**In one sentence:** The learned model M0 is frozen. Its 128M-URL list is being built from a full read of all 1.66B crawled rows, which finished in 1 h 48 min with no visible load on the database host. The model already reaches 94–99 % of the crawled ceiling, so the next large gain must come from crawl coverage, not ranking.
+**In one sentence:** The learned model beats every baseline in the backtest, and the full 128M-URL pipeline now runs end to end (1.66B rows read in 1 h 48 min with no visible load on the database host). Right after the first full scoring I found a feature bug (§1.10): pages from domains missing in the 1 % sample get very high scores. So M0 must be fixed and refrozen before batch 20, and the backtest numbers below are probably 0.5–1 pt too high.
 
 | Topic | This week's finding | Next step |
 |---|---|---|
-| Learned model (backtest) | Over 5 held-out batches at K = 128M, `lgbm:full` selects **22.49 %** (head) and **18.01 %** (random) of golden URLs. It beats every baseline; a model with V1's features gets 20.59 % / 16.23 % | Forward evaluation on batch 20 (10-16) |
+| Learned model (backtest) | Over 5 held-out batches at K = 128M, `lgbm:full` selects **22.49 %** (head) and **18.01 %** (random) of golden URLs. It beats every baseline; a model with V1's features gets 20.59 % / 16.23 %. These numbers are probably 0.5–1 pt too high (§1.10) | Rerun after the fix; forward evaluation on batch 20 (10-16) |
 | Ceiling | The model reaches **94–99 %** of the crawled ceiling on head (82–97 % on random) | Coverage is the bottleneck; share findings with the crawler side |
 | Leakage and labels | The crawler writes golden back into `source`, `url_score`, `domain_score` and inlink counts. As-of pools and a `FORBIDDEN` list keep this out. Negatives are clean: 2×10⁻⁶–1.5×10⁻⁴ later became golden | Keep the current labels; `later_unlabeled` is not adopted |
 | Reproducibility | DuckDB's parallel float sums made reruns train different trees. DECIMAL sums fixed it; reruns are now bit-identical | — |
-| M0 | Frozen 10-11 06:37 (deadline 10-15 06:00): 7.31M rows, 18,695 positives, 447 trees | Never retrain this cycle |
+| M0 | Frozen 10-11 06:37 (deadline 10-15 06:00): 7.31M rows, 18,695 positives, 447 trees | Refit with the §1.10 fix and refreeze before 10-15 06:00 |
 | Full-table read | CSV + 4 capped connections: **1 h 48 min** for 1,657,046,602 rows (V2 estimated ~14 h). Host1 IO PSI avg **13.7 %**, at its baseline | Done |
 | Deployment | Container on Host2. Fixed a Docker subnet collision and a wrong `select` password on our selectdb | Done |
-| Scoring and selection | `score-full` at 189/256 shards (74 %), 0 errors | `select-full` → `publish` → `swap` before 10-15 20:00 |
+| Scoring and selection | Done: 1,657,046,602 rows scored in 2 h 41 min; `select-full` wrote exactly 128,000,000 URLs | Do not publish this list; rescore after the fix, then `publish` → `swap` before 10-15 20:00 |
+| **Known issue** | Rows whose domain is absent from the 1 % sample get +17.4 logit from M0. An estimated 20–27M of the 128M slots go to such pages | Fix the domain statistics, rerun the backtest, refreeze M0, rescore |
 | Official Metric | It still reads V1's `:5444`, and the deployed container hardcodes `indexed = False` | TA switch to `:5445` before 10-16 12:00 |
 
 ## 1. This week's progress
 
-Before this week, V1 (PR #4) ran in production with known problems, and my rule-based V2 had been validated on one shard (10-04). V2 used the crawler's `url_score`, which leaks golden, and its weights were tuned in-sample. This week I replaced it and broke the work into 5 questions:
+Before this week, V1 (NTU-CSIE5376/WebSearchEngine#4) ran in production with known problems, and my rule-based V2 had been validated on one shard (10-04). V2 used the crawler's `url_score`, which leaks golden, and its weights were tuned in-sample. This week I replaced it and broke the work into 5 questions:
 
 1. Which method and which evaluation rules fit this task?
 2. How can we read crawlerdb without disturbing production?
@@ -46,7 +47,7 @@ The official Metric checks whether each golden URL's **raw string** is in `selec
 | `inlink_count_*` | Golden parent patrols add extra inlinks |
 | `first_seen` | Reset on injection |
 
-**What was wrong with V1 (PR #4):**
+**What was wrong with V1 (NTU-CSIE5376/WebSearchEngine#4):**
 
 | Aspect | Problem |
 |---|---|
@@ -119,7 +120,7 @@ All reads ran from the Mac over the VPN through the 3 layers above. Nothing was 
 - The pool grew from 6.1M pages (batch 1) to 1.51B pages (batch 19).
 - Canonical-only positives are about 1 % of positives, so spelling losses are small.
 - Negatives that later became golden are 2×10⁻⁶–1.5×10⁻⁴ per batch. The negatives are clean.
-- Batches 9 and 18 have about half the golden URLs. This matches issue #2: batch 9 has no head URLs, and batch 18 has 500 queries per set.
+- Batches 9 and 18 have about half the golden URLs. This matches hacheng0193/WebSearchEngine#2: batch 9 has no head URLs, and batch 18 has 500 queries per set.
 
 ---
 
@@ -153,7 +154,7 @@ All reads ran from the Mac over the VPN through the 3 layers above. Nothing was 
 - CIs use a paired bootstrap over queries with 1,000 resamples.
 - Test batches: 6, 7, 8, 18, 19. Run `20261010T043436446958Z`, 58.5 min, peak 13.0 GB.
 
-**Pooled result (K = 128M):**
+**Pooled result (K = 128M; probably 0.5–1 pt too high on head, see §1.10):**
 
 | Model | head | diff vs `lgbm:full` (95 % CI) | random | diff vs `lgbm:full` (95 % CI) |
 |---|---|---|---|---|
@@ -188,13 +189,14 @@ All reads ran from the Mac over the VPN through the 3 layers above. Nothing was 
 
 #### Observation
 
+- **Caveat:** the bug in §1.10 inflates the `lgbm:*` rows, so treat the numbers in this section as upper bounds until the rerun.
 - `lgbm:full` beats every baseline, and every paired CI excludes 0.
 - **Most of the gain over V1 comes from the training method**, not the features. With V1's features only, the time split, as-of features, correct negatives and real boosting already give 20.59 % head. The 45 features add 1.9 pt more.
 - The feature gain grows over time: 0.5 pt (batch 6, head) and 3.3 pt (batch 19, head).
-- **Domain features matter most:** removing them costs 1.3–1.7 pt on head, and removing inlinks costs 0.6–0.9 pt. URL history adds only about 0.1 pt. `rel_ext` has the highest gain (42–53 %), then `lift_hp` (8–16 %).
+- **Domain features matter most:** removing them costs 1.3–1.7 pt on head, and removing inlinks costs 0.6–0.9 pt. Part of the domain gap is the §1.10 artifact, because `no_domain` also drops the affected features; it will be rechecked. URL history adds only about 0.1 pt. `rel_ext` has the highest gain (42–53 %), then `lift_hp` (8–16 %).
 - Most hits sit in the top 32M URLs. Halving K to 64M costs only 0.2–1.1 pt on head.
 - `later_unlabeled` drops only 0–22 negatives per test batch, and all its CIs include 0. Under the pre-registered rule (DESIGN §5) it is **not adopted**.
-- **Batch 19 random is the outlier.** It has the lowest ceiling (14.94 %) and the lowest share of the ceiling (82 %). This matches issue #2, where batch 19 shifts toward news, Reddit and TikTok, and its same-keyword URL retention falls to 28 %.
+- **Batch 19 random is the outlier.** It has the lowest ceiling (14.94 %) and the lowest share of the ceiling (82 %). This matches hacheng0193/WebSearchEngine#2, where batch 19 shifts toward news, Reddit and TikTok, and its same-keyword URL retention falls to 28 %.
 
 ---
 
@@ -229,6 +231,7 @@ All reads ran from the Mac over the VPN through the 3 layers above. Nothing was 
 #### Observation
 
 - M0 predicts batch 20 with information up to S0 only. Batch 20 did not exist when M0 was frozen, so it is a true forward test.
+- M0 has the §1.10 bug. It will be refit with the fix and refrozen before 10-15 06:00. That is still before batch 20 exists, so the forward test stays valid.
 
 ---
 
@@ -312,19 +315,61 @@ All reads ran from the Mac over the VPN through the 3 layers above. Nothing was 
 
 ---
 
-### 1.9 Full scoring and selection (in progress)
+### 1.9 Full scoring and selection (10-11)
 
-| Item | At 13:26 |
+| Item | Result |
 |---|---|
-| Progress | 189/256 shards; 1,228M rows scored (74 %) |
-| Kept (score ≥ τ) | 139.0M rows (11.3 %) |
-| Speed | about 175k rows/s; 4–9 cores and 9–19 GB of the 16-core / 64 GB limit |
-| Errors | 0 |
-| Expected finish | about 14:10; `select-full` starts automatically after it |
+| `score-full` | 11:26:31–14:07:28 (2 h 41 min), 1,657,046,602 rows, about 172k rows/s, 0 errors |
+| Threshold τ | −6.2957 (raw score), the sample score at rank 1,472,000 = 1,280,000 × 1.15 |
+| Kept (score ≥ τ) | 186,144,743 rows (11.2 %) |
+| `select-full` | 14:07–14:09, run `20261011T140745532003Z`: exactly 128,000,000 distinct URLs; lowest selected score −5.67 |
+| Resources | 4–16 cores and 9–26 GB of the 16-core / 64 GB limit |
+
+Score histogram of the selected list:
+
+| Raw score | Rows |
+|---|---|
+| −6.3 to −4 | 73,315,436 |
+| −4 to −2 | 17,445,279 |
+| −2 to 0 | 5,235,805 |
+| 0 to 2 | 5,284,641 |
+| 2 to 6 | 8,986,718 |
+| ≥ 6 | 17,732,121 |
 
 #### Observation
 
-- More rows pass τ than the 9 % first estimate, because τ is set with a 15 % margin. More candidates are safe: `select-full` still takes exactly K = 128,000,000 distinct URLs.
+- τ was set to keep about 147M rows (K × 1.15), but 186M rows passed it, 27 % more. A 1 % sample should estimate this quantile much more closely.
+- A cluster of 17.7M rows sits at score ≥ 6, far above the bulk. Checking these two oddities led to the bug in §1.10.
+
+---
+
+### 1.10 Known issue: domains missing from the sample get very high scores (found 10-11)
+
+**Mechanism.**
+- The domain statistics behind `log_size_dkey`, `log_size_host`, `rel_inlinks`, `rel_ext` and `dkey_ext_share` are computed from **sample rows only**.
+- A sample row always counts itself, so its domain is never "absent". For a sample row, `log_size_dkey` ≥ ln(1 + 100) ≈ 4.6.
+- Positives are fetched by primary key and are mostly not sample rows. When a positive's domain has no sampled row, it gets `log_size_dkey = 0` and NULL `rel_*`.
+- No negative can ever look like that. So "domain absent from the sample" becomes a **label-dependent** pattern, and LightGBM learns it.
+
+**Measurements (local data, M0):**
+
+| Check | Result |
+|---|---|
+| Positives with an absent domain, train frames | batch 8: 107 of 3,611 (3.0 %); batch 18: 33 of 1,946 (1.7 %); batch 19: 71 of 2,944 (2.4 %) |
+| Negatives with an absent domain | 0 in every batch |
+| M0 score change when a sample row's domain is made "absent" | +17.4 raw score on average; all 200,000 rows go up |
+| Batch-19 golden rows | absent domain: mean score 16.2; present domain: mean 0.02 |
+
+**Impact.**
+- **Full list:** every crawled page from a domain with no sampled row gets pushed to the top. Based on the histogram in §1.9, I estimate that 20–27M of the 128M slots go to such pages. This list will not be published.
+- **Backtest:** golden rows with an absent domain get free hits, while their non-golden peers never appear in the sample. I estimate head is inflated by about 0.5–1 pt (low confidence). The `no_domain` gap is partly this artifact.
+- **Why tests missed it:** the parity test scores sample rows, and sample rows never have an absent domain.
+
+**Fix (planned).**
+1. Make every row count itself in its domain statistics: non-sample rows add their own values, as sample rows already do. "Absent" then no longer depends on the label.
+2. Check whether the exposure behind `lift_*` has the same asymmetry, and fix it the same way.
+3. Add a test that compares the feature distributions of sample and non-sample rows. Add a full-scoring check that the share of rows above τ matches the sample's share.
+4. Rerun the backtest, refit and refreeze M0 before 10-15 06:00, then rescore and reselect.
 
 ---
 
@@ -350,9 +395,9 @@ The crawler writes golden back into several columns. Without as-of pools and the
 
 ---
 
-### Finding 4 — Domain-level signals are the strongest
+### Finding 4 — Domain-level signals look the strongest (to be rechecked)
 
-Hierarchical domain rates (TLD → domain → host → host + first path segment) cost 1.3–1.7 pt when removed. The URL's own golden history adds only about 0.1 pt, because the same URL reappears in the next batch only 0.6–2.7 % of the time.
+Hierarchical domain rates (TLD → domain → host → host + first path segment) cost 1.3–1.7 pt when removed. Part of that gap is the §1.10 artifact, so this finding must be rechecked after the fix. The URL's own golden history adds only about 0.1 pt, because the same URL reappears in the next batch only 0.6–2.7 % of the time.
 
 ---
 
@@ -365,6 +410,12 @@ CSV parsing and 4 capped connections read 3.43 TB in 1 h 48 min. That is about 8
 ### Finding 6 — crawlerdb is not frozen
 
 The crawler is stopped, but a rescoring job updates 4,400–6,600 rows/s and keeps Host1 IO PSI near 15 %. It changes only `url_score` and `url_score_updated_at`, which M0 does not use. During a read, a moved row can be missed or read twice. Duplicates are removed by URL; missed rows are estimated at about 10⁴ (under 0.01 %).
+
+---
+
+### Finding 7 — Sample-based domain statistics leaked the label
+
+Pages from domains missing in the 1 % sample get +17.4 logit, because only positives could ever have such a domain (§1.10). The first full list is contaminated and will not be published. The lesson: every feature must be computed the same way for sample rows, positives and full-export rows, and a test must check it.
 
 ---
 
@@ -384,13 +435,13 @@ I propose the batch-20 forward evaluation as the headline, using the same SQL as
 
 ### Q3. How should evaluation treat the golden data gaps?
 
-Batch 9 has no head URLs, batches 10–17 are empty, batch 18 has half the queries, and batch 19 shifts toward news and social sites (issue #2). My backtest tests on batches 18 and 19. Should they be kept, weighted down, or reported separately?
+Batch 9 has no head URLs, batches 10–17 are empty, batch 18 has half the queries, and batch 19 shifts toward news and social sites (hacheng0193/WebSearchEngine#2). My backtest tests on batches 18 and 19. Should they be kept, weighted down, or reported separately?
 
 ---
 
 ### Q4. Should index selection and crawl scheduling work together?
 
-Finding 1 says coverage is the bottleneck. Issue #2 finds that YouTube is a discovery problem and Wikipedia a scheduling problem. Would it help to share M0's scores with the crawler side, for example to rank pending URLs?
+Finding 1 says coverage is the bottleneck. hacheng0193/WebSearchEngine#2 finds that YouTube is a discovery problem and Wikipedia a scheduling problem. Would it help to share M0's scores with the crawler side, for example to rank pending URLs?
 
 ---
 
@@ -406,13 +457,20 @@ Free SerpApi and Serper quotas could add about 2,400–3,200 positives (+8–10 
 
 ---
 
+### Q7. May M0 be refrozen before 10-15 06:00?
+
+The pre-registered rule froze M0 on 10-11. The §1.10 bug needs a refit. A refreeze before 10-15 06:00 still happens before batch 20 exists, so the forward test stays valid. Is this acceptable, and should the original M0 be reported alongside?
+
+---
+
 ## 4. Discussion / Conclusion
 
 This week turned index selection from a hand-weighted rule into a learned, frozen and reproducible model, with an evaluation that matches how the list is used.
 
 - The model beats every baseline, and it is within 0.3–2.7 pt of the crawled ceiling in every test batch. Further gains need crawl coverage.
 - The largest gain came from correct problem framing and training (as-of pools, clean labels, time split), not from new features.
-- The production pipeline runs end to end on Host2. The full read finished quickly without visible load on crawlerdb. Scoring is 74 % done, and the list will be published before batch 20.
+- The production pipeline runs end to end on Host2. The full read finished quickly without visible load on crawlerdb.
+- Right after the first full scoring, I found a feature bug that leaks the label through the sample-based domain statistics (§1.10). The first list will not be published, and the backtest numbers are probably 0.5–1 pt too high. The fixed model and list must be ready before 10-15 20:00.
 
 Two things are outside this work: whether Metric reads `:5445` in time (Q1), and how the golden data gaps should be handled in evaluation (Q3).
 
@@ -420,21 +478,25 @@ Two things are outside this work: whether Metric reads `:5445` in time (Q1), and
 
 ## 5. Next week's plan
 
-1. **Finish this cycle's list**
-   - Finish `score-full` and `select-full` (exactly 128,000,000 rows).
+1. **Fix the §1.10 bug (first priority)**
+   - Write failing tests first, then make every row count itself in its domain statistics.
+   - Rerun the backtest and update the numbers in this report.
+   - Refit and refreeze M0 before 10-15 06:00.
+2. **Finish this cycle's list**
+   - Rerun `score-full` and `select-full` with the fixed M0.
    - `publish` and `swap` on `:5445` before 10-15 20:00, then `verify-live --batch 19` as a sanity check.
-2. **Confirm with the TA that Metric reads `:5445`** before 10-16 12:00.
-3. **Batch 20 forward evaluation** (from 10-16 20:00)
+3. **Confirm with the TA that Metric reads `:5445`** before 10-16 12:00.
+4. **Batch 20 forward evaluation** (from 10-16 20:00)
    - `pull-golden`, `pull-positives --batches 20`, `forward-eval`, `verify-live --batch 20`.
    - Write a new experiment record and compare with the backtest.
-4. **Close review items**
+5. **Close review items**
    - Compare the start and end snapshots of the full read.
    - Check the feature config in `score-full`, not only the snapshot time.
    - Check finished shards' files on resume.
    - Pass `GIT_SHA` as a compose build argument.
    - Improve `score-full` throughput (it uses 4–9 of 16 cores).
-5. **Decide on pseudo golden** after the batch-20 result (Q6).
-6. **Explore new features:** anchor-text and title content, and freshness or trend signals for head queries.
+6. **Decide on pseudo golden** after the batch-20 result (Q6).
+7. **Explore new features:** anchor-text and title content, and freshness or trend signals for head queries.
 
 ---
 
@@ -470,11 +532,11 @@ Two things are outside this work: whether Metric reads `:5445` in time (Q1), and
 
 | Artifact | Location |
 |---|---|
-| Design, runbook, safety rules | `docs/DESIGN.md` |
-| Literature and system research | `docs/RESEARCH.md` |
-| Backtest record (full tables for §1.3–1.5) | `docs/experiments/2026-10-09-real-data-backtest.md` |
+| Design, runbook, safety rules | [`docs/DESIGN.md`](https://github.com/RexLeee/index-selection/blob/main/docs/DESIGN.md) |
+| Literature and system research | [`docs/RESEARCH.md`](https://github.com/RexLeee/index-selection/blob/main/docs/RESEARCH.md) |
+| Backtest record (full tables for §1.3–1.5) | [`docs/experiments/2026-10-09-real-data-backtest.md`](https://github.com/RexLeee/index-selection/blob/main/docs/experiments/2026-10-09-real-data-backtest.md) |
 | Backtest results | `work/backtests/20261010T043436446958Z/` (local, not in git) |
 | M0 | `work/models/20261011T063745518690Z/` (Mac and Host2) |
 | Full export | Host2 `~/isel/work/full/export/` |
 | Scoring and selection outputs | Host2 `~/isel/work/full/scored/`, `~/isel/work/full/selection/run=<id>/` |
-| Related report | WebSearchEngine issue #2 (crawler coverage, golden set inventory) |
+| Related report | hacheng0193/WebSearchEngine#2 (crawler coverage, golden set inventory) |
