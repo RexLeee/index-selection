@@ -169,10 +169,10 @@ def train_frozen(cfg: Config, work_dir: Path, baselines: list[str]) -> Path:
     return out
 
 
-def _load_models(model_dir: Path) -> dict[str, TrainedModel]:
+def _load_models(model_dir: Path, num_threads: int) -> dict[str, TrainedModel]:
     models = {}
     for sub in sorted(p for p in model_dir.iterdir() if (p / "meta.json").exists()):
-        model = TrainedModel.load(sub)
+        model = TrainedModel.load(sub, num_threads)
         models[model.meta.get("name", sub.name)] = model
     if not models:
         raise FileNotFoundError(f"no models under {model_dir}")
@@ -222,7 +222,7 @@ def forward_eval(cfg: Config, work_dir: Path, model_dirs: list[Path], batch: int
     """
     groups: dict[bool, dict[str, TrainedModel]] = defaultdict(dict)
     for model_dir in model_dirs:
-        for name, model in _load_models(model_dir).items():
+        for name, model in _load_models(model_dir, cfg.model.num_threads).items():
             use = bool(model.meta.get("use_pseudo", False))
             groups[use][f"{name}+pseudo" if use else name] = model
     stores = {use: _store(replace(cfg, golden=replace(cfg.golden, use_pseudo=use)), work_dir)
@@ -263,7 +263,8 @@ def forward_eval(cfg: Config, work_dir: Path, model_dirs: list[Path], batch: int
 def _reasons(model: TrainedModel, frame: pa.Table, top_n: int) -> list[list[str]]:
     if top_n == 0 or model.booster is None:
         return [[] for _ in range(frame.num_rows)]
-    contrib = model.booster.predict(to_numpy(frame, model.features), pred_contrib=True)[:, :-1]
+    contrib = model.booster.predict(to_numpy(frame, model.features), pred_contrib=True,
+                                    num_threads=model.num_threads)[:, :-1]
     order = np.argsort(-np.abs(contrib), axis=1)[:, :top_n]
     return [[f"{model.features[j]}:{contrib[i, j]:+.3f}" for j in row]
             for i, row in enumerate(order)]
@@ -276,7 +277,7 @@ def select_sample(cfg: Config, work_dir: Path, model_dir: Path, k: int) -> dict[
     the manifest contract at sample scale without touching any database.
     """
     store = _store(cfg, work_dir, next_batch=True)
-    models = _load_models(model_dir)
+    models = _load_models(model_dir, cfg.model.num_threads)
     model = models[_model_name(cfg.model.feature_set)]
     target = store.batches[-1].batch_id
     frame = store.frame(target, "eval")

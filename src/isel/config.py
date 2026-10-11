@@ -148,6 +148,11 @@ class ModelCfg:
     logreg_c: float
     logreg_max_iter: int
 
+    @property
+    def num_threads(self) -> int:
+        """LightGBM threads for training and prediction."""
+        return int(self.params["num_threads"])
+
 
 @dataclass(frozen=True)
 class EvalCfg:
@@ -218,6 +223,8 @@ KNOWN_BASELINES = (
     "random", "inlinks", "ext", "domain_prior", "logreg", "v1_features",
     "url_score", "v2_baseline_v1", "later_unlabeled",
 )
+# LightGBM 4.7 aliases of num_threads; predict would not see a thread count set this way.
+LGBM_THREAD_ALIASES = ("n_jobs", "nthread", "nthreads", "num_thread")
 
 
 def _deep_merge(base: dict[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
@@ -405,6 +412,11 @@ def _validate(cfg: Config) -> None:
     need(cfg.model.early_stopping_rounds > 0, "model.early_stopping_rounds must be > 0")
     need(cfg.model.logreg_c > 0, "model.logreg_c must be > 0")
     need(cfg.model.params.get("objective") == "binary", "model.params.objective must be 'binary'")
+    threads = cfg.model.params.get("num_threads")
+    need(isinstance(threads, int) and not isinstance(threads, bool) and threads > 0,
+         "model.params.num_threads must be an integer > 0")
+    aliases = sorted(set(cfg.model.params) & set(LGBM_THREAD_ALIASES))
+    need(not aliases, f"model.params must set num_threads, not its aliases {aliases}")
     need(bool(cfg.eval.test_batches), "eval.test_batches must not be empty")
     need(cfg.eval.k_headline in cfg.eval.k_values, "eval.k_headline must be in eval.k_values")
     need(all(k > 0 for k in cfg.eval.k_values + cfg.eval.gain_curve_k), "K values must be > 0")

@@ -50,6 +50,10 @@ def test_base_config_loads(base_cfg):
     ("[guard]\ntimeout_cap_s = 2880\n", "hourly open gap"),
     ("[guard]\nmonth_window = ['20:00', '00:00']\n", "wrap"),
     ("[guard]\nmonth_window = ['00:00', '25:00']\n", "HH:MM"),
+    # num_threads = 0 lets OpenMP start one thread per host CPU, past the container quota.
+    ("[model.params]\nnum_threads = 0\n", "num_threads must be an integer > 0"),
+    ("[model.params]\nnum_threads = 2.5\n", "num_threads must be an integer > 0"),
+    ("[model.params]\nn_jobs = 4\n", r"aliases \['n_jobs'\]"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
@@ -61,6 +65,14 @@ def test_config_rejects_missing_key(tmp_path):
     path = tmp_path / "full.toml"
     path.write_text(text)
     with pytest.raises(ConfigError, match="missing keys"):
+        load_config([path])
+
+
+def test_config_needs_the_lightgbm_thread_count(tmp_path):
+    text = BASE.read_text().replace("\nnum_threads = 8\n", "\n")
+    path = tmp_path / "full.toml"
+    path.write_text(text)
+    with pytest.raises(ConfigError, match="num_threads must be an integer > 0"):
         load_config([path])
 
 

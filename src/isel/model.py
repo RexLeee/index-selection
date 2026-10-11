@@ -38,11 +38,13 @@ class TrainedModel:
     booster: lgb.Booster | None = None
     pipeline: Pipeline | None = None
     meta: dict[str, Any] = field(default_factory=dict)
+    # Booster.predict ignores the training params, so the thread count is passed per call.
+    num_threads: int = 0
 
     def raw_score(self, table: pa.Table) -> np.ndarray:
         x = to_numpy(table, self.features)
         if self.booster is not None:
-            return self.booster.predict(x, raw_score=True)
+            return self.booster.predict(x, raw_score=True, num_threads=self.num_threads)
         assert self.pipeline is not None
         return self.pipeline.decision_function(x)
 
@@ -60,14 +62,14 @@ class TrainedModel:
                            "offset": self.offset})
 
     @staticmethod
-    def load(out_dir: Path) -> TrainedModel:
+    def load(out_dir: Path, num_threads: int) -> TrainedModel:
         meta = read_json(out_dir / "meta.json")
         if meta is None:
             raise FileNotFoundError(f"{out_dir}/meta.json is missing")
         assert_clean(meta["features"])
         booster = lgb.Booster(model_file=str(out_dir / "model.txt"))
         return TrainedModel(meta["kind"], list(meta["features"]), float(meta["offset"]),
-                            booster=booster, meta=meta)
+                            booster=booster, meta=meta, num_threads=num_threads)
 
 
 def case_control_offset(sample_rate: float, neg_rate: float) -> float:
@@ -107,7 +109,8 @@ def fit_lgbm(cfg: Config, m: Matrix, features: list[str], offset: float,
         booster = lgb.train(params, dataset(np.ones(len(m.y), bool)), num_boost_round=rounds)
     meta = {"best_iteration": best, "train_batches": batches, "valid_batch": valid_batch,
             "rows": len(m.y), "positives": int(m.y.sum())}
-    return TrainedModel(kind, features, offset, booster=booster, meta=meta)
+    return TrainedModel(kind, features, offset, booster=booster, meta=meta,
+                        num_threads=cfg.model.num_threads)
 
 
 def fit_logreg(cfg: Config, m: Matrix, features: list[str], offset: float) -> TrainedModel:
