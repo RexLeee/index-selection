@@ -47,8 +47,8 @@ def test_base_config_loads(base_cfg):
     ("[trends]\nhours = 500\n", "trends.hours"),
     ("[pseudo]\ngate_provider_overlap = 1.5\n", "gate"),
     ("[pseudo]\ngate_trend_jaccard = -0.1\n", "gate"),
-    ("[guard]\ntimeout_cap_s = 2700\n", "hourly open gap"),
-    ("[guard]\ndaily_window = ['04:40', '02:50']\n", "wrap"),
+    ("[guard]\ntimeout_cap_s = 2880\n", "hourly open gap"),
+    ("[guard]\nmonth_window = ['20:00', '00:00']\n", "wrap"),
     ("[guard]\nmonth_window = ['00:00', '25:00']\n", "HH:MM"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):

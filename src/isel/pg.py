@@ -270,10 +270,8 @@ def _forbidden_windows(start: datetime, end: datetime,
     """Every forbidden [from, to) interval that can overlap [start, end]."""
     out = []
     day = start.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
-    daily = [timedelta(minutes=hhmm_minutes(v)) for v in g.daily_window]
     monthly = [timedelta(minutes=hhmm_minutes(v)) for v in g.month_window]
     while day <= end:
-        out.append((day + daily[0], day + daily[1]))
         if day.day in g.month_days:
             out.append((day + monthly[0], day + monthly[1]))
         day += timedelta(days=1)

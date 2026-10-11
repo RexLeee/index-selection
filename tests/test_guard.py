@@ -14,11 +14,11 @@ def t(text: str) -> datetime:
 
 @pytest.mark.parametrize("start, duration_s, expected", [
     ("2026-10-08 05:20", 300, "2026-10-08 05:20"),
-    ("2026-10-08 05:50", 300, "2026-10-08 05:50"),   # ends exactly at :55
-    ("2026-10-08 05:51", 300, "2026-10-08 06:10"),   # would run into :55
-    ("2026-10-08 06:05", 60, "2026-10-08 06:10"),    # inside :55-:10
-    ("2026-10-08 02:47", 300, "2026-10-08 04:40"),   # daily accounting window
-    ("2026-10-16 10:00", 60, "2026-10-16 20:10"),    # measurement day, then :55-:10
+    ("2026-10-08 05:53", 300, "2026-10-08 05:53"),   # ends exactly at :58
+    ("2026-10-08 05:54", 300, "2026-10-08 06:10"),   # would run into :58
+    ("2026-10-08 06:05", 60, "2026-10-08 06:10"),    # inside :58-:10
+    ("2026-10-08 03:20", 300, "2026-10-08 03:20"),   # no daily window since 2026-10-11
+    ("2026-10-16 10:00", 60, "2026-10-16 20:10"),    # measurement day, then :58-:10
     ("2026-10-15 23:58", 60, "2026-10-16 20:10"),    # chained hourly, day 16, hourly
     ("2026-10-02 10:20", 60, "2026-10-02 10:20"),    # day 2 is not a measurement day
 ])
@@ -33,14 +33,14 @@ def test_next_allowed_start_needs_aware_time(base_cfg):
 
 def test_a_statement_longer_than_the_hourly_gap_is_refused(base_cfg):
     with pytest.raises(ValueError, match="cannot fit"):
-        next_allowed_start(t("2026-10-08 05:20"), 45 * 60, base_cfg.guard)
+        next_allowed_start(t("2026-10-08 05:20"), 48 * 60, base_cfg.guard)
 
 
 @pytest.mark.parametrize("now, expected", [
-    ("2026-10-08 05:20", ("2026-10-08 05:55", "2026-10-08 06:10")),
-    ("2026-10-08 06:00", ("2026-10-08 05:55", "2026-10-08 06:10")),   # in progress
-    ("2026-10-08 02:56", ("2026-10-08 02:50", "2026-10-08 04:40")),   # daily absorbs hourly
-    ("2026-10-16 10:00", ("2026-10-15 23:55", "2026-10-16 20:10")),   # chained on day 16
+    ("2026-10-08 05:20", ("2026-10-08 05:58", "2026-10-08 06:10")),
+    ("2026-10-08 06:00", ("2026-10-08 05:58", "2026-10-08 06:10")),   # in progress
+    ("2026-10-08 02:56", ("2026-10-08 02:58", "2026-10-08 03:10")),   # only the hourly one
+    ("2026-10-16 10:00", ("2026-10-15 23:58", "2026-10-16 20:10")),   # chained on day 16
 ])
 def test_next_forbidden_window_merges_overlaps(base_cfg, now, expected):
     assert next_forbidden_window(t(now), base_cfg.guard) == (t(expected[0]), t(expected[1]))
@@ -115,8 +115,8 @@ def test_session_runs_statements_only_inside_read_windows(base_cfg):
 
 
 def test_window_is_checked_again_after_the_load_probe(base_cfg):
-    # 05:53:00 + 120 s just fits before :55, but the probe itself takes 2 s.
-    clock = FakeClock(t("2026-10-08 05:53"))
+    # 05:56:00 + 120 s just fits before :58, but the probe itself takes 2 s.
+    clock = FakeClock(t("2026-10-08 05:56"))
     conn = FakeConn(rows={"pg_stat_activity": [(0,)], "SELECT 1": [(1,)]},
                     clock=lambda: clock.now)
     session = ReadOnlySession(conn, timeout_s=120)

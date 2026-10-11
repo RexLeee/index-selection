@@ -120,7 +120,7 @@ V1 的資料來自 RESEARCH §3.4。`v1_features` 這個 baseline 只用 V1 的�
 | crawler 容器 | 從 10-06 停到現在 | `last_fetch_ok` 不會變，候選池可以重建 |
 | crawlerdb | 仍是 PostgreSQL，256 張 shard 表都在 | `TABLESAMPLE` 可用 |
 | crawlerdb 寫入 | 評分程式正在更新 `url_score`，約每 2–3 分鐘做一次 checkpoint | 列層沒有凍結。`url_score` 被 `FORBIDDEN` 擋在模型外，不影響特徵 |
-| Host1 IO PSI avg10 | gc 時段內 45.8%，之後 6.7–14% | 等 04:40 gc 時段結束才開始讀 |
+| Host1 IO PSI avg10 | gc 時段內 45.8%，之後 6.7–14% | 等 04:40 gc 時段結束才開始讀。註（10-11）：45.8% 是 03:06 UTC 量的，正值 Metric 整點掃描（:00–:07），不是 gc 造成的 |
 
 ### 5.2 讀取步驟
 

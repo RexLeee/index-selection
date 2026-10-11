@@ -33,7 +33,6 @@ class RunCfg:
 class GuardCfg:
     month_days: list[int]
     month_window: list[str]
-    daily_window: list[str]
     hourly_window: list[int]
     max_io_waiters: int
     probes: int
@@ -325,11 +324,9 @@ def timeout_seconds(session: Mapping[str, str]) -> int:
 
 
 def _validate_guard(g: GuardCfg, need: Any) -> None:
-    for name in ("month_window", "daily_window"):
-        window = getattr(g, name)
-        need(len(window) == 2, f"guard.{name} must be [start, end]")
-        start, end = (hhmm_minutes(v) for v in window)
-        need(start < end, f"guard.{name} must not wrap past midnight")
+    need(len(g.month_window) == 2, "guard.month_window must be [start, end]")
+    start, end = (hhmm_minutes(v) for v in g.month_window)
+    need(start < end, "guard.month_window must not wrap past midnight")
     need(all(1 <= d <= 31 for d in g.month_days), "guard.month_days must be 1-31")
     need(len(g.hourly_window) == 2 and all(0 <= m < 60 for m in g.hourly_window),
          "guard.hourly_window must be [start_minute, end_minute]")
