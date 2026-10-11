@@ -19,7 +19,6 @@ def replace(cfg: Config, section: str, **values) -> Config:
 def small_cfg(work_dir: Path) -> Config:
     cfg = load_config([BASE])
     cfg = replace(cfg, "run", work_dir=str(work_dir))
-    cfg = replace(cfg, "pull", sample_percent=100.0)
     cfg = replace(cfg, "dataset", neg_rate=0.5, first_label_batch=2)
     cfg = replace(cfg, "model", num_boost_round=150, early_stopping_rounds=20,
                   params={**cfg.model.params, "num_leaves": 15, "min_data_in_leaf": 20,

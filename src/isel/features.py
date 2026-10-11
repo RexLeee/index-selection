@@ -11,6 +11,10 @@ Leakage rules (see docs/DESIGN.md):
   batches whose as-of time is later than their fetch time.
 * Columns the crawler derives from golden labels are in `FORBIDDEN` and can
   never enter a feature set.
+* A row's features never depend on whether the sample holds it. Domain and
+  lift statistics come from sample rows; a row outside the sample adds itself,
+  so it sees what it would see as a sample row. Otherwise positives, which are
+  mostly outside the sample, carry a label proxy.
 """
 
 from __future__ import annotations
@@ -99,8 +103,14 @@ FORBIDDEN = frozenset({
 })
 ID_COLUMNS = ("url", "shard", "h", "dkey", "is_sample", "label", "in_head", "in_random",
               "url_score", "source")
-# Pulled for diagnostics and later text features; never loaded into the store.
-UNLOADED_COLUMNS = ("num_fetch_ok_90d", "title")
+# The crawl columns the full export keeps and the store loads, in export order.
+ROW_COLUMNS = (
+    "url", "domain_id", "last_fetch_ok", "title_len", "has_anchor", "discovery_source_type",
+    "robots_bits", "is_redirect", "redirect_hop_count", "has_json_ld", "hreflang_count",
+    "has_last_modified", "has_cache_control", "inlink_count_approx", "inlink_count_external",
+    "url_score", "source", "shard",
+)
+SAMPLE_METHOD = "hash"
 LEVELS = ("tld", "dkey", "host", "hp")
 
 
@@ -152,10 +162,18 @@ class FeatureStore:
         self.con = con
         self.work_dir = work_dir
         meta = read_json(work_dir / "sample" / "_meta.json")
-        if not meta:
-            raise RuntimeError("sample/_meta.json is missing; run pull-sample first")
-        if "finished_at" not in meta:
-            raise RuntimeError("the sample is unfinished; rerun pull-sample until it finishes")
+        if not meta or "finished_at" not in meta:
+            raise RuntimeError("sample/_meta.json is missing or unfinished; run derive-sample")
+        if meta.get("method") != SAMPLE_METHOD:
+            raise RuntimeError("the sample was not drawn row by row from the full export; "
+                               "move it away and run derive-sample")
+        positives = read_json(work_dir / "positives" / "_meta.json") or {}
+        if positives.get("export_started_at") != meta["export_started_at"]:
+            raise RuntimeError("positives/ did not come from the sample's export; "
+                               "move it away and run derive-positives")
+        # A model fits the sample it was trained on; a new sample means a new model.
+        self.fingerprint = {key: meta[key] for key in
+                            ("method", "sample_percent", "sample_salt", "export_started_at")}
         self.rate = float(meta["sample_percent"]) / 100.0
         self.snapshot_at = datetime.fromisoformat(meta["snapshot_at"])
         self.batches: list[Batch] = []
@@ -169,11 +187,11 @@ class FeatureStore:
         con, cfg = self.con, self.cfg
         sample = self._files("sample/shard=*.parquet")
         if not sample:
-            raise RuntimeError("no sample files; run pull-sample first")
-        skip = ", ".join(UNLOADED_COLUMNS)
-        parts = [f"SELECT * EXCLUDE ({skip}), true AS is_sample FROM read_parquet({sql_str(f)})"
+            raise RuntimeError("no sample files; run derive-sample")
+        cols = ", ".join(ROW_COLUMNS)
+        parts = [f"SELECT {cols}, true AS is_sample FROM read_parquet({sql_str(f)})"
                  for f in sample]
-        parts += [f"SELECT * EXCLUDE ({skip}), false AS is_sample FROM read_parquet({sql_str(f)})"
+        parts += [f"SELECT {cols}, false AS is_sample FROM read_parquet({sql_str(f)})"
                   for f in self._files("positives/batch=*.parquet")]
         con.execute(
             "CREATE OR REPLACE TEMP TABLE crawl0 AS SELECT *, "
@@ -199,7 +217,7 @@ class FeatureStore:
         missing = [b.batch_id for b in self.batches
                    if not (self.work_dir / "positives" / f"batch={b.batch_id}.parquet").exists()]
         if missing:
-            raise RuntimeError(f"positives are missing for batches {missing}; run pull-positives")
+            raise RuntimeError(f"positives are missing for batches {missing}; run derive-positives")
         if next_batch:
             official = [b.batch_id for b in self.batches if b.official]
             t = self.snapshot_at + lead
@@ -220,6 +238,8 @@ class FeatureStore:
         self._host_keys("SELECT DISTINCT host FROM crawl0 UNION SELECT DISTINCT host FROM gold0")
         self._key_columns("crawl", "crawl0")
         self._key_columns("gold", "gold0")
+        con.execute("CREATE OR REPLACE TEMP TABLE sample_keys AS "
+                    "SELECT DISTINCT url, shard FROM crawl WHERE is_sample")
         con.execute(
             "CREATE OR REPLACE TEMP TABLE spell AS SELECT batch_id, url, canonical_url, "
             "bool_or(in_head) AS in_head, bool_or(in_random) AS in_random FROM ("
@@ -268,7 +288,7 @@ class FeatureStore:
 
     def _aggregates(self) -> None:
         """Per-level exposure, hits and demand, decayed into each destination batch."""
-        con, rate = self.con, self.rate
+        con = self.con
         con.execute(
             "CREATE OR REPLACE TEMP TABLE matches AS SELECT s.batch_id, s.canonical_url, "
             "c.host, c.hp, c.dkey, c.tld FROM spell s JOIN crawl c ON c.url = s.url "
@@ -276,7 +296,7 @@ class FeatureStore:
         for lvl in LEVELS:
             extra = (f", sum(ln(1 + c.inlink_count_approx)::{EXACT}) AS sum_li, "
                      f"sum(ln(1 + c.inlink_count_external)::{EXACT}) AS sum_le, "
-                     "avg((c.inlink_count_external > 0)::DOUBLE) AS ext_share"
+                     "count(*) FILTER (WHERE c.inlink_count_external > 0) AS n_ext"
                      if lvl == "dkey" else "")
             con.execute(
                 f"CREATE OR REPLACE TEMP TABLE expo_{lvl} AS SELECT c.{lvl} AS k, b.batch_id, "
@@ -287,7 +307,7 @@ class FeatureStore:
                 "count(DISTINCT canonical_url) AS g FROM matches GROUP BY ALL")
             con.execute(
                 f"CREATE OR REPLACE TEMP TABLE lvl_{lvl} AS SELECT k, dst AS batch_id, "
-                f"{_exact_sum('w * n')} / {rate!r} AS e, {_exact_sum('w * g')} AS g FROM ("
+                f"sum(w::{EXACT} * n) AS ex, {_exact_sum('w * g')} AS g FROM ("
                 f"SELECT e.k, p.dst, p.w, e.n, 0 AS g FROM expo_{lvl} e "
                 "JOIN pairs p ON p.src = e.batch_id UNION ALL "
                 f"SELECT h.k, p.dst, p.w, 0, h.g FROM hits_{lvl} h "
@@ -300,7 +320,7 @@ class FeatureStore:
                 "JOIN pairs p ON p.src = d.batch_id GROUP BY ALL")
         con.execute(
             "CREATE OR REPLACE TEMP TABLE glob_stats AS SELECT p.dst AS batch_id, "
-            f"{_exact_sum('p.w * coalesce(x.n, 0)')} / {rate!r} AS e, "
+            f"sum(p.w::{EXACT} * coalesce(x.n, 0)) AS ex, "
             f"{_exact_sum('p.w * coalesce(m.g, 0)')} AS g, "
             "count(*) AS hb FROM pairs p "
             "LEFT JOIN (SELECT batch_id, sum(n) AS n FROM expo_tld GROUP BY ALL) x "
@@ -320,16 +340,21 @@ class FeatureStore:
         """Replaces the crawl rows with one full-export file and keeps the sample aggregates.
 
         The aggregate tables were built from the sample in `_prepare`, as for
-        training, and every feature is a per-row value or a lookup into them,
-        so `frame_sql(..., "score")` gives each row exactly the features it
-        would get as a sample row, whichever file it came in.
+        training. A row of the file is a sample row when the sample holds its
+        (url, shard), and `frame_sql` counts every other row into its own
+        domain statistics, so each row gets the features it would get in
+        training, whether the sample holds it or not.
         """
         # The file sits under a shard=NNN/ directory; its own shard column is the truth.
+        source = f"read_parquet({sql_str(str(path))}, hive_partitioning = false)"
         self.con.execute(
-            "CREATE OR REPLACE TEMP TABLE crawl0 AS SELECT *, false AS is_sample, "
-            f"lower(regexp_extract(url, {sql_str(HOST_RE)}, 1)) AS host, "
-            f"regexp_extract(url, {sql_str(PATH_RE)}, 1) AS path, md5_number_lower(url) AS h "
-            f"FROM read_parquet({sql_str(str(path))}, hive_partitioning = false)")
+            "CREATE OR REPLACE TEMP TABLE crawl0 AS SELECT e.*, k.url IS NOT NULL AS is_sample, "
+            f"lower(regexp_extract(e.url, {sql_str(HOST_RE)}, 1)) AS host, "
+            f"regexp_extract(e.url, {sql_str(PATH_RE)}, 1) AS path, "
+            f"md5_number_lower(e.url) AS h FROM {source} e "
+            "LEFT JOIN (SELECT url, shard FROM sample_keys "
+            f"WHERE shard IN (SELECT DISTINCT shard FROM {source})) k "
+            "ON k.url = e.url AND k.shard = e.shard")
         self._host_keys("SELECT DISTINCT host FROM crawl0")
         self._key_columns("crawl", "crawl0")
 
@@ -375,6 +400,20 @@ class FeatureStore:
             "ln(1 + c.inlink_count_external) AS log_ext, "
             "(c.inlink_count_external > 0)::INT AS has_ext")
 
+    def _own_weight_sql(self, batch_id: int) -> str:
+        """Exact decay weight of the row in every source pool of `batch_id`.
+
+        `expo_*` counts a sample row in the pool of each source batch with
+        `last_fetch_ok < as_of`; a row outside the sample adds the same weight
+        for itself. DuckDB renders the DECIMAL weights, so they match `lvl_*` exactly.
+        """
+        rows = self.con.execute(
+            f"SELECT s.as_of, (p.w::{EXACT})::VARCHAR FROM pairs p "
+            f"JOIN batches s ON s.batch_id = p.src WHERE p.dst = {batch_id} ORDER BY 1").fetchall()
+        terms = [f"CASE WHEN c.last_fetch_ok < {_ts(t)} THEN {sql_str(w)}::{EXACT} ELSE 0 END"
+                 for t, w in rows]
+        return f"({' + '.join(terms)})::{EXACT}" if terms else f"0::{EXACT}"
+
     def frame_sql(self, batch_id: int, mode: str) -> str:
         """SQL for the rows of batch `batch_id` with ids, label and every feature.
 
@@ -398,22 +437,34 @@ class FeatureStore:
                          f"md5_number_lower(c.url || {salt}) % 1000000 < {ppm}))",
                 "score": "true"}[mode]
         rate = self.rate
+        # Every row counts in its own domain: sample rows through expo_*, others by `own`.
+        n_dkey = "(coalesce(ds.n, 0) + c.own)"
+
+        def exposure(alias: str) -> str:
+            # Sample rows count themselves in `ex`; any other row adds itself here.
+            return f"(coalesce({alias}.ex, 0) + base.own * base.own_w)::DOUBLE / {rate!r}"
+
         return f"""
 WITH base AS (
   SELECT c.*, l.url IS NOT NULL AS label,
-    coalesce(l.in_head, false) AS in_head, coalesce(l.in_random, false) AS in_random
+    coalesce(l.in_head, false) AS in_head, coalesce(l.in_random, false) AS in_random,
+    CASE WHEN c.is_sample THEN 0 ELSE 1 END AS own, {self._own_weight_sql(batch_id)} AS own_w
   FROM crawl c
   LEFT JOIN (SELECT * FROM label_urls WHERE batch_id = {batch_id}) l ON l.url = c.url
   WHERE c.last_fetch_ok < {_ts(b.as_of)} AND {keep}
 ), g AS (
-  SELECT e, g, hb, nullif(g, 0) / nullif(e, 0) AS rg FROM glob_stats WHERE batch_id = {batch_id}
+  SELECT ex, g, hb FROM glob_stats WHERE batch_id = {batch_id}
+),
+s0 AS (
+  SELECT base.*, nullif(g.g, 0) / nullif({exposure("g")}, 0) AS rg, g.hb
+  FROM base LEFT JOIN g ON true
 ),
 s1 AS (
-  SELECT base.*, g.rg, g.hb,
-    (coalesce(t.g, 0) + {a}) / (coalesce(t.e, 0) + {a} / g.rg) AS r_tld,
-    t.g AS g_tld, d.g AS g_dkey, d.e AS e_dkey, ho.g AS g_host, ho.e AS e_host,
-    hp.g AS g_hp, hp.e AS e_hp
-  FROM base LEFT JOIN g ON true
+  SELECT base.*,
+    (coalesce(t.g, 0) + {a}) / ({exposure("t")} + {a} / base.rg) AS r_tld,
+    t.g AS g_tld, d.g AS g_dkey, {exposure("d")} AS e_dkey, ho.g AS g_host,
+    {exposure("ho")} AS e_host, hp.g AS g_hp, {exposure("hp")} AS e_hp
+  FROM s0 base
   LEFT JOIN (SELECT * FROM lvl_tld WHERE batch_id = {batch_id}) t ON t.k = base.tld
   LEFT JOIN (SELECT * FROM lvl_dkey WHERE batch_id = {batch_id}) d ON d.k = base.dkey
   LEFT JOIN (SELECT * FROM lvl_host WHERE batch_id = {batch_id}) ho ON ho.k = base.host
@@ -432,16 +483,21 @@ SELECT c.url, c.shard, c.h, c.dkey, c.is_sample, c.label::INT AS label, c.in_hea
   c.url_score, c.source,
   {self._static_sql()},
   date_diff('second', c.last_fetch_ok, {_ts(b.as_of)}) / 86400.0 AS fetch_age_days,
-  (ln(1 + c.inlink_count_approx)::{EXACT} * ds.n - ds.sum_li)::DOUBLE / ds.n AS rel_inlinks,
-  (ln(1 + c.inlink_count_external)::{EXACT} * ds.n - ds.sum_le)::DOUBLE / ds.n AS rel_ext,
+  (ln(1 + c.inlink_count_approx)::{EXACT} * {n_dkey} - coalesce(ds.sum_li, 0)
+   - c.own * coalesce(ln(1 + c.inlink_count_approx), 0)::{EXACT})::DOUBLE
+   / nullif({n_dkey}, 0) AS rel_inlinks,
+  (ln(1 + c.inlink_count_external)::{EXACT} * {n_dkey} - coalesce(ds.sum_le, 0)
+   - c.own * coalesce(ln(1 + c.inlink_count_external), 0)::{EXACT})::DOUBLE
+   / nullif({n_dkey}, 0) AS rel_ext,
   coalesce(u.hist_decayed, 0) AS hist_decayed, coalesce(u.hist_head, 0) AS hist_head,
   coalesce(u.hist_random, 0) AS hist_random, u.hist_days_since,
   ln(c.r_tld / c.rg) AS lift_tld, ln(c.r_dkey / c.rg) AS lift_dkey,
   ln(c.r_host / c.rg) AS lift_host, ln(c.r_hp / c.rg) AS lift_hp,
   ln(1 + coalesce(dd.dem, 0)) AS dem_dkey, ln(1 + coalesce(dh.dem, 0)) AS dem_host,
-  ln(1 + coalesce(ds.n, 0) / {rate!r}) AS log_size_dkey,
-  ln(1 + coalesce(hs.n, 0) / {rate!r}) AS log_size_host,
-  ds.ext_share AS dkey_ext_share, c.hb AS history_batches
+  ln(1 + {n_dkey} / {rate!r}) AS log_size_dkey,
+  ln(1 + (coalesce(hs.n, 0) + c.own) / {rate!r}) AS log_size_host,
+  (coalesce(ds.n_ext, 0) + c.own * coalesce((c.inlink_count_external > 0)::INT, 0))
+   / nullif({n_dkey}, 0) AS dkey_ext_share, c.hb AS history_batches
 FROM s4 c
 LEFT JOIN (SELECT * FROM expo_dkey WHERE batch_id = {batch_id}) ds ON ds.k = c.dkey
 LEFT JOIN (SELECT * FROM expo_host WHERE batch_id = {batch_id}) hs ON hs.k = c.host

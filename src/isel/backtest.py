@@ -162,7 +162,8 @@ def train_frozen(cfg: Config, work_dir: Path, baselines: list[str]) -> Path:
                       [b for b in baselines if b == "v1_features"])
     out = work_dir / "models" / utc_id()
     for name, model in models.items():
-        model.meta.update(snapshot_at=store.snapshot_at, trained_at=datetime.now(UTC),
+        model.meta.update(snapshot_at=store.snapshot_at, sample_fingerprint=store.fingerprint,
+                          trained_at=datetime.now(UTC),
                           config_sha256=cfg.sha256(), code_version=code_version(), name=name,
                           use_pseudo=cfg.golden.use_pseudo)
         model.save(out / name.replace(":", "_"))
@@ -177,6 +178,16 @@ def load_models(model_dir: Path, num_threads: int) -> dict[str, TrainedModel]:
     if not models:
         raise FileNotFoundError(f"no models under {model_dir}")
     return models
+
+
+def frozen_model(cfg: Config, store: FeatureStore, model_dir: Path) -> TrainedModel:
+    """The configured feature set's model; it must come from the store's sample."""
+    model = load_models(model_dir, cfg.model.num_threads)[model_name(cfg.model.feature_set)]
+    if model.meta.get("sample_fingerprint") != store.fingerprint:
+        raise RuntimeError(f"the model was trained on another sample "
+                           f"({model.meta.get('sample_fingerprint')}); the sample is "
+                           f"{store.fingerprint}")
+    return model
 
 
 def _align(frame: pa.Table, base: pa.Table) -> pa.Table:
@@ -231,10 +242,10 @@ def forward_eval(cfg: Config, work_dir: Path, model_dirs: list[Path], batch: int
     base_use = False not in stores   # official-only features when present
     base = stores[base_use]
     for use, models in groups.items():
-        snapshots = {str(m.meta.get("snapshot_at")) for m in models.values()}
-        if snapshots != {str(stores[use].snapshot_at)}:
-            raise RuntimeError(f"models were trained on snapshot(s) {snapshots}, "
-                               f"but the sample is {stores[use].snapshot_at}")
+        if any(m.meta.get("sample_fingerprint") != stores[use].fingerprint
+               for m in models.values()):
+            raise RuntimeError("a model was trained on another sample; "
+                               f"the sample is {stores[use].fingerprint}")
     b = base.batch(batch)
     if b.created_at <= base.snapshot_at:
         raise RuntimeError(f"batch {batch} existed before the snapshot; use backtest")
@@ -278,8 +289,7 @@ def select_sample(cfg: Config, work_dir: Path, model_dir: Path, k: int) -> dict[
     the manifest contract at sample scale without touching any database.
     """
     store = open_store(cfg, work_dir, next_batch=True)
-    models = load_models(model_dir, cfg.model.num_threads)
-    model = models[model_name(cfg.model.feature_set)]
+    model = frozen_model(cfg, store, model_dir)
     target = store.batches[-1].batch_id
     frame = store.frame(target, "eval")
     frame = frame.filter(frame.column("is_sample"))

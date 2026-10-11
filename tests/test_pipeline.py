@@ -19,7 +19,7 @@ from isel.features import FeatureStore, resolve_set
 from isel.golden import PSEUDO, golden_table, pseudo_batch_path
 from isel.io import atomic_write_json, open_duckdb, read_json, write_parquet_atomic
 from isel.manifest import validate_run
-from isel.pull import CRAWL_SCHEMA
+from isel.pull import FULL_SCHEMA
 from isel.urlnorm import canonicalize
 
 
@@ -207,7 +207,7 @@ def test_decay_weights_fall_with_age(work):
 def test_empirical_bayes_falls_back_to_parent(work):
     store = _store(small_cfg(work), work)
     rows = store.con.execute(
-        f"SELECT f.lift_hp, f.lift_host, l.e, l.g FROM ({store.frame_sql(2, 'eval')}) f "
+        f"SELECT f.lift_hp, f.lift_host, l.ex, l.g FROM ({store.frame_sql(2, 'eval')}) f "
         "JOIN crawl c USING (url, shard) "
         "LEFT JOIN (SELECT * FROM lvl_hp WHERE batch_id = 2) l ON l.k = c.hp").fetchall()
     empty = [(hp, host) for hp, host, e, g in rows if not e and not g]
@@ -255,6 +255,15 @@ def test_backtest_batch_before_snapshot_is_rejected_for_forward_eval(work):
     model_dir = train_frozen(cfg, work, [])
     with pytest.raises(RuntimeError, match="existed before the snapshot"):
         forward_eval(cfg, work, [model_dir], 8, ["random"])
+
+
+def test_forward_eval_refuses_a_model_of_another_sample(work):
+    cfg = small_cfg(work)
+    model_dir = train_frozen(cfg, work, [])
+    meta = read_json(work / "sample" / "_meta.json")
+    atomic_write_json(work / "sample" / "_meta.json", {**meta, "sample_percent": 50.0})
+    with pytest.raises(RuntimeError, match="another sample"):
+        forward_eval(cfg, work, [model_dir], 9, ["random"])
 
 
 def _add_golden(work, world, extra):
@@ -320,7 +329,7 @@ def test_label_audit_counts_other_spellings_of_golden_pages(work, world):
     variant.update(url=page["url"].replace("https://www.", "http://"), shard=0)
     path = work / "sample" / "shard=000.parquet"
     write_parquet_atomic(pa.Table.from_pylist([*pq.read_table(path).to_pylist(), variant],
-                                              schema=CRAWL_SCHEMA), path)
+                                              schema=FULL_SCHEMA), path)
     after = cmd_build_dataset(cfg, Namespace())
     assert after["5"]["neg_variant_golden"] - before["5"]["neg_variant_golden"] == 1
 
@@ -399,3 +408,12 @@ def test_relative_inlinks_are_zero_for_pages_at_the_domain_mean(tmp_path, world)
             if r["dkey"] in flat]
     assert rows
     assert [r for r in rows if r["rel_inlinks"] != 0 or r["rel_ext"] != 0] == []
+
+
+def test_select_sample_refuses_a_model_of_another_sample(work):
+    cfg = small_cfg(work)
+    model_dir = train_frozen(cfg, work, [])
+    meta = read_json(work / "sample" / "_meta.json")
+    atomic_write_json(work / "sample" / "_meta.json", {**meta, "sample_salt": "other"})
+    with pytest.raises(RuntimeError, match="another sample"):
+        select_sample(cfg, work, model_dir, 1000)

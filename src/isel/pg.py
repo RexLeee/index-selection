@@ -14,7 +14,7 @@ import re
 import statistics
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -453,15 +453,6 @@ class ReadOnlySession:
     def fetchone(self, query: str | sql.Composable, params: Sequence[Any] | None = None) -> Any:
         rows = self.fetchall(query, params)
         return rows[0] if rows else None
-
-    def copy_rows(self, query: str | sql.Composable, type_oids: Sequence[int]) -> Iterator[tuple]:
-        """Streams rows of a `COPY ... TO STDOUT (FORMAT BINARY)` statement."""
-        text = self._text(query)
-        assert_read_only_sql(text)
-        self._admit()
-        with self.conn.cursor() as cur, cur.copy(text) as copy:
-            copy.set_types(list(type_oids))
-            yield from copy.rows()
 
     def copy_bytes(self, query: str | sql.Composable) -> bytearray:
         """Returns the whole output of a `COPY ... TO STDOUT` statement."""

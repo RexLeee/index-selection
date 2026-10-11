@@ -81,28 +81,6 @@ def cmd_pull_dims(cfg: Config, args: argparse.Namespace) -> Any:
         session.close()
 
 
-def cmd_pull_sample(cfg: Config, args: argparse.Namespace) -> Any:
-    from datetime import UTC, datetime
-
-    from isel.pg import next_allowed_start, next_forbidden_window, open_crawlerdb
-    from isel.pull import estimate_sample, pull_sample
-
-    session = open_crawlerdb(cfg)
-    try:
-        if args.dry_run:
-            estimate = estimate_sample(cfg, session, _ids(args.shards))
-            now = datetime.now(UTC)
-            longest = estimate["timeout_s_max"] or 0
-            window = next_forbidden_window(now, cfg.guard)
-            return {**estimate, "io_waiters_now": session.io_waiters(),
-                    "forbidden_window_next": [t.isoformat() for t in window],
-                    "next_start_for_longest": next_allowed_start(
-                        now, longest, cfg.guard).isoformat()}
-        return pull_sample(cfg, session, cfg.work_dir / "sample", _ids(args.shards))
-    finally:
-        session.close()
-
-
 def cmd_pull_full(cfg: Config, args: argparse.Namespace) -> Any:
     import shutil
     from datetime import UTC, datetime
@@ -130,32 +108,6 @@ def cmd_pull_full(cfg: Config, args: argparse.Namespace) -> Any:
     finally:
         for session in sessions:
             session.close()
-
-
-def cmd_advance_snapshot(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.pg import open_crawlerdb
-    from isel.pull import advance_snapshot
-
-    session = open_crawlerdb(cfg)
-    try:
-        return advance_snapshot(cfg, session, cfg.work_dir / "sample")
-    finally:
-        session.close()
-
-
-def cmd_pull_positives(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.golden import read_golden
-    from isel.pg import open_crawlerdb
-    from isel.pull import pull_positives
-
-    router = _router(cfg)
-    session = open_crawlerdb(cfg)
-    try:
-        golden = read_golden(cfg.work_dir, include_pseudo=cfg.golden.use_pseudo)
-        return pull_positives(cfg, session, router, golden,
-                              cfg.work_dir / "positives", _ids(args.batches), args.force)
-    finally:
-        session.close()
 
 
 def cmd_trends_snapshot(cfg: Config, args: argparse.Namespace) -> Any:
@@ -189,20 +141,6 @@ def cmd_pseudo_batch(cfg: Config, args: argparse.Namespace) -> Any:
     ledger = serp_ledger(cfg, cfg.work_dir)
     return run_pseudo_batch(cfg, cfg.work_dir, args.source, args.batch_id, args.head,
                             args.random, make_client(cfg, args.provider, ledger), ledger)
-
-
-def cmd_validate_sample(cfg: Config, args: argparse.Namespace) -> Any:
-    """Checks the pool rebuild's premise that each URL is fetched once (`num_fetch_ok_90d`)."""
-    con = open_duckdb(cfg, cfg.work_dir / "duckdb_tmp")
-    glob = sql_str(str(cfg.work_dir / "sample" / "shard=*.parquet"))
-    rows, refetched, no_title = con.execute(
-        "SELECT count(*), count(*) FILTER (WHERE num_fetch_ok_90d > 1), "
-        f"count(*) FILTER (WHERE title IS NULL) FROM read_parquet({glob})").fetchone()
-    return {"rows": rows, "refetched_rows": refetched,
-            "refetched_share": refetched / rows if rows else None,
-            "title_null_share": no_title / rows if rows else None,
-            "meta": {k: v for k, v in (read_json(cfg.work_dir / "sample" / "_meta.json") or {}
-                                       ).items() if k != "rows"}}
 
 
 def cmd_validate_routing(cfg: Config, args: argparse.Namespace) -> Any:
@@ -307,6 +245,18 @@ def cmd_forward_eval(cfg: Config, args: argparse.Namespace) -> Any:
     return {"results": str(out / "results.json"), "report": str(out / "report.md")}
 
 
+def cmd_derive_sample(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.derive import derive_sample
+
+    return derive_sample(cfg, cfg.work_dir)
+
+
+def cmd_derive_positives(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.derive import derive_positives
+
+    return derive_positives(cfg, cfg.work_dir, _ids(args.batches))
+
+
 def cmd_select_sample(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.backtest import select_sample
 
@@ -391,16 +341,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("check-config")
     sub.add_parser("pull-golden")
     sub.add_parser("pull-dims")
-    p = sub.add_parser("pull-sample")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--shards")
     p = sub.add_parser("pull-full", help="export every crawled row in ctid block ranges")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--shards")
-    sub.add_parser("advance-snapshot")
-    p = sub.add_parser("pull-positives")
+    sub.add_parser("derive-sample", help="hash-sample the full export into sample/")
+    p = sub.add_parser("derive-positives", help="golden URLs' rows from the full export")
     p.add_argument("--batches")
-    p.add_argument("--force", action="store_true")
     p = sub.add_parser("trends-snapshot", help="pull the trending pool of every trends.geos")
     p.add_argument("--source", choices=["trendspy", "serpapi"], required=True)
     p = sub.add_parser("trends-compare", help="keyword Jaccard and volume rank correlation")
@@ -419,7 +365,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pseudo-gate", help="crawled-positive rate of a backfill vs official")
     p.add_argument("--batch-id", type=int, required=True)
     sub.add_parser("validate-routing")
-    sub.add_parser("validate-sample")
     sub.add_parser("build-dataset")
     p = sub.add_parser("backtest")
     p.add_argument("--feature-sets")
@@ -458,17 +403,15 @@ COMMANDS = {
     "check-config": cmd_check_config,
     "pull-golden": cmd_pull_golden,
     "pull-dims": cmd_pull_dims,
-    "pull-sample": cmd_pull_sample,
     "pull-full": cmd_pull_full,
-    "advance-snapshot": cmd_advance_snapshot,
-    "pull-positives": cmd_pull_positives,
+    "derive-sample": cmd_derive_sample,
+    "derive-positives": cmd_derive_positives,
     "trends-snapshot": cmd_trends_snapshot,
     "trends-compare": cmd_trends_compare,
     "pseudo-calibrate": cmd_pseudo_calibrate,
     "pseudo-batch": cmd_pseudo_batch,
     "pseudo-gate": cmd_pseudo_gate,
     "validate-routing": cmd_validate_routing,
-    "validate-sample": cmd_validate_sample,
     "build-dataset": cmd_build_dataset,
     "backtest": cmd_backtest,
     "report": cmd_report,

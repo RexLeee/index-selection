@@ -30,17 +30,7 @@ from isel.publish import (
     swap,
     verify_live,
 )
-from isel.pull import (
-    CRAWL_SCHEMA,
-    FULL_SCHEMA,
-    advance_snapshot,
-    estimate_full,
-    estimate_sample,
-    pull_dims,
-    pull_full,
-    pull_positives,
-    pull_sample,
-)
+from isel.pull import CRAWL_COLUMNS, FULL_SCHEMA, estimate_full, pull_dims, pull_full
 from isel.urlnorm import DomainKeyer, ShardRouter
 
 pytestmark = pytest.mark.integration
@@ -70,7 +60,7 @@ def _router() -> ShardRouter:
 def _urls() -> list[str]:
     plain = [f"https://site{d}.com/p{i}" for d in range(40) for i in range(25)]
     # Quotes, commas, newlines, backslashes and CJK, so the CSV full export is checked
-    # against the binary sample; ten of them keep len(_urls()) a multiple of 10.
+    # against psycopg's own decoding; ten of them keep len(_urls()) a multiple of 10.
     tricky = [f'https://tricky{i}.example/a?q="x,{i}"\n\\p/中文/NULL' for i in range(10)]
     return plain + tricky
 
@@ -135,7 +125,7 @@ def cfg(base_cfg, tmp_path, dsn, monkeypatch):
     cfg = replace(base_cfg, "run", work_dir=str(tmp_path))
     cfg = replace(cfg, "crawlerdb", num_shards=SHARDS)
     cfg = replace(cfg, "routing", overrides={})
-    return replace(cfg, "pull", sample_percent=100.0, min_interval_s=0.0)
+    return replace(cfg, "pull", min_interval_s=0.0)
 
 
 def _session(cfg, opener=open_crawlerdb):
@@ -144,23 +134,11 @@ def _session(cfg, opener=open_crawlerdb):
     return session
 
 
-def test_sample_and_lookups_read_real_rows(cfg, tmp_path):
+def test_dims_read_real_rows(cfg, tmp_path):
     session = _session(cfg)
     try:
         assert session.io_waiters() >= 0
-        estimate = estimate_sample(cfg, session)
-        assert estimate["table_rows"] == len(_urls())
         assert pull_dims(cfg, session, tmp_path / "dims")["split_hosts"] == 1
-        out = pull_sample(cfg, session, tmp_path / "sample", now=ALLOWED)
-        assert out["shards_missing"] == 0 and out["shards_failed"] == []
-        sample = pq.read_table(tmp_path / "sample")
-        assert sample.num_rows == len(_urls()) - len(_urls()) // 10   # last_fetch_ok IS NULL
-        assert sample.schema.equals(CRAWL_SCHEMA, check_metadata=False)
-        assert {len(t) for t in sample.column("title").to_pylist()} == {cfg.pull.title_chars}
-        golden = golden_table([(1, ALLOWED, 1, "q", 1, ["head"], 1, "https://site3.com/p4"),
-                               (1, ALLOWED, 1, "q", 1, ["head"], 2, "https://none.example/")])
-        report = pull_positives(cfg, session, _router(), golden, tmp_path / "positives")
-        assert report["1"]["found_rows"] == 1 and report["1"]["crawled_rows"] == 1
     finally:
         session.close()
 
@@ -175,23 +153,6 @@ def test_the_server_refuses_writes_and_the_gate_stops_bypasses(cfg):
         session.set_statement_timeout(300)
         assert session.fetchone("SHOW statement_timeout") == ("5min",)
         assert session.fetchone("SHOW default_transaction_read_only") == ("on",)
-    finally:
-        session.close()
-
-
-def test_advance_snapshot_follows_real_write_counters(cfg, tmp_path, dsn):
-    session = _session(cfg)
-    try:
-        pull_sample(cfg, session, tmp_path / "sample", now=ALLOWED)
-        later = ALLOWED + timedelta(hours=1)
-        assert advance_snapshot(cfg, session, tmp_path / "sample", now=later)["snapshot_at"] \
-            == later.isoformat()
-        with psycopg.connect(dsn, autocommit=True) as writer:
-            writer.execute("UPDATE url_state_current_000 SET title = 'x' "
-                           "WHERE url = (SELECT min(url) FROM url_state_current_000)")
-        time.sleep(1.5)   # backends flush table stats at most once per second
-        with pytest.raises(RuntimeError, match="changed"):
-            advance_snapshot(cfg, session, tmp_path / "sample", now=later + timedelta(hours=1))
     finally:
         session.close()
 
@@ -230,17 +191,24 @@ def test_full_export_reads_every_crawled_row_once(cfg, tmp_path, dsn):
     assert set(meta["io"]) == {str(s) for s in range(SHARDS)}
 
 
-def test_the_csv_full_export_equals_the_binary_sample(cfg, tmp_path):
+def test_the_csv_full_export_equals_psycopg_decoding(cfg, tmp_path, dsn):
     cfg = replace(cfg, "full", chunk_blocks=1, chunks_per_file=3, min_free_gb=0.0)
     session = _session(cfg)
     try:
-        pull_sample(cfg, session, tmp_path / "sample", now=ALLOWED)
         pull_full(cfg, [session], tmp_path / "export", now=ALLOWED)
     finally:
         session.close()
-    binary = pq.read_table(tmp_path / "sample").select(FULL_SCHEMA.names).cast(FULL_SCHEMA)
+    columns = ", ".join(f"{expr} AS {name}" for name, expr, _ in CRAWL_COLUMNS)
+    rows = []
+    with psycopg.connect(dsn) as conn:
+        for shard in range(SHARDS):
+            cur = conn.execute(f"SELECT {columns} FROM url_state_current_{shard:03d} "
+                               "WHERE last_fetch_ok IS NOT NULL")
+            names = [d.name for d in cur.description]
+            rows += [{**dict(zip(names, r, strict=True)), "shard": shard} for r in cur]
+    decoded = pa.Table.from_pylist(rows, schema=FULL_SCHEMA)
     csv = _files(tmp_path / "export").cast(FULL_SCHEMA)
-    assert csv.sort_by("url").equals(binary.sort_by("url"))
+    assert csv.sort_by("url").equals(decoded.sort_by("url"))
     assert sum("\n" in u for u in csv.column("url").to_pylist()) == 9
 
 

@@ -9,18 +9,7 @@ from psycopg import errors
 
 from isel.io import read_json
 from isel.pg import assert_read_only_sql
-from isel.pull import (
-    CRAWL_SCHEMA,
-    FULL_SCHEMA,
-    advance_snapshot,
-    estimate_full,
-    estimate_sample,
-    lookup_sql,
-    pull_full,
-    pull_sample,
-    sample_sql,
-    timeout_for,
-)
+from isel.pull import FULL_SCHEMA, estimate_full, pull_full
 
 T0 = datetime(2026, 10, 8, 5, 20, tzinfo=UTC)
 T1 = datetime(2026, 10, 14, 20, 10, tzinfo=UTC)
@@ -29,10 +18,9 @@ T1 = datetime(2026, 10, 14, 20, 10, tzinfo=UTC)
 class FakeSession:
     """Answers the catalog and probe queries `pull` sends; COPY returns no rows."""
 
-    def __init__(self, relpages: dict[str, int], probe: tuple, failing: set[str] = frozenset(),
+    def __init__(self, probe: tuple, failing: set[str] = frozenset(),
                  sizes: dict[str, list[int]] | None = None, csv: bytes = b"",
                  io: list[tuple[int, int, int]] | None = None, broken: set[str] = frozenset()):
-        self.relpages = relpages
         self.probe = probe
         self.failing = set(failing)
         self.broken = set(broken)   # tables whose COPY raises a non-retryable error
@@ -49,21 +37,12 @@ class FakeSession:
         if "pg_relation_size" in query:
             sizes = self.sizes.get(params[0], [0])
             return (sizes.pop(0) if len(sizes) > 1 else sizes[0],)
-        if "pg_class" in query:
-            return (self.relpages[params[0]] * 50, self.relpages[params[0]])
         if "pg_stat_user_tables" in query:
             return self.probe
         raise AssertionError(query)
 
     def set_statement_timeout(self, seconds):
         self.timeout_s = seconds
-
-    def copy_rows(self, query, type_oids):
-        assert_read_only_sql(query)
-        self.copies.append((query, self.timeout_s))
-        if any(f"FROM {table} " in query for table in self.failing):
-            raise errors.QueryCanceled("canceling statement due to statement timeout")
-        yield from ()
 
     def copy_bytes(self, query):
         assert_read_only_sql(query)
@@ -88,117 +67,6 @@ class FakeRate:
 PROBE = (datetime(2026, 10, 6, 8, 2, 16, tzinfo=UTC), 123_456)
 
 
-@pytest.mark.parametrize("relpages, expected", [
-    (10_339_355, 170),        # shard 224: 847 MB at 5 MB/s
-    (1_000, 120),             # floor
-    (1_000_000_000, 900),     # cap
-])
-def test_timeout_scales_with_pages_read(base_cfg, relpages, expected):
-    assert timeout_for(base_cfg, relpages) == expected
-
-
-def test_sample_reads_diagnostic_and_title_columns(base_cfg):
-    text = sample_sql(base_cfg, 3)
-    assert "num_fetch_ok_90d" in text
-    assert f"left(title, {base_cfg.pull.title_chars})" in text
-    assert {"num_fetch_ok_90d", "title"} <= set(CRAWL_SCHEMA.names)
-    assert_read_only_sql(lookup_sql(base_cfg, 3))
-
-
-def test_pull_sample_sets_a_timeout_per_shard_and_records_the_probe(tmp_path, base_cfg):
-    cfg = replace(base_cfg, "pull", shards=[0, 224])
-    session = FakeSession({"url_state_current_000": 1_000,
-                           "url_state_current_224": 10_339_355}, PROBE)
-    pull_sample(cfg, session, tmp_path, now=T0)
-    assert [(q.split("FROM ")[1].split()[0], s) for q, s in session.copies] == [
-        ("url_state_current_000", 120), ("url_state_current_224", 170)]
-    meta = read_json(tmp_path / "_meta.json")
-    assert meta["snapshot_at"] == T0.isoformat()
-    assert meta["frozen_probe"] == {"postmaster_start": PROBE[0].isoformat(),
-                                    "tuple_changes": PROBE[1], "probed_at": T0.isoformat()}
-
-
-def _finished_sample(tmp_path, cfg):
-    session = FakeSession({"url_state_current_000": 1_000}, PROBE)
-    pull_sample(replace(cfg, "pull", shards=[0]), session, tmp_path, now=T0)
-
-
-def test_advance_snapshot_moves_s0_when_crawlerdb_is_unchanged(tmp_path, base_cfg):
-    _finished_sample(tmp_path, base_cfg)
-    out = advance_snapshot(base_cfg, FakeSession({}, PROBE), tmp_path, now=T1)
-    meta = read_json(tmp_path / "_meta.json")
-    assert meta["snapshot_at"] == T1.isoformat() == out["snapshot_at"]
-    assert meta["snapshot_initial"] == T0.isoformat()
-
-
-@pytest.mark.parametrize("probe", [
-    (PROBE[0], PROBE[1] + 1),                                   # rows written
-    (datetime(2026, 10, 9, 0, 0, tzinfo=UTC), PROBE[1]),        # server restarted
-])
-def test_advance_snapshot_refuses_when_crawlerdb_changed(tmp_path, base_cfg, probe):
-    _finished_sample(tmp_path, base_cfg)
-    with pytest.raises(RuntimeError, match="changed"):
-        advance_snapshot(base_cfg, FakeSession({}, probe), tmp_path, now=T1)
-    assert read_json(tmp_path / "_meta.json")["snapshot_at"] == T0.isoformat()
-
-
-def test_advance_snapshot_needs_a_finished_sample(tmp_path, base_cfg):
-    with pytest.raises(RuntimeError, match="finished"):
-        advance_snapshot(base_cfg, FakeSession({}, PROBE), tmp_path, now=T1)
-
-
-def _tables(*shards):
-    return {f"url_state_current_{s:03d}": 1_000 for s in shards}
-
-
-def test_a_partial_pull_is_not_a_finished_sample(tmp_path, base_cfg):
-    cfg = replace(base_cfg, "pull", shards=[0, 1])
-    out = pull_sample(cfg, FakeSession(_tables(0, 1), PROBE), tmp_path, shards=[0], now=T0)
-    assert out["shards_missing"] == 1
-    assert "finished_at" not in read_json(tmp_path / "_meta.json")
-    with pytest.raises(RuntimeError, match="finished"):
-        advance_snapshot(cfg, FakeSession({}, PROBE), tmp_path, now=T1)
-    pull_sample(cfg, FakeSession(_tables(0, 1), PROBE), tmp_path, now=T0)
-    assert "finished_at" in read_json(tmp_path / "_meta.json")
-
-
-def test_a_timed_out_shard_is_recorded_and_retried(tmp_path, base_cfg):
-    cfg = replace(base_cfg, "pull", shards=[0, 1, 2])
-    session = FakeSession(_tables(0, 1, 2), PROBE, failing={"url_state_current_001"})
-    out = pull_sample(cfg, session, tmp_path, now=T0)
-    assert out["shards_failed"] == [1] and out["shards_done"] == 2
-    assert len(session.copies) == 3
-    meta = read_json(tmp_path / "_meta.json")
-    assert meta["shards_failed"] == {"1": "QueryCanceled"} and "finished_at" not in meta
-    retry = FakeSession(_tables(0, 1, 2), PROBE)
-    out = pull_sample(cfg, retry, tmp_path, now=T1)
-    assert [q.split("FROM ")[1].split()[0] for q, _ in retry.copies] == ["url_state_current_001"]
-    meta = read_json(tmp_path / "_meta.json")
-    assert meta["shards_failed"] == {} and "finished_at" in meta
-    assert meta["snapshot_at"] == T0.isoformat()
-
-
-def test_estimate_lists_every_shard(base_cfg):
-    session = FakeSession({"url_state_current_000": 1_000,
-                           "url_state_current_224": 10_339_355}, PROBE)
-    est = estimate_sample(base_cfg, session, [0, 224])
-    assert est["shards"] == {"0": {"rows": 50_000, "pages": 1_000, "timeout_s": 120},
-                             "224": {"rows": 516_967_750, "pages": 10_339_355,
-                                     "timeout_s": 170}}
-    assert est["slowest_shard"] == 224 and est["timeout_s_sum"] == 290
-
-
-def test_a_done_shard_whose_file_is_gone_is_pulled_again(tmp_path, base_cfg):
-    cfg = replace(base_cfg, "pull", shards=[0, 1])
-    pull_sample(cfg, FakeSession(_tables(0, 1), PROBE), tmp_path, now=T0)
-    (tmp_path / "shard=001.parquet").unlink()
-    failing = FakeSession(_tables(0, 1), PROBE, failing={"url_state_current_001"})
-    out = pull_sample(cfg, failing, tmp_path, now=T1)
-    meta = read_json(tmp_path / "_meta.json")
-    assert out["shards_missing"] == 1 and meta["shards_done"] == [0]
-    assert "finished_at" not in meta
-
-
 def _full_cfg(base_cfg, **full):
     cfg = replace(base_cfg, "crawlerdb", num_shards=2)
     return replace(cfg, "full", **{"chunk_blocks": 10, "chunks_per_file": 2, "min_free_gb": 0.0,
@@ -218,7 +86,7 @@ def _ranges(session):
 def test_full_export_reads_every_block_range_once_and_resumes(tmp_path, base_cfg):
     cfg = _full_cfg(base_cfg)
     sizes = {"url_state_current_000": [35], "url_state_current_001": [0]}
-    session = FakeSession({}, PROBE, sizes=sizes)
+    session = FakeSession(PROBE, sizes=sizes)
     out = pull_full(cfg, [session], tmp_path, now=T0)
     assert out["shards_missing"] == 0
     assert _ranges(session) == [("url_state_current_000", lo, hi)
@@ -226,10 +94,9 @@ def test_full_export_reads_every_block_range_once_and_resumes(tmp_path, base_cfg
     files = sorted(p.name for p in (tmp_path / "shard=000").iterdir())
     assert files == ["part-0000000000-0000000020.parquet", "part-0000000020-0000000035.parquet"]
     assert pq.read_schema(tmp_path / "shard=000" / files[0]).names == FULL_SCHEMA.names
-    assert not {"title", "num_fetch_ok_90d"} & set(FULL_SCHEMA.names)
     meta = read_json(tmp_path / "_meta.json")
     assert meta["extents"] == {"0": [[0, 35]], "1": [[0, 0]]} and "finished_at" in meta
-    again = FakeSession({}, PROBE, sizes=sizes)
+    again = FakeSession(PROBE, sizes=sizes)
     pull_full(cfg, [again], tmp_path, now=T1)
     assert again.copies == []
 
@@ -237,13 +104,13 @@ def test_full_export_reads_every_block_range_once_and_resumes(tmp_path, base_cfg
 def test_full_export_resumes_a_failed_shard_from_its_unfinished_files(tmp_path, base_cfg):
     cfg = _full_cfg(base_cfg, chunks_per_file=1)
     sizes = {"url_state_current_000": [20], "url_state_current_001": [20]}
-    failing = FakeSession({}, PROBE, failing={"url_state_current_001"}, sizes=sizes)
+    failing = FakeSession(PROBE, failing={"url_state_current_001"}, sizes=sizes)
     out = pull_full(cfg, [failing], tmp_path, now=T0)
     assert out["shards_failed"] == [1] and "finished_at" not in read_json(tmp_path / "_meta.json")
     (tmp_path / "shard=001").mkdir(exist_ok=True)
     pq.write_table(FULL_SCHEMA.empty_table(),
                    tmp_path / "shard=001" / "part-0000000000-0000000010.parquet")
-    retry = FakeSession({}, PROBE, sizes=sizes)
+    retry = FakeSession(PROBE, sizes=sizes)
     out = pull_full(cfg, [retry], tmp_path, now=T1)
     assert _ranges(retry) == [("url_state_current_001", 10, 20)]
     assert out["shards_failed"] == [] and "finished_at" in read_json(tmp_path / "_meta.json")
@@ -259,7 +126,7 @@ CSV_CHUNK = (
 
 
 def test_full_export_parses_the_csv_copy_output(tmp_path, base_cfg):
-    session = FakeSession({}, PROBE, sizes={"url_state_current_000": [10]}, csv=CSV_CHUNK)
+    session = FakeSession(PROBE, sizes={"url_state_current_000": [10]}, csv=CSV_CHUNK)
     pull_full(_full_cfg(base_cfg), [session], tmp_path, shards=[0], now=T0)
     assert "TO STDOUT (FORMAT CSV)" in session.copies[0][0]
     got = pq.read_table(tmp_path / "shard=000" / "part-0000000000-0000000010.parquet")
@@ -283,7 +150,7 @@ def test_full_export_parses_the_csv_copy_output(tmp_path, base_cfg):
 
 
 def test_full_export_records_cluster_wal_and_writes_per_shard(tmp_path, base_cfg):
-    session = FakeSession({}, PROBE, sizes={"url_state_current_000": [10]},
+    session = FakeSession(PROBE, sizes={"url_state_current_000": [10]},
                           io=[(1_000, 10, 50), (4_000, 12, 80)])
     pull_full(_full_cfg(base_cfg), [session], tmp_path, shards=[0], now=T0)
     io = read_json(tmp_path / "_meta.json")["io"]["0"]
@@ -296,7 +163,7 @@ def test_full_export_spreads_shards_over_sessions_and_reads_each_range_once(tmp_
                                                                            base_cfg):
     cfg = replace(_full_cfg(base_cfg), "crawlerdb", num_shards=6)
     sizes = {f"url_state_current_{s:03d}": [10 * (s + 1)] for s in range(6)}
-    sessions = [FakeSession({}, PROBE, sizes=sizes) for _ in range(3)]
+    sessions = [FakeSession(PROBE, sizes=sizes) for _ in range(3)]
     out = pull_full(cfg, sessions, tmp_path, now=T0)
     ranges = [r for s in sessions for r in _ranges(s)]
     expected = {(f"url_state_current_{s:03d}", lo, lo + 10) for s in range(6)
@@ -310,23 +177,23 @@ def test_full_export_spreads_shards_over_sessions_and_reads_each_range_once(tmp_
 def test_a_broken_session_stops_the_export_and_raises(tmp_path, base_cfg):
     cfg = replace(_full_cfg(base_cfg), "crawlerdb", num_shards=4)
     sizes = {f"url_state_current_{s:03d}": [10] for s in range(4)}
-    broken = FakeSession({}, PROBE, sizes=sizes, broken={f"url_state_current_{s:03d}"
+    broken = FakeSession(PROBE, sizes=sizes, broken={f"url_state_current_{s:03d}"
                                                           for s in range(4)})
     with pytest.raises(RuntimeError, match="closed the connection"):
-        pull_full(cfg, [broken, FakeSession({}, PROBE, sizes=sizes)], tmp_path, now=T0)
+        pull_full(cfg, [broken, FakeSession(PROBE, sizes=sizes)], tmp_path, now=T0)
     assert "finished_at" not in read_json(tmp_path / "_meta.json")
 
 
 def test_every_chunk_reserves_its_heap_bytes_from_the_shared_rate(tmp_path, base_cfg):
     rate = FakeRate()
-    session = FakeSession({}, PROBE, sizes={"url_state_current_000": [35]})
+    session = FakeSession(PROBE, sizes={"url_state_current_000": [35]})
     pull_full(_full_cfg(base_cfg), [session], tmp_path, shards=[0], now=T0, rate=rate)
     assert rate.reserved == [10 * 8192, 10 * 8192, 10 * 8192, 5 * 8192]
 
 
 def test_full_export_reads_pages_appended_during_the_export(tmp_path, base_cfg):
     cfg = _full_cfg(base_cfg)
-    session = FakeSession({}, PROBE, sizes={"url_state_current_000": [20, 26, 26]})
+    session = FakeSession(PROBE, sizes={"url_state_current_000": [20, 26, 26]})
     pull_full(cfg, [session], tmp_path, shards=[0], now=T0)
     assert [r[1:] for r in _ranges(session)] == [(0, 10), (10, 20), (20, 26)]
     assert read_json(tmp_path / "_meta.json")["extents"]["0"] == [[0, 20], [20, 26]]
@@ -334,19 +201,19 @@ def test_full_export_reads_pages_appended_during_the_export(tmp_path, base_cfg):
 
 def test_full_export_refuses_another_layout_or_a_full_disk(tmp_path, base_cfg):
     sizes = {"url_state_current_000": [10], "url_state_current_001": [10]}
-    pull_full(_full_cfg(base_cfg), [FakeSession({}, PROBE, sizes=sizes)], tmp_path, shards=[0],
+    pull_full(_full_cfg(base_cfg), [FakeSession(PROBE, sizes=sizes)], tmp_path, shards=[0],
               now=T0)
     with pytest.raises(RuntimeError, match=r"different full\.chunk_blocks"):
-        pull_full(_full_cfg(base_cfg, chunk_blocks=5), [FakeSession({}, PROBE, sizes=sizes)],
+        pull_full(_full_cfg(base_cfg, chunk_blocks=5), [FakeSession(PROBE, sizes=sizes)],
                   tmp_path, now=T1)
     with pytest.raises(RuntimeError, match="GB free"):
-        pull_full(_full_cfg(base_cfg, min_free_gb=1e9), [FakeSession({}, PROBE, sizes=sizes)],
+        pull_full(_full_cfg(base_cfg, min_free_gb=1e9), [FakeSession(PROBE, sizes=sizes)],
                   tmp_path, now=T1)
 
 
 def test_full_estimate_counts_chunks_and_worst_case_hours(base_cfg):
     cfg = _full_cfg(base_cfg, chunk_blocks=131072)
     sizes = {"url_state_current_000": [131072 * 3 + 1], "url_state_current_001": [0]}
-    est = estimate_full(cfg, FakeSession({}, PROBE, sizes=sizes))
+    est = estimate_full(cfg, FakeSession(PROBE, sizes=sizes))
     assert est["chunks"] == 4 and est["largest_shard"] == 0
     assert est["chunk_timeout_s"] == 215     # 1 GiB at 5 MB/s

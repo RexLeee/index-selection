@@ -6,12 +6,12 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 from conftest import replace, small_cfg
-from synth import SNAPSHOT, make_world, write_work_dir
+from synth import SNAPSHOT, crawl_rows, make_world, write_export, write_work_dir
 
 from isel.backtest import open_store, select_sample, train_frozen
 from isel.features import FeatureStore
 from isel.io import atomic_write_json, read_json, write_parquet_atomic
-from isel.pull import CRAWL_SCHEMA, FULL_SCHEMA
+from isel.pull import FULL_SCHEMA
 from isel.score import SCORED_SCHEMA, NotEnoughCandidates, score_full, select_full
 
 
@@ -27,25 +27,10 @@ def work(tmp_path, world):
 
 
 def _export(work, world, new_hosts=0):
-    """Writes every crawled page as if `pull-full` had exported it, two files per shard.
-
-    `new_hosts` adds pages on hosts that neither the sample nor golden has seen.
-    """
-    rows = [{k: v for k, v in p.items() if not k.startswith("_")} for p in world.pages]
-    rows += [{**rows[i], "url": f"https://fresh{i}.example.org/p", "shard": i % 4}
-             for i in range(new_hosts)]
-    pages = pa.Table.from_pylist(rows, schema=CRAWL_SCHEMA)
-    pages = pages.select(FULL_SCHEMA.names).cast(FULL_SCHEMA)
-    shards = sorted(set(pages.column("shard").to_pylist()))
-    for shard in shards:
-        table = pages.filter(pc.equal(pages.column("shard"), shard))
-        half = table.num_rows // 2
-        for lo, part in ((0, table.slice(0, half)), (1, table.slice(half))):
-            write_parquet_atomic(part, work / "full" / "export" / f"shard={shard:03d}"
-                                 / f"part-{lo:010d}-{lo + 1:010d}.parquet")
-    atomic_write_json(work / "full" / "export" / "_meta.json", {
-        "started_at": SNAPSHOT.isoformat(), "finished_at": SNAPSHOT.isoformat(),
-        "shards_done": shards})
+    """Writes the export again; `new_hosts` adds pages on hosts the sample never saw."""
+    rows = crawl_rows(world)
+    write_export(world, work, [{**rows[i], "url": f"https://fresh{i}.example.org/p",
+                                "shard": i % 4} for i in range(new_hosts)])
 
 
 NEW_HOSTS = 30
@@ -54,8 +39,7 @@ NEW_HOSTS = 30
 def _half_sample_model(work, world, **full):
     # A half sample: the export holds pages and hosts the sample never saw.
     write_work_dir(world, work, sample_percent=50.0)
-    cfg = replace(small_cfg(work), "pull", sample_percent=50.0)
-    cfg = replace(cfg, "full", **full) if full else cfg
+    cfg = replace(small_cfg(work), "full", sample_percent=50.0, **full)
     model_dir = train_frozen(cfg, work, [])
     _export(work, world, NEW_HOSTS)
     return cfg, model_dir
@@ -170,7 +154,8 @@ def _write_scored(work, k, shards):
                              work / "full" / "scored" / f"shard={shard:03d}.parquet")
     atomic_write_json(work / "full" / "scored" / "_meta.json", {
         "finished_at": "2026-10-14T00:00:00+00:00", "k": k, "tau": 0.0, "model_dir": "m",
-        "snapshot_at": SNAPSHOT.isoformat(), "target_batch": 20, "model_meta": {}})
+        "snapshot_at": SNAPSHOT.isoformat(), "target_batch": 20, "model_meta": {},
+        "kept_check": {"passed": True}})
 
 
 def test_select_full_is_the_exact_top_k_with_ties_and_duplicates(tmp_path):
@@ -197,3 +182,61 @@ def test_select_full_refuses_too_few_candidates_or_a_larger_k(tmp_path):
         select_full(cfg, tmp_path, 2)
     with pytest.raises(ValueError, match="rerun score-full"):
         select_full(replace(cfg, "eval", k_headline=6), tmp_path, 6)
+
+
+def test_score_full_checks_the_kept_share_against_the_sample(tmp_path, world):
+    cfg, model_dir = _half_sample_model(tmp_path, world)
+    report = score_full(cfg, tmp_path, model_dir, 1000)
+    check = read_json(tmp_path / "full" / "scored" / "_meta.json")["kept_check"]
+    assert check["passed"] and abs(check["z"]) <= cfg.full.kept_share_max_z
+    assert check["kept"] == report["kept"]
+    assert abs(check["expected"] - check["kept"]) < 0.2 * check["kept"]
+
+
+def test_score_full_stops_when_the_kept_share_drifts_and_select_full_refuses(tmp_path, world):
+    cfg, model_dir = _half_sample_model(tmp_path, world, kept_share_max_z=0.0)
+    with pytest.raises(RuntimeError, match="kept share"):
+        score_full(cfg, tmp_path, model_dir, 1000)
+    meta = read_json(tmp_path / "full" / "scored" / "_meta.json")
+    assert meta["kept_check"]["passed"] is False and "finished_at" not in meta
+    with pytest.raises(RuntimeError, match="kept share"):
+        score_full(replace(cfg, "full", kept_share_max_z=6.0), tmp_path, model_dir, 1000)
+    atomic_write_json(tmp_path / "full" / "scored" / "_meta.json",
+                      {**meta, "finished_at": SNAPSHOT.isoformat()})
+    with pytest.raises(RuntimeError, match="failed its checks"):
+        select_full(cfg, tmp_path, 1000)
+
+
+def test_score_full_stops_when_a_sample_row_scores_differently(tmp_path, world, monkeypatch):
+    cfg, model_dir = _half_sample_model(tmp_path, world)
+    frame = FeatureStore.frame
+
+    def shifted(self, batch_id, mode):
+        table = frame(self, batch_id, mode)
+        if mode != "score":
+            return table
+        # A feature that moves with sample membership, as the absent-domain leak did.
+        i = table.schema.get_field_index("log_size_dkey")
+        moved = pc.add(table.column(i), pc.cast(table.column("is_sample"), pa.float64()))
+        return table.set_column(i, "log_size_dkey", moved)
+
+    monkeypatch.setattr(FeatureStore, "frame", shifted)
+    with pytest.raises(RuntimeError, match="sample rows scored differently"):
+        score_full(cfg, tmp_path, model_dir, 1000)
+
+
+def test_score_full_refuses_a_sample_whose_copies_differ_before_scoring(tmp_path, world):
+    cfg, model_dir = _half_sample_model(tmp_path, world)
+    meta = read_json(tmp_path / "sample" / "_meta.json")
+    atomic_write_json(tmp_path / "sample" / "_meta.json", {**meta, "differing_duplicates": 3})
+    with pytest.raises(RuntimeError, match="3 sample keys"):
+        score_full(cfg, tmp_path, model_dir, 1000)
+    assert not list((tmp_path / "full" / "scored").glob("shard=*.parquet"))
+
+
+def test_a_model_of_another_sample_is_refused(tmp_path, world):
+    cfg, model_dir = _half_sample_model(tmp_path, world)
+    meta = read_json(tmp_path / "sample" / "_meta.json")
+    atomic_write_json(tmp_path / "sample" / "_meta.json", {**meta, "sample_salt": "other"})
+    with pytest.raises(RuntimeError, match="another sample"):
+        score_full(cfg, tmp_path, model_dir, 1000)

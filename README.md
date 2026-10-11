@@ -13,7 +13,7 @@
 ## 里程碑
 
 - **里程碑 1（離線研究）：**
-  - 資料來源是 metricdb 的 golden、crawlerdb 的 1% block sample 和 golden 主鍵查詢。
+  - 資料來源是 metricdb 的 golden，和 crawlerdb 全量匯出裡依 URL 雜湊抽出的 1% sample 與 golden 列。
   - 主要數字是凍結模型對之後新 batch 的前瞻評估。
 - **里程碑 2（串上 Metric，目標 batch 20）：**
   - 全量匯出已爬列，用凍結模型打分，取精確的 1.28 億列。
@@ -32,18 +32,14 @@ set -a; source .env; set +a                     # ISEL_CRAWLERDB_DSN, ISEL_METRI
 C="--config config/isel.toml"
 uv run isel $C pull-golden
 uv run isel $C pull-dims                        # crawlerdb: needs TA approval
-uv run isel $C pull-positives
-uv run isel $C pull-sample --dry-run            # per-shard pages and timeouts, next no-read window
-uv run isel $C pull-sample                      # guarded: read windows + IO load; resumable
-uv run isel $C validate-sample                  # share of sample rows fetched more than once
-uv run isel $C validate-routing
+# sample/ and positives/ come from the full export on Host2 (derive-*, below)
+uv run isel $C validate-routing                 # share of sample rows whose shard the crawler rule predicts
 uv run isel $C build-dataset
 uv run isel $C backtest --feature-sets full,no_inlinks,no_domain,no_history
 uv run isel $C trends-snapshot --source trendspy  # pseudo golden: free trending pool
 uv run isel $C trends-compare --a <id> --b <id>   # trendspy vs SerpApi snapshot
 uv run isel $C pseudo-calibrate --batch 19 --tag random --n 100
 uv run isel $C pseudo-batch --source official:19 --batch-id 10019 --random 800 --provider serper
-uv run isel $C advance-snapshot                 # move S0 if crawlerdb is unchanged
 uv run isel $C train                            # M0: official golden only
 uv run isel $C --config config/pseudo.toml train  # M1: official + pseudo golden
 uv run isel $C forward-eval --model-dir work/models/<M0> --model-dir work/models/<M1> --batch 20
@@ -54,7 +50,9 @@ uv run isel $C validate-manifest --run-dir work/selection/run=<id>
 $J pull-full --dry-run                          # catalog only: heap size, chunks, worst-case hours
 $J pull-full                                    # every crawled row, ctid chunks, 4 guarded sessions
                                                # capped at full.max_heap_mb_s together; resumable
-$J score-full --model-dir /work/models/<M0>     # sample aggregates + frozen model; keeps score >= tau
+$J derive-sample                                # 1% of export rows by salted URL hash
+$J derive-positives                             # export rows matching golden spellings
+$J score-full --model-dir /work/models/<M0>     # keeps score >= tau; stops on membership skew
 $J select-full                                  # exact top-K distinct URLs
 $J init-selectdb                                # once: tables and the metric's reader role
 $J publish --run-dir /work/full/selection/run=<id>   # new table, validated, not visible yet
@@ -75,7 +73,8 @@ SERP 指令需要自己的 `ISEL_SERPAPI_KEY`、`ISEL_SERPER_KEY`，不能用課
 | `urlnorm.py` | canonical URL、shard key、shard 路由 |
 | `golden.py` | metricdb → golden 和 trending 池；讀取時可加入偽 golden |
 | `pseudo.py` | 偽 golden：trending 快照與比對、官方選 query 規則、SERP client、額度帳本、校準 |
-| `pull.py` | crawlerdb → split hosts、sample、golden 查詢、全量匯出 |
+| `pull.py` | crawlerdb → split hosts、全量匯出 |
+| `derive.py` | 全量匯出 → 雜湊 sample、正例 |
 | `features.py` | 時間點候選池、特徵登記表、洩漏防護 |
 | `dataset.py` | 訓練矩陣、tag 權重 |
 | `model.py` | LightGBM、logistic regression、規則 baseline |

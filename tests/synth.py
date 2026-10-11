@@ -14,11 +14,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.compute as pc
+from conftest import replace, small_cfg
 
+from isel.derive import derive_positives, derive_sample
 from isel.golden import PSEUDO, golden_table, pseudo_batch_path
 from isel.io import atomic_write_json, write_parquet_atomic
-from isel.pull import CRAWL_SCHEMA
-from isel.urlnorm import canonicalize
+from isel.pull import FULL_SCHEMA
 
 START = datetime(2026, 1, 1, tzinfo=UTC)
 FIRST_BATCH = datetime(2026, 2, 1, tzinfo=UTC)
@@ -89,33 +91,39 @@ def write_pseudo(world: World, work_dir: Path, batch_id: int, created_at: dateti
             for i, u in enumerate(chosen)]
     write_parquet_atomic(golden_table(rows, label_source=PSEUDO, available_at=available_at),
                          pseudo_batch_path(work_dir, batch_id))
-    clean = {p["url"]: {k: v for k, v in p.items() if not k.startswith("_")}
-             for p in world.pages}
-    write_parquet_atomic(pa.Table.from_pylist([clean[u] for u in chosen], schema=CRAWL_SCHEMA),
+    clean = {r["url"]: r for r in crawl_rows(world)}
+    write_parquet_atomic(pa.Table.from_pylist([clean[u] for u in chosen], schema=FULL_SCHEMA),
                          work_dir / "positives" / f"batch={batch_id}.parquet")
     return chosen
 
 
+def crawl_rows(world: World) -> list[dict]:
+    return [{k: v for k, v in p.items() if not k.startswith("_")} for p in world.pages]
+
+
+def write_export(world: World, work_dir: Path, extra: list[dict] = (),
+                 started_at: datetime = SNAPSHOT) -> None:
+    """Writes every crawled page plus `extra` as a finished `pull-full`, two files per shard."""
+    pages = pa.Table.from_pylist(crawl_rows(world) + list(extra), schema=FULL_SCHEMA)
+    shards = sorted(set(pages.column("shard").to_pylist()))
+    for shard in shards:
+        table = pages.filter(pc.equal(pages.column("shard"), shard))
+        half = table.num_rows // 2
+        for lo, part in ((0, table.slice(0, half)), (1, table.slice(half))):
+            write_parquet_atomic(part, work_dir / "full" / "export" / f"shard={shard:03d}"
+                                 / f"part-{lo:010d}-{lo + 1:010d}.parquet")
+    atomic_write_json(work_dir / "full" / "export" / "_meta.json", {
+        "started_at": started_at.isoformat(), "finished_at": started_at.isoformat(),
+        "frozen_probe": {"tuple_changes": 0}, "shards_done": shards})
+
+
 def write_work_dir(world: World, work_dir: Path, sample_percent: float = 100.0) -> None:
-    rng = random.Random(7)
-    clean = [{k: v for k, v in p.items() if not k.startswith("_")} for p in world.pages]
-    keep = [p for p in clean if rng.random() * 100 < sample_percent]
-    for shard in range(4):
-        rows = [p for p in keep if p["shard"] == shard]
-        write_parquet_atomic(pa.Table.from_pylist(rows, schema=CRAWL_SCHEMA),
-                             work_dir / "sample" / f"shard={shard:03d}.parquet")
-    atomic_write_json(work_dir / "sample" / "_meta.json", {
-        "sample_percent": sample_percent, "sample_seed": 7,
-        "snapshot_at": SNAPSHOT.isoformat(), "shards_done": [0, 1, 2, 3],
-        "finished_at": SNAPSHOT.isoformat()})
-    golden = golden_table(world.golden_rows)
-    write_parquet_atomic(golden, work_dir / "golden" / "golden.parquet")
-    by_url = {p["url"]: p for p in clean}
-    for b in world.batches:
-        urls = {u for r in world.golden_rows if r[0] == b for u in (r[7], canonicalize(r[7]))}
-        rows = [by_url[u] for u in sorted(urls) if u in by_url]
-        write_parquet_atomic(pa.Table.from_pylist(rows, schema=CRAWL_SCHEMA),
-                             work_dir / "positives" / f"batch={b}.parquet")
+    """Writes golden, dims and an export, then derives the sample and positives from it."""
+    write_parquet_atomic(golden_table(world.golden_rows), work_dir / "golden" / "golden.parquet")
     write_parquet_atomic(pa.table({"host": pa.array([], pa.string()),
                                    "migrated_at": pa.array([], pa.timestamp("us", tz="UTC"))}),
                          work_dir / "dims" / "split_hosts.parquet")
+    write_export(world, work_dir)
+    cfg = replace(small_cfg(work_dir), "full", sample_percent=sample_percent)
+    derive_sample(cfg, work_dir)
+    derive_positives(cfg, work_dir)

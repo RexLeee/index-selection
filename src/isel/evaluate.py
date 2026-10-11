@@ -1,4 +1,4 @@
-"""Recall@K of a scored pool, estimated from the block sample, with query bootstrap.
+"""Recall@K of a scored pool, estimated from the row sample, with query bootstrap.
 
 The official metric counts a raw golden URL as indexed iff the string equals a
 row of the selected list. With a sample at rate p, the K-th best row of the

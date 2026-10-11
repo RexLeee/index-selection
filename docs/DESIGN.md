@@ -34,11 +34,12 @@
 
 ```
 crawlerdb (read-only, paced)        metricdb (read-only)
-  ├─ pull-sample: TABLESAMPLE 1%      └─ pull-golden: batches, queries, URLs
-  ├─ pull-positives: PK lookups
-  ├─ pull-dims: split hosts
-  └─ pull-full: every crawled row, ctid chunks (milestone 2)
+  ├─ pull-dims: split hosts           └─ pull-golden: batches, queries, URLs
+  └─ pull-full: every crawled row, ctid chunks
             ▼ Parquet in work_dir
+  ├─ derive-sample: 1% of rows by salted URL hash
+  └─ derive-positives: export rows matching golden spellings, every shard
+            ▼
 FeatureStore (DuckDB): pool_b, as-of features, EB domain rates, URL history
             ▼
 LightGBM golden-propensity model  ← trained on batches < t
@@ -64,15 +65,15 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 | `pseudo/ledger.json` | 每個供應商在每個額度期間的呼叫次數 | `pseudo-*`、`trends-snapshot --source serpapi` |
 | `pseudo/calibration/batch=<b>_<tag>.{json,parquet}` | 校準結果；query 文字只在 Parquet | `pseudo-calibrate` |
 | `dims/split_hosts.parquet` | `shard_split_subdomain` 白名單 | `pull-dims` |
-| `sample/shard=NNN.parquet`、`_meta.json` | 1% block sample；`snapshot_at` 是 S0；`finished_at` 只在全部 shard 完成後出現，`shards_failed` 列出待重試的 shard | `pull-sample` |
-| `positives/batch=<id>.parquet` | 每批 golden 的原始與 canonical 拼法查到的列 | `pull-positives` |
+| `sample/shard=NNN.parquet`、`_meta.json` | 從 export 逐列雜湊抽出的 1% sample。`method = "hash"`；`snapshot_at` 是 S0，等於 export 的 `started_at` | `derive-sample` |
+| `positives/batch=<id>.parquet`、`_meta.json` | export 裡 URL 等於 golden 原始或 canonical 拼法的列，涵蓋所有 shard；`_meta.json` 記錄來源 export | `derive-positives` |
 | `datasets/summary.json` | 每批的候選池大小、正例數、有無歷史、標籤稽核（§5） | `build-dataset` |
 | `backtests/<id>/` | `results.json`、`report.md` | `backtest` |
 | `models/<id>/` | 凍結的 LightGBM 模型和 meta | `train` |
 | `forward_evals/batch=<b>_<id>/` | 前瞻評估結果 | `forward-eval` |
 | `selection/run=<id>/` | manifest 和 delta | `select-sample` |
 | `full/export/shard=NNN/part-<lo>-<hi>.parquet`、`_meta.json` | 全部已爬列，依 heap block 範圍分檔；`_meta.json` 記錄每個 shard 的 block 範圍、`frozen_probe`、`end_probe`，以及每個 shard 期間的全叢集 WAL 和寫入量（`io`） | `pull-full` |
-| `full/scored/shard=NNN.parquet`、`_meta.json` | 分數 ≥ τ 的列（url、shard、h、score）；`_meta.json` 記錄模型、K、τ | `score-full` |
+| `full/scored/shard=NNN.parquet`、`_meta.json` | 分數 ≥ τ 的列（url、shard、h、score）；`_meta.json` 記錄模型、K、τ、`kept_check` 和失敗原因（`failed`） | `score-full` |
 | `full/selection/run=<id>/selected.parquet`、`_meta.json` | 精確的 top-K（url、score）；`_meta.json` 最後寫 | `select-full` |
 
 所有檔案都先寫成 `.tmp`，fsync 後才 rename（`io.py`）。
@@ -81,7 +82,9 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 
 ## 3. 時間點與候選池（`features.py`）
 
-- 每個 batch b 有一個 as-of 時間：`as_of_b = min(created_b − lead_h, S0)`。`lead_h` 預設 30 小時，S0 是 sample 的快照時間。
+- 每個 batch b 有一個 as-of 時間：`as_of_b = min(created_b − lead_h, S0)`。`lead_h` 預設 30 小時，S0 是 export 的開始時間。
+- **sample：** `derive-sample` 從 full export 抽列。`md5_number_lower(url:shard:salt) mod 10⁶ < p × 10⁶` 的列進 sample，所以每一列是否進 sample 互相獨立。正例由 `derive-positives` 從同一份 export 取出。訓練、評估、打分的列都來自同一次讀取。
+- **為何不用 TABLESAMPLE SYSTEM：** SYSTEM 整頁取列。同一頁的列常屬同一網域，所以 sample 列的網域統計多算了同頁鄰居，非 sample 列沒有。2026-10-11 實測：依檔案順序相鄰兩列同 `domain_id` 佔 32.6%，隨機只有 0.012%。
 - **候選池：** pool_b = {`last_fetch_ok` < as_of_b}。每個 URL 只爬一次，所以這等於重建 batch 出現前的爬取狀態。
 - **golden 衍生特徵：** batch b 只用 `created_b′ < created_b` 且 `available_b′ ≤ as_of_b` 的 batch b′。官方 batch 的 `available_at` 等於建立時間；偽 batch 的 `available_at` 是 SERP 抓取時間（§5.1）。
 - **訓練 batch：** 也用 `available_at ≤ 測試 batch 的 as_of` 判斷。所以 10 月才抓的偽 golden 不會進入 B18、B19 的回測，只會影響 batch 20 的前瞻評估。
@@ -106,6 +109,10 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 
 `url_score` 和 `source` 仍會被拉下來，但只給前瞻評估的 baseline 用。
 
+**成員不變式：** 一列的特徵值不能取決於它在不在 sample 裡。網域統計和 lift 只用 sample 列算；不在 sample 的列（大多數正例、幾乎所有打分列）在 frame SQL 裡把自己加進去（`own = 1`）：n 加 1，`sum_li`、`sum_le`、`n_ext` 加上自己的值，e 加上自己的衰減權重 `own_w`。所以每一列看到的都是「自己 + 其他 sample 列」。`tests/test_membership.py` 用同一頁在 sample 內外兩個世界比對全部特徵，要求完全相同。
+
+這條不變式修正了 2026-10-11 的洩漏：舊版正例不含自己，網域不在 sample 時 `log_size_dkey = 0`、`rel_*` 為 NULL，而負例永遠不會這樣。M0 對這個模式加了 +17.4 logit，`score-full` 多留下 3,814 萬列（11.23% 對 8.93%）。
+
 ### 4.1 網域層 empirical Bayes
 
 階層由細到粗：`hp`（host + 第一段路徑）→ `host` → `dkey`（shard key，即白名單 host 或 eTLD+1）→ `tld` → 全體。
@@ -113,7 +120,7 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 對每一層的 key k 和目標 batch b：
 
 ```
-e_k(b) = Σ_{b′} w(b′, b) · n_sample(k, pool_b′) / p        # estimated crawled pages
+e_k(b) = (Σ_{b′} w(b′, b) · n_sample(k, pool_b′) + own · own_w) / p   # estimated crawled pages
 g_k(b) = Σ_{b′} w(b′, b) · hits(k, b′)                      # crawled golden pages
 r_global = G / E
 r_tld  = (g_tld  + a) / (e_tld  + a / r_global)
@@ -127,12 +134,13 @@ lift_x = ln(r_x / r_global)
 - `a` 是 `features.eb_pseudo_hits`，單位是「虛擬命中數」。
 - 沒有資料的 key（e = g = 0）會等於上一層，所以小網域不會得到極端值。
 - `dem_*` 是不論有沒有爬到的 golden 需求量，對應 V2 的 prior。
+- e 先以 DECIMAL 累加，最後才除以 p。這樣「其他 sample 列 + 自己」和「自己是 sample 列」得到同一個值，連末位都相同。
 
 ### 4.2 網域內相對值
 
 `rel_inlinks = ln(1 + inlinks) − mean_{dkey, pool_b}(ln(1 + inlinks))`，`rel_ext` 同理。這讓頁面層可以比較「同網域內誰的連入比較多」，而不是只看絕對值。
 
-程式用精確的 DECIMAL 算 `(n·x − Σx) / n`，不直接減浮點平均。頁面值等於網域平均時，結果正好是 0。
+程式用精確的 DECIMAL 算 `(n·x − Σx) / n`，不直接減浮點平均。頁面值等於網域平均時，結果正好是 0。不在 sample 的列先把自己加進 n 和 Σx（§4 成員不變式）。
 
 ---
 
@@ -246,7 +254,7 @@ lift_x = ln(r_x / r_global)
 
 **採用規則（事先寫定）：** 在 t−1 調參、在 t 報告；和最強 baseline 的配對 95% CI 下界 > 0 才採用。
 
-**前瞻評估：** `train` 在 S0 凍結模型；新 batch 出現後，`pull-positives --batches <b>` 再 `forward-eval`。模型的 `snapshot_at` 必須等於 sample 的 S0，batch 必須晚於 S0，否則拒絕執行。
+**前瞻評估：** `train` 在 S0 凍結模型；新 batch 出現後，`pull-golden`、`derive-positives --batches <b>`，再 `forward-eval`。模型 meta 的 `sample_fingerprint`（method、percent、salt、export 開始時間）必須等於目前的 sample，batch 必須晚於 S0，否則拒絕執行。
 
 **M0 對 M1（batch 20，事先寫定）：**
 
@@ -351,12 +359,12 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 | 風險 | 做法 |
 |---|---|
 | 寫入 crawlerdb（帳號是 superuser） | 每條連線設 `default_transaction_read_only=on` 和 `standard_conforming_strings=on`。用戶端 `assert_read_only_sql` 先用 `normalize_sql` 照 PostgreSQL 的詞法掃一遍：字串（含 `E''`、`$$`）收成 `''`，巢狀註解拿掉，引號識別字還原成名稱，`U&"..."` 直接拒絕，非 ASCII 字母也算識別字字元。`%s` 不能緊接在識別字或 `$` 後面，因為 psycopg 送出時會把它改寫成 `$1`。之後只放行單一讀取語句：COPY 必須正好是 `COPY (SELECT/WITH 查詢) TO STDOUT [[WITH] (選項)]`，伺服器端檔案或 PROGRAM 目標一律拒絕；`SELECT ... INTO` 也拒絕。關鍵字和函式的檢查一律涵蓋整段語句，並拒絕會改伺服器狀態或代執行 SQL 字串的函式族（`set_config`、`pg_terminate_backend`、replication slot、`pg_stat_*reset*`、advisory lock、`lo_*`、`brin_summarize_*`、`gin_clean_pending_list`、`pg_prewarm`、`query_to_xml` 等）。`statement_timeout` 只能經 `ReadOnlySession.set_statement_timeout` 以整數參數設定 |
-| 長查詢 | 預設 `statement_timeout` 120 秒，不能超過 `guard.timeout_cap_s`。sample 每個 shard 一條語句，只讀約 1% 的頁；逾時依 `pg_class.relpages` 和 `guard.min_mb_s` 計算，介於 `timeout_floor_s` 和 `timeout_cap_s` 之間（`pull.timeout_for`）。撞到逾時或 `lock_timeout` 的 shard 記進 `shards_failed`，其他 shard 繼續，下次執行再重試 |
+| 長查詢 | 預設 `statement_timeout` 120 秒，不能超過 `guard.timeout_cap_s`。逾時依讀取的 heap 位元組和 `guard.min_mb_s` 計算，介於 `timeout_floor_s` 和 `timeout_cap_s` 之間。撞到逾時或 `lock_timeout` 的 shard 記進 `shards_failed`，其他 shard 繼續，下次執行再重試 |
 | 伺服器端暫存檔 | 不做 server 端排序或彙總；`temp_file_limit=0`、`work_mem=16MB`、不開平行 worker |
 | 搶資源 | 語句之間至少間隔 `pull.min_interval_s` |
 | 讀取時機 | **讀 crawlerdb 前要取得助教同意**（2026-10-08 已同意）。`ReadGuard` 在 crawlerdb 和 metricdb 的每條語句前檢查：語句跑滿逾時也不會進入 golden 建立與量測日（1、16 日 00:00–20:00 UTC）或每小時 :58–:10；`pg_stat_activity` 中等待 IO 的連線數（3 次取中位數）超過 `max_io_waiters` 就暫停。IO 探測本身要 2 秒，所以探測完再檢查一次時段才放行。每次等待都寫進 log。時段和門檻都在 `[guard]`。Metric 整點掃描實測在 :00–:07，峰值 7–8 GB/s（2026-10-11）。語句跑滿逾時也會在 :58 前結束，所以每小時時段從 :58 開始。V2 的每日 02:50–04:40 時段在 2026-10-11 拿掉：它保護的是 V2 每天讀的 `url_state_history`（accounting 03:00 會 DROP 它的分區），isel 不讀這些表；gc 只鎖要刪的列，而且從 04:00 跑約 8 小時；`sar` 在 10-03 到 10-11 的這段時間沒有額外負載，爬蟲還在跑的 10-03 到 10-05 也一樣 |
-| S0 的意義 | `pull-sample` 開始時記下 `frozen_probe`（server 啟動時間加 `url_state_current_*` 累計寫入列數）。`advance-snapshot` 只接受已完成的 sample，再量一次，完全相同才把 S0 移到現在，否則拒絕 |
-| 資料不完整 | `FeatureStore` 拒絕三種狀況：sample 沒有 `finished_at`、任何 batch 缺 `positives/batch=<id>.parquet`、同一個 batch id 同時有官方和偽 golden 列 |
+| S0 的意義 | S0 是 `pull-full` 的開始時間。export 開始時記下 `frozen_probe`（server 啟動時間加 `url_state_current_*` 累計寫入列數），結束時記下 `end_probe`。sample 和正例都從這份 export 導出，所以三者是同一次讀取 |
+| 資料不完整 | `FeatureStore` 拒絕這些狀況：sample 沒有 `finished_at`、sample 的 `method` 不是 `hash`、正例的來源 export 和 sample 不同、任何 batch 缺 `positives/batch=<id>.parquet`、同一個 batch id 同時有官方和偽 golden 列 |
 | 憑證外洩 | DSN 只放環境變數，或放在 `<NAME>_FILE` 指向的 secret 檔（容器用這種）；所有 JSON 輸出經過 `assert_no_secrets` |
 | 寫入 selectdb | 只有 `publish.py` 會寫 DB。連線前，DSN 的 port 若在 `selectdb.forbidden_ports`（5432、5433、5444）就拒絕；連上後，資料庫若有 `url_state_current_000` 或 `metric_url` 也拒絕。`verify-live` 用 `default_transaction_read_only=on` 的讀者連線 |
 | 全量讀取 | `pull-full` 每塊一條 `COPY`，只讀 `chunk_blocks` 個 heap block（TID range scan）。每塊 512 MiB，逾時取下限 120 秒，所以每個禁讀時段前只保留 2 分鐘。逾時依區塊大小計算，照樣經過 SQL gate、`ReadGuard` 和限速。heap 大小用 `pg_relation_size` 量，不用過期的 `relpages`；匯出途中新增的頁面會補成新的範圍。輸出用 `FORMAT CSV`：pyarrow 在 C++ 解析，另一條執行緒寫 Parquet，下一塊同時在傳。CSV 的文字由 `crawlerdb.session` 的 `datestyle`、`extra_float_digits`、`client_encoding` 固定，設定檢查會擋住其他值。每個 shard 前後讀 `pg_stat_wal` 和 `pg_stat_io`，差值寫進 `_meta.json` 的 `io`。這是全叢集的數字，要和沒在讀的時段比較 |
@@ -369,7 +377,7 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 
 1. **觸發條件：** 助教確認切換日期之後才動工。
 2. **先看 schema：** 從 Voyager 產生的 DDL 確認 `url` 是 HASH 主鍵的第一欄，以及 256 張表是否保留。
-3. **抽樣：** 改用 `WHERE yb_hash_code(url) < floor(65536 × p)`。條件會下推到 DocDB，只讀對應的 hash 範圍，抽到的是列層均勻樣本，沒有區塊群聚。先用 `EXPLAIN` 確認下推。`_meta.json` 記錄抽樣方式；hash 樣本和 TABLESAMPLE 樣本不能混用。
+3. **抽樣：** sample 從 export 導出，不受 engine 影響。要改的只有 `pull-full` 的讀法：YB 沒有 ctid，改成依 `yb_hash_code(url)` 範圍分塊。先用 `EXPLAIN` 確認條件會下推到 DocDB。
 4. **設定：** session GUC 依 engine 分開。`pg_class.relpages` 沒有意義，改用 `reltuples × p` 估讀取量。`yb_read_time` 預設只保留 900 秒歷史，不能拿來固定 S0；仍用 `frozen_probe`。兩個節點只能 RF 1，沒有 follower reads 可以分流。
 5. **驗證：** 本機用同版本 YugabyteDB 容器跑合約測試。PG 和 YB 並存時，golden URL 的主鍵查詢要逐筆一致，樣本只比較分布。
 6. **要提醒助教的風險：** Voyager export 目錄和 YB 資料目錄都在 Host1 `/data`（2026-10-08 剩 385 GB，crawlerdb 6.6 TB）。live migration 要把 `wal_level` 改成 logical（需重啟），replication slot 卡住會累積 WAL，可能再次寫滿 `/data`。
@@ -385,11 +393,9 @@ C="--config config/isel.toml"
 uv run isel $C pull-golden                  # metricdb only
 # --- needs TA approval from here ---
 uv run isel $C pull-dims
-uv run isel $C pull-positives
-uv run isel $C pull-sample --dry-run        # pg_class only: pages, timeouts, next window
-uv run isel $C pull-sample                  # ~16.6M rows, resumable per shard, guarded; rerun until shards_missing = 0
-uv run isel $C validate-sample              # refetched_share: how often "fetched once" fails
-uv run isel $C validate-routing             # expect candidate_rate >= 0.99
+# pull-full, derive-sample and derive-positives run on Host2 (§12.5); the export is
+# 56 GB. rsync work/sample/ and work/positives/ (~1.2 GB) back to the Mac.
+uv run isel $C validate-routing             # share of sample rows whose shard the crawler rule predicts
 uv run isel $C build-dataset                # also the label audit (DESIGN §5)
 uv run isel $C backtest --feature-sets full,no_inlinks,no_domain,no_history
 uv run isel $C backtest --feature-sets full --baselines random,later_unlabeled  # pre-registered §5
@@ -402,14 +408,13 @@ uv run isel $C pseudo-calibrate --batch 18 --tag random --n 50
 uv run isel $C pseudo-batch --source official:19 --batch-id 10019 --random 800 --provider serper
 uv run isel $C pseudo-batch --source snapshot:<id> --batch-id 10100 --head 500 --random 450 --provider serper  # keeps ~50 Serper calls for retries
 P="$C --config config/pseudo.toml"
-uv run isel $P pull-positives --batches 10019,10100
+# derive-positives for the pseudo batches runs on Host2 (§12.5); rsync positives/ back.
 uv run isel $P build-dataset && uv run isel $P pseudo-gate --batch-id 10019
-uv run isel $C advance-snapshot             # only if crawlerdb is unchanged since the sample
-uv run isel $C train                        # M0; freeze with S0 <= 2026-10-15 06:00 UTC
+uv run isel $C train                        # M0; freeze before 2026-10-15 06:00 UTC
 uv run isel $P train                        # M1
 # after batch 20 exists:
 uv run isel $C pull-golden
-uv run isel $C pull-positives --batches 20
+# derive-positives --batches 20 runs on Host2 (§12.5); rsync positives/ back.
 uv run isel $C forward-eval --model-dir work/models/<M0> --model-dir work/models/<M1> --batch 20
 ```
 
@@ -420,20 +425,20 @@ uv run isel $C forward-eval --model-dir work/models/<M0> --model-dir work/models
 - `.env` 放在 repo 根目錄，權限 600。DSN 的 host 和 `.env.example` 相同。兩個 DB 的 `pg_hba.conf` 接受任何來源的 scram-sha-256 登入。
 - 只用 `config/isel.toml`。base 設定就是 Mac 的規模：8 threads、DuckDB 16 GB。
 - 長指令用 `caffeinate -i` 執行，Mac 要接電源並保持 VPN 連線。
-- VPN 曾在幾分鐘內重設連線多次，指令會因 `OperationalError` 結束。重跑同一個指令即可續傳：`pull-sample` 從沒完成的 shard 繼續，`pull-positives` 跳過已有檔案的 batch。
-- 實測量（2026-10-09）：`pull-positives` 每個 batch 約 2 分鐘；`pull-sample` 讀 33.9 GB 的頁、1,648 萬列，約 47 分鐘（含一次每小時禁讀時段）；讀取期間 Host1 的 IO PSI avg10 最高 17.9%。
+- VPN 曾在幾分鐘內重設連線多次，指令會因 `OperationalError` 結束。重跑同一個指令即可續傳。
 - 直連失敗時，改用 `ssh -N -L 127.0.0.1:15432:127.0.0.1:5432 -L 127.0.0.1:15433:127.0.0.1:5433 ntu-sa1`，DSN 改成這兩個本機 port。
 
 ---
 
 ## 11. 已知限制
 
-- **inlinks 膨脹：** 回測的 inlink 特徵在 batch 之後量測，可能被 patrol 膨脹。前瞻評估能排除這點；為了縮短落差，新 batch 出現後要盡快跑 `pull-positives`。
-- **block sample：** TABLESAMPLE SYSTEM 以頁為單位抽，同一頁的列常來自同一網域。小網域的 `*_size` 和 `rel_*` 估計較吵。
+- **inlinks 膨脹：** 回測的 inlink 特徵在 export 當下量測，晚於大多數 batch，可能被 patrol 膨脹。前瞻評估能排除這點。
+- **只讀一次：** sample、正例、打分列都來自同一份 export。爬蟲停止期間（2026-10-06 起）這等於凍結的爬取狀態；爬蟲重啟後，新 batch 的正例仍取自舊 export，要評估新爬到的頁就得重跑 `pull-full`。
+- **export 重複列：** 匯出途中被搬動的列可能讀到兩次。`derive-*` 依 (url, shard) 留一份，`select-full` 依 URL 取最高分。
 - **跨 shard 重複：** 同一 URL 出現在兩個 shard 時，sample 排名會算兩次。影響可忽略。
 - **拼法：** crawler 存 `canonicalize_url(response.url)`，清單也輸出這個拼法；官方只認 SerpApi 的原始拼法。原始拼法和 canonical 不同時，原始那列沒有 `last_fetch_ok`，不會進 pool，exact 比對永遠配不到；`canonical_only_positives` 和 `indexed_canonical_rate` 顯示這部分的大小。同一頁的 http/https、`www`、尾斜線變體是不同列，它們是真負例（§5）。
 - **redirect：** crawler 存 redirect 之後的網址（`WebCrawler/containers/crawler/crawler/settings.py` 的 `REDIRECT_ENABLED`）。golden 原始網址若會 redirect，原始那列永遠沒被爬到，抓到的內容記在目標網址名下。
-- **每個 URL 只爬一次：** §3 依賴這個假設。sample 帶回 `num_fetch_ok_90d` 只為了檢查它（`FORBIDDEN` 擋住它進模型，`FeatureStore` 也不載入它和 `title`）。`validate-sample` 的 `refetched_share` 偏高時，pool 會把重抓的頁誤當成 batch 之後才爬到。
+- **每個 URL 只爬一次：** §3 依賴這個假設。舊的 sample 曾用 `num_fetch_ok_90d` 檢查它；export 不帶這欄，要再檢查得在 `pull-full` 加回。重抓比例偏高時，pool 會把重抓的頁誤當成 batch 之後才爬到。
 - **偽 golden 的雜訊：** 回填批次的 SERP 比官方晚 1–3 週抓，供應商預設值也可能不同（§5.1 校準）。爬取狀態凍結在 2026-10-05，所以偏新的頁面不會成為正例。`history_batches` 在 M1 的評分時會多出幾批，訓練列中只有前瞻批次看得到同樣的範圍。
 - **免費額度只夠一次：** Serper 的 2,500 次只送一次，之後只剩 SerpApi 每月 250 次。M1 的做法不能每兩週持續；報告要寫明。
 - **trendspy 是非官方 API：** 失效時改用 `trends-snapshot --source serpapi`（每次 10 次呼叫）。
@@ -495,8 +500,7 @@ Mac 經 VPN 只有約 4 MB/s，全量匯出只能在伺服器上跑。
 # Mac: ship one commit (no repo access needed on the server)
 SHA=$(git rev-parse --short HEAD)
 git archive --format=tar "$SHA" | ssh ntu-sa2 "mkdir -p ~/isel/src-$SHA && tar -x -C ~/isel/src-$SHA"
-rsync -a work/sample work/golden work/positives work/dims ntu-sa2:isel/work/
-rsync -a work/models/<M0> ntu-sa2:isel/work/models/
+rsync -a work/golden work/dims ntu-sa2:isel/work/
 
 # Host2
 cd ~/isel/src-$SHA
@@ -507,17 +511,25 @@ J="docker compose -f deploy/compose.compute.yaml run --rm isel"
 $J check-config
 $J pull-full --dry-run                       # catalog only; check heap_bytes, chunks, free disk
 $J pull-full                                 # needs TA approval; rerun until shards_missing = 0
-$J score-full --model-dir /work/models/<M0>
+$J derive-sample                             # reads only the export; score-full refuses
+                                             # a sample whose differing_duplicates > 0
+$J derive-positives                          # official batches
+$J --config /app/config/pseudo.toml derive-positives --batches 10019,10100
+# Mac: rsync sample/ and positives/ back, train M0, rsync work/models/<M0> to Host2
+$J score-full --model-dir /work/models/<M0>  # stops if sample rows score differently or the
+                                             # kept share leaves the sample's estimate
 $J select-full
 $J init-selectdb                             # idempotent
 $J publish --run-dir /work/full/selection/run=<id>
 $J swap --db-run-id <n>
 $J verify-live --batch 19                    # sanity: in-sample batch
-# after batch 20 exists (2026-10-16 20:00 UTC): pull-golden, then
+# after batch 20 exists (2026-10-16 20:00 UTC): pull-golden, rsync work/golden, then
+$J derive-positives --batches 20
 $J verify-live --batch 20
 ```
 
 - 長指令用 `nohup`，或在 `tmux` 裡跑；中斷後重跑同一個指令就會續跑。
+- `score-full` 停下時，`full/scored/_meta.json` 的 `failed` 寫明原因；修好後把 `full/scored` 移走再重跑。`select-full` 不接受沒通過檢查的結果。
 - 想先演練時，可以用 `select-full --k 1000000` 的結果跑一次 publish、swap、verify-live、rollback。
 - `build` 一定要寫服務名 `isel`。服務在 `job` profile 裡，不指名就不會建。
 
@@ -535,5 +547,6 @@ $J verify-live --batch 20
 | 匯出時間 | 4 條連線約 40–80 分鐘（信心低） | 單一連線推估 2–3 小時：本機 CSV 路徑比 binary 快 2.65 倍，每塊約 0.7–1.1 秒。本機 4 個 shard 表：4 條連線比 1 條快 1.85 倍（伺服器和用戶端搶同一台 Mac 的 CPU）；300 MB/s 上限時實測 294 MB/s。Host1 上 4 條連線的上限是 2 GB/s，3.43 TB 約 29 分鐘，再加上禁讀時段和探測（約 28%）。每個檔的 log 有 heap MB/s，第一批 shard 量完再定 |
 | 匯出檔 | 約 90 GB | 約 16 億列 × 每列約 55 B（V2 量測） |
 | 打分結果 | 約 1.5 億列，約 12 GB | τ 只留約 K·(1 + `tau_margin`) 列 |
-| `score-full` 記憶體 | 峰值約 10 GB | Mac 實測，用真實的 1% sample（1,648 萬列）。峰值出現在估 τ 時；之後每次只載入一個匯出檔（8 GiB heap，約 350 萬列）。若一次載入整個 shard，最大的 shard 約 3,500 萬列，估計峰值約 63 GB，接近 64 GiB 上限 |
+| `derive-sample` | 1,657 萬列 | export 1,657,046,602 列 × 1%；DuckDB 掃一次 56 GB |
+| `score-full` 記憶體 | 峰值約 10 GB | Mac 實測，用 2026-10-09 的 1% sample（1,648 萬列）。峰值出現在估 τ 時，τ 用的 sample 分數也留在記憶體裡做成員檢查；之後每次只載入一個匯出檔（8 GiB heap，約 350 萬列）。若一次載入整個 shard，最大的 shard 約 3,500 萬列，估計峰值約 63 GB，接近 64 GiB 上限 |
 | selectdb | 每份清單約 30 GB（heap 加 PK）；current、prev、新表同時存在時約 90 GB | Host1 根目錄剩 654 GB；`selectdb.max_db_bytes` 擋住超量 |

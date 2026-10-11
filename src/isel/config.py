@@ -69,12 +69,8 @@ class RoutingCfg:
 
 @dataclass(frozen=True)
 class PullCfg:
-    sample_percent: float
-    sample_seed: int
-    lookup_chunk: int
     min_interval_s: float
     shards: list[int]
-    title_chars: int
 
 
 @dataclass(frozen=True)
@@ -191,6 +187,9 @@ class FullCfg:
     parse_threads: int
     connections: int
     max_heap_mb_s: float
+    sample_percent: float
+    sample_salt: str
+    kept_share_max_z: float
 
 
 @dataclass(frozen=True)
@@ -243,10 +242,6 @@ class Config:
     @property
     def work_dir(self) -> Path:
         return Path(self.run.work_dir)
-
-    @property
-    def sample_rate(self) -> float:
-        return self.pull.sample_percent / 100.0
 
     def sha256(self) -> str:
         """Returns a stable digest of the effective config, for run auditing."""
@@ -425,10 +420,7 @@ def _validate(cfg: Config) -> None:
     _validate_session("metricdb", cfg.metricdb.session, cfg.guard, need)
     need(all(0 <= s < cfg.crawlerdb.num_shards for s in cfg.routing.overrides.values()),
          "routing.overrides must map to valid shards")
-    need(0 < cfg.pull.sample_percent <= 100, "pull.sample_percent must be in (0, 100]")
-    need(cfg.pull.lookup_chunk > 0, "pull.lookup_chunk must be > 0")
     need(cfg.pull.min_interval_s >= 0, "pull.min_interval_s must be >= 0")
-    need(cfg.pull.title_chars > 0, "pull.title_chars must be > 0")
     need(all(0 <= s < cfg.crawlerdb.num_shards for s in cfg.pull.shards),
          "pull.shards must be valid shard ids")
     need(cfg.golden.lead_h >= 0, "golden.lead_h must be >= 0")
@@ -485,6 +477,12 @@ def _validate_full(cfg: Config, need: Any) -> None:
     need(f.min_free_gb >= 0 and f.tau_margin >= 0,
          "full.min_free_gb and full.tau_margin must be >= 0")
     need(f.parse_threads > 0, "full.parse_threads must be > 0")
+    need(0 < f.sample_percent <= 100
+         and abs(f.sample_percent * 1e4 - round(f.sample_percent * 1e4)) < 1e-9,
+         "full.sample_percent must be in (0, 100] with at most 4 decimals")
+    need(bool(f.sample_salt) and f.sample_salt != cfg.dataset.neg_salt,
+         "full.sample_salt must be set and differ from dataset.neg_salt")
+    need(f.kept_share_max_z >= 0, "full.kept_share_max_z must be >= 0")
     need(f.connections > 0 and f.max_heap_mb_s > 0,
          "full.connections and full.max_heap_mb_s must be > 0")
     need(all(cfg.crawlerdb.session.get(k) == v for k, v in CSV_SESSION.items()),

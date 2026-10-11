@@ -16,7 +16,7 @@ from isel.pg import (
     assert_read_only_sql,
     require_env,
 )
-from isel.pull import full_sql, probes, sample_sql
+from isel.pull import full_sql
 from isel.urlnorm import DomainKeyer, ShardRouter, canonicalize, md5_number_lower
 
 
@@ -33,7 +33,9 @@ def test_base_config_loads(base_cfg):
 
 @pytest.mark.parametrize("text, message", [
     ("[run]\nunknown = 1\n", "unknown keys"),
-    ("[pull]\nsample_percent = 'x'\n", "expected float"),
+    ("[full]\nsample_percent = 'x'\n", "expected float"),
+    ("[full]\nsample_percent = 0.00001\n", "at most 4 decimals"),
+    ("[full]\nsample_salt = 'isel'\n", "differ from dataset.neg_salt"),
     ("[crawlerdb.session]\ndefault_transaction_read_only = 'off'\n", "read_only"),
     ("[eval]\nk_headline = 5\n", "k_headline"),
     ("[crawlerdb.session]\nstatement_timeout = '2min'\n", "statement_timeout"),
@@ -195,17 +197,11 @@ def test_statement_timeout_rejects_bad_values(seconds):
         ReadOnlySession(FakeConn()).set_statement_timeout(seconds)
 
 
-def test_pull_statements_pass_the_gate(base_cfg):
-    assert_read_only_sql(sample_sql(base_cfg, 12))
-    assert "url_state_current_012" in sample_sql(base_cfg, 12)
-
-
 def test_full_export_statement_passes_the_gate(base_cfg):
     text = full_sql(base_cfg, 7, 131072, 262144)
     assert_read_only_sql(text)
     assert "ctid >= '(131072,0)'::tid AND ctid < '(262144,0)'::tid" in text
     assert text.endswith("TO STDOUT (FORMAT CSV)")
-    assert "left(title" not in text and "num_fetch_ok_90d" not in text
 
 
 def test_require_env_reads_a_secret_file(tmp_path, monkeypatch):
@@ -244,12 +240,6 @@ def test_shard_router_matches_crawler_rule(base_cfg):
     split = router.candidate_shards("https://news.example.co.uk/a")
     assert len(split) == 2
     assert router.shard_for_key("example.co.uk") in split
-
-
-def test_probes_group_by_shard(base_cfg):
-    router = ShardRouter(DomainKeyer([], offline=True), 256, base_cfg.routing.overrides)
-    grouped = probes(router, ["https://en.wikipedia.org/a", "https://fr.wikipedia.org/b"])
-    assert grouped == {0: ["https://en.wikipedia.org/a", "https://fr.wikipedia.org/b"]}
 
 
 def test_canonicalize_and_hash():
