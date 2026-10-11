@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import shutil
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -83,6 +84,8 @@ _CSV_CONVERT = pcsv.ConvertOptions(
     true_values=["t"], false_values=["f"], null_values=[""],
     strings_can_be_null=True, quoted_strings_can_be_null=False)
 _CSV_PARSE = pcsv.ParseOptions(newlines_in_values=True)
+_IO_SQL = ("SELECT w.wal_bytes, w.wal_fpi, (SELECT coalesce(sum(writes), 0) FROM pg_stat_io "
+           "WHERE backend_type = 'client backend') FROM pg_stat_wal w")
 _BATCH_ROWS = 200_000
 PAGE_BYTES = 8192
 # A shard that hits its timeout or lock_timeout is retried on the next run.
@@ -361,6 +364,13 @@ def _csv_table(data: bytes | bytearray, shard: int) -> pa.Table:
     return table.cast(FULL_SCHEMA)
 
 
+def _io_counters(session: ReadOnlySession) -> dict[str, int]:
+    """Cluster-wide WAL and client-backend block writes, to compare a shard with idle time."""
+    wal_bytes, wal_fpi, writes = session.fetchone(_IO_SQL)
+    return {"wal_bytes": int(wal_bytes), "wal_fpi": int(wal_fpi),
+            "client_backend_writes": int(writes)}
+
+
 def estimate_full(cfg: Config, session: ReadOnlySession,
                   shards: Iterable[int] | None = None) -> dict[str, Any]:
     """Reads only catalog sizes: heap bytes, COPY statements and worst-case hours."""
@@ -391,6 +401,7 @@ def _export_file(cfg: Config, session: ReadOnlySession, final: Path, shard: int,
     pyarrow releases the GIL, so the server rarely waits for this client.
     """
     span = cfg.full.chunk_blocks
+    start = time.monotonic()
     with AtomicParquetWriter(final, FULL_SCHEMA) as writer, ThreadPoolExecutor(1) as pool:
         pending = None
         for c_lo in range(lo, hi, span):
@@ -402,6 +413,9 @@ def _export_file(cfg: Config, session: ReadOnlySession, final: Path, shard: int,
             pending = pool.submit(lambda d=data: writer.write(_csv_table(d, shard)))
         if pending is not None:
             pending.result()
+    seconds = time.monotonic() - start
+    log.info("shard %03d blocks %d-%d: %d rows in %.0f s, %.0f MB/s of heap", shard, lo, hi,
+             writer.rows, seconds, (hi - lo) * PAGE_BYTES / 1e6 / max(seconds, 1e-9))
     return writer.rows
 
 
@@ -470,6 +484,7 @@ def pull_full(cfg: Config, session: ReadOnlySession, out_dir: Path,
         if key not in extents:
             extents[key] = [[0, _relation_blocks(cfg, session, shard)]]
             save()
+        before, start = _io_counters(session), time.monotonic()
         try:
             rows = _export_shard(cfg, session, out_dir, shard, extents[key], save)
         except _RETRYABLE as exc:
@@ -480,7 +495,12 @@ def pull_full(cfg: Config, session: ReadOnlySession, out_dir: Path,
             done.add(shard)
             failed.pop(key, None)
             meta.setdefault("rows", {})[key] = rows
-            log.info("shard %03d: %d crawled rows (%d/%d)", shard, rows, i, len(todo))
+            after = _io_counters(session)
+            io = {"seconds": round(time.monotonic() - start),
+                  **{k: after[k] - before[k] for k in after}}
+            meta.setdefault("io", {})[key] = io
+            log.info("shard %03d: %d crawled rows (%d/%d); cluster-wide during it: %s",
+                     shard, rows, i, len(todo), io)
         meta["shards_done"] = sorted(done)
         meta["shards_failed"] = failed
         save()

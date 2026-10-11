@@ -30,17 +30,21 @@ class FakeSession:
     """Answers the catalog and probe queries `pull` sends; COPY returns no rows."""
 
     def __init__(self, relpages: dict[str, int], probe: tuple, failing: set[str] = frozenset(),
-                 sizes: dict[str, list[int]] | None = None, csv: bytes = b""):
+                 sizes: dict[str, list[int]] | None = None, csv: bytes = b"",
+                 io: list[tuple[int, int, int]] | None = None):
         self.relpages = relpages
         self.probe = probe
         self.failing = set(failing)
         self.sizes = {t: list(v) for t, v in (sizes or {}).items()}   # successive heap sizes
         self.csv = csv
+        self.io = list(io or [(0, 0, 0)])   # successive (wal_bytes, wal_fpi, writes) readings
         self.timeout_s = 120
         self.copies: list[tuple[str, int]] = []
 
     def fetchone(self, query, params=None):
         assert_read_only_sql(query)
+        if "pg_stat_wal" in query:
+            return self.io.pop(0) if len(self.io) > 1 else self.io[0]
         if "pg_relation_size" in query:
             sizes = self.sizes.get(params[0], [0])
             return (sizes.pop(0) if len(sizes) > 1 else sizes[0],)
@@ -263,6 +267,16 @@ def test_full_export_parses_the_csv_copy_output(tmp_path, base_cfg):
          "has_last_modified": False, "has_cache_control": False, "url_score": float("-inf"),
          "shard": 0},
     ]
+
+
+def test_full_export_records_cluster_wal_and_writes_per_shard(tmp_path, base_cfg):
+    session = FakeSession({}, PROBE, sizes={"url_state_current_000": [10]},
+                          io=[(1_000, 10, 50), (4_000, 12, 80)])
+    pull_full(_full_cfg(base_cfg), session, tmp_path, shards=[0], now=T0)
+    io = read_json(tmp_path / "_meta.json")["io"]["0"]
+    assert {k: io[k] for k in ("wal_bytes", "wal_fpi", "client_backend_writes")} == {
+        "wal_bytes": 3_000, "wal_fpi": 2, "client_backend_writes": 30}
+    assert io["seconds"] >= 0
 
 
 def test_full_export_reads_pages_appended_during_the_export(tmp_path, base_cfg):

@@ -226,6 +226,7 @@ def test_full_export_reads_every_crawled_row_once(cfg, tmp_path, dsn):
     assert exported.schema.equals(FULL_SCHEMA, check_metadata=False)
     meta = read_json(tmp_path / "export" / "_meta.json")
     assert "finished_at" in meta and "end_probe" in meta
+    assert set(meta["io"]) == {str(s) for s in range(SHARDS)}
 
 
 def test_the_csv_full_export_equals_the_binary_sample(cfg, tmp_path):
