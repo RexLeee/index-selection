@@ -31,9 +31,9 @@ services:
       - ${ISEL_WORK_DIR:-/home/r14725023/isel/work}:/work
     read_only: true
     tmpfs: [/tmp]
-    mem_limit: 64g
-    memswap_limit: 64g                  # no swap
-    cpus: 16
+    mem_limit: 128g
+    memswap_limit: 128g                 # no swap
+    cpus: 32
     cpu_shares: 256                     # the crawler wins under contention
     pids_limit: 512
     oom_score_adj: 1000                 # we are killed first

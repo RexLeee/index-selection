@@ -1,12 +1,12 @@
 # Host2 container overlay; the image passes it after config/isel.toml.
-# Sizes stay below the limits in deploy/compose.compute.yaml (64 GB, 16 CPUs).
+# Sizes stay below the limits in deploy/compose.compute.yaml (128 GB, 32 CPUs).
 [run]
 work_dir = "/work"
 
 [model.params]
-num_threads = 16
+num_threads = 32
 
 [duckdb]
-threads = 16
-memory_limit = "40GB"
+threads = 32
+memory_limit = "96GB"
 max_temp_directory_size = "100GB"

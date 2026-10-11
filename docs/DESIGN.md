@@ -475,7 +475,7 @@ Mac 經 VPN 只有約 4 MB/s，全量匯出只能在伺服器上跑。
 | `init: true` | Ctrl-C 和 `docker stop` 能傳到 isel；所有指令都可續跑 |
 | `read_only: true`、`tmpfs: /tmp` | 只有 `/work` 可寫 |
 | secret 檔 + `<NAME>_FILE` | DSN 不出現在 `docker inspect`、env 或 log（V1 的 cron 檔就外洩過 DSN） |
-| `mem_limit`/`memswap_limit` 64g、`cpus` 16 | DuckDB 40 GB、LightGBM 16 threads，都設在上限以下。DuckDB 1.5 會讀 cgroup，但預設用到 80%，所以明確設定，留空間給 Arrow 和 Python 物件。LightGBM 預測時不讀模型存的參數，所以每次 `predict` 都傳 `num_threads`；不傳時 OpenMP 依主機的 144 核開執行緒，被 16 CPU 的配額節流。設定檔因此要求 `model.params.num_threads` 是正整數，也拒絕 `n_jobs` 等別名 |
+| `mem_limit`/`memswap_limit` 128g、`cpus` 32 | DuckDB 96 GB、LightGBM 32 threads，都設在上限以下。`score-full` 受 CPU 限制：16 threads 時每列 5.6 µs，其中 LightGBM `predict` 約佔 61%，而且隨執行緒數線性加速，所以 32 threads 估計把 2.6 h 縮到約 1.5 h。`cpu_shares` 256 讓主機上的其他服務在搶 CPU 時優先。DuckDB 1.5 會讀 cgroup，但預設用到 80%，所以明確設定，留空間給 Arrow 和 Python 物件。LightGBM 預測時不讀模型存的參數，所以每次 `predict` 都傳 `num_threads`；不傳時 OpenMP 依主機的 144 核開執行緒，被 32 CPU 的配額節流。設定檔因此要求 `model.params.num_threads` 是正整數，也拒絕 `n_jobs` 等別名 |
 | `cpu_shares: 256`、`oom_score_adj: 1000`、`pids_limit: 512` | 爬蟲恢復後，搶資源時爬蟲優先，記憶體不足時先殺我們 |
 | `json-file` log，20 MB × 5 | 和現有容器相同，不會塞滿根目錄 |
 | `network_mode: bridge`，用現有的 `docker0` | 專案網路要一段沒人用的子網。別的使用者 2026-10-11 在 Host2 建了 `172.20.0.0/16`，蓋住原本固定的 `172.20.251.0/24`；Docker 自動挑的下一段可能撞到 VPN 用戶端（`172.24.0.0/16`）。工作容器只對外連 Host1，不需要自己的網路 |
