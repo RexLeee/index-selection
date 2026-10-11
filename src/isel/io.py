@@ -28,6 +28,11 @@ class SecretLeak(ValueError):
     """Raised when metadata would store something that looks like a credential."""
 
 
+def code_version() -> str:
+    """The git revision baked into the image (`ISEL_CODE_VERSION`), or `dev` outside it."""
+    return os.environ.get("ISEL_CODE_VERSION", "dev")
+
+
 def utc_id(now: datetime | None = None) -> str:
     """Returns a sortable, microsecond-unique UTC id such as `20261001T050000123456Z`."""
     return (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%S%fZ")

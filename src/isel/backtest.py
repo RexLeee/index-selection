@@ -24,7 +24,7 @@ from isel.evaluate import (
 )
 from isel.features import FeatureStore, resolve_set
 from isel.golden import PSEUDO, read_golden
-from isel.io import atomic_write_json, open_duckdb, utc_id
+from isel.io import atomic_write_json, code_version, open_duckdb, utc_id
 from isel.manifest import write_run
 from isel.model import (
     FORWARD_ONLY,
@@ -142,7 +142,7 @@ def run_backtest(cfg: Config, work_dir: Path, feature_sets: list[str],
         "title": "Forward-chained backtest",
         "reference": reference, "k_headline": cfg.eval.k_headline,
         "sample_rate": store.rate, "snapshot_at": store.snapshot_at,
-        "config_sha256": cfg.sha256(), "batches": batches_out,
+        "config_sha256": cfg.sha256(), "code_version": code_version(), "batches": batches_out,
         "pooled": pooled(cfg, keyed_queries, all_hits, reference) if all_queries else {},
     }
     out = work_dir / "backtests" / utc_id()
@@ -163,7 +163,7 @@ def train_frozen(cfg: Config, work_dir: Path, baselines: list[str]) -> Path:
     out = work_dir / "models" / utc_id()
     for name, model in models.items():
         model.meta.update(snapshot_at=store.snapshot_at, trained_at=datetime.now(UTC),
-                          config_sha256=cfg.sha256(), name=name,
+                          config_sha256=cfg.sha256(), code_version=code_version(), name=name,
                           use_pseudo=cfg.golden.use_pseudo)
         model.save(out / name.replace(":", "_"))
     return out
@@ -252,7 +252,8 @@ def forward_eval(cfg: Config, work_dir: Path, model_dirs: list[Path], batch: int
     results = {"title": f"Forward evaluation on batch {batch}", "reference": reference,
                "k_headline": cfg.eval.k_headline, "sample_rate": base.rate,
                "snapshot_at": base.snapshot_at, "model_dirs": [str(d) for d in model_dirs],
-               "config_sha256": cfg.sha256(), "batches": {str(batch): result}, "pooled": {}}
+               "config_sha256": cfg.sha256(), "code_version": code_version(),
+               "batches": {str(batch): result}, "pooled": {}}
     out = work_dir / "forward_evals" / f"batch={batch}_{utc_id()}"
     atomic_write_json(out / "results.json", results)
     (out / "report.md").write_text(render_report(results), encoding="utf-8")
