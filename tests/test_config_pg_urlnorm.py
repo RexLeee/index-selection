@@ -73,7 +73,7 @@ def test_config_rejects_bad_values(tmp_path, text, message):
 
 
 def test_config_rejects_missing_key(tmp_path):
-    text = BASE.read_text().replace('app_name = "isel_r14725023"', "")
+    text = BASE.read_text().replace('app_name = "isel"', "")
     path = tmp_path / "full.toml"
     path.write_text(text)
     with pytest.raises(ConfigError, match="missing keys"):

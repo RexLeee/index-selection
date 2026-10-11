@@ -4,7 +4,7 @@
 
 [run]
 work_dir = "work"
-app_name = "isel_r14725023"              # application_name prefix on every DB session
+app_name = "isel"                        # application_name prefix on every DB session
 
 [guard]                                  # checked before every crawlerdb and metricdb statement (UTC)
 month_days = [1, 16]                     # golden creation and measurement days

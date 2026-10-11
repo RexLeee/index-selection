@@ -1,15 +1,15 @@
 # Host2 (ntu-sa2): isel batch jobs, one container per command. See DESIGN §12.
-#   GIT_SHA=<short sha> docker compose -f deploy/compose.compute.yaml build --build-arg GIT_SHA=<short sha> isel
-#   docker compose -f deploy/compose.compute.yaml run --rm isel pull-full --dry-run
+#   GIT_SHA=<short sha> docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml build --build-arg GIT_SHA=<short sha> isel
+#   docker compose --env-file ~/isel/compose.env -f deploy/compose.compute.yaml run --rm isel pull-full --dry-run
 # Never run `docker system/image/volume prune` on the shared hosts.
-name: idxsel_r14725023
+name: ${ISEL_PROJECT:?set it in the env file (DESIGN §12.5)}
 
 services:
   isel:
     build:
       context: ..
       target: runtime
-    image: isel_r14725023:${GIT_SHA:-dev}
+    image: ${ISEL_IMAGE:?set it in the env file (DESIGN §12.5)}:${GIT_SHA:-dev}
     profiles: [job]                     # never started by `up`; only `run --rm`
     entrypoint: ["isel", "--config", "/app/config/isel.toml",
                  "--config", "/app/config/container.toml"]
@@ -28,7 +28,7 @@ services:
     secrets: [crawlerdb_dsn, metricdb_dsn, selectdb_admin_dsn, selectdb_reader_dsn,
               selectdb_reader_password]
     volumes:
-      - ${ISEL_WORK_DIR:-/home/r14725023/isel/work}:/work
+      - ${ISEL_WORK_DIR:?set it in the env file (DESIGN §12.5)}:/work
     read_only: true
     tmpfs: [/tmp]
     mem_limit: 128g
@@ -43,12 +43,12 @@ services:
 
 secrets:
   crawlerdb_dsn:
-    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/crawlerdb_dsn
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/crawlerdb_dsn
   metricdb_dsn:
-    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/metricdb_dsn
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/metricdb_dsn
   selectdb_admin_dsn:
-    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/selectdb_admin_dsn
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_admin_dsn
   selectdb_reader_dsn:
-    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/selectdb_reader_dsn
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_dsn
   selectdb_reader_password:
-    file: ${ISEL_SECRETS:-/home/r14725023/isel/secrets}/selectdb_reader_password
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_password

@@ -484,7 +484,7 @@ Mac 經 VPN 只有約 4 MB/s，全量匯出只能在伺服器上跑。
 
 ### 12.4 secret 檔
 
-使用者在 Host2 的 `/home/r14725023/isel/secrets/` 建立以下檔案，權限 600。內容不進 repo、image、env 或 log。
+使用者在 Host2 的 `~/isel/secrets/` 建立以下檔案，權限 600。內容不進 repo、image、env 或 log。
 
 | 檔案 | 內容 |
 |---|---|
@@ -505,9 +505,11 @@ rsync -a work/golden work/dims ntu-sa2:isel/work/
 # Host2
 cd ~/isel/src-$SHA
 docker build --target test .                                   # unit tests, no network
-GIT_SHA=$SHA docker compose -f deploy/compose.compute.yaml build --build-arg GIT_SHA=$SHA isel
+# ~/isel/compose.env (not in the repo) sets ISEL_PROJECT, ISEL_IMAGE, ISEL_WORK_DIR, ISEL_SECRETS
+D="docker compose --env-file $HOME/isel/compose.env -f deploy/compose.compute.yaml"
+GIT_SHA=$SHA $D build --build-arg GIT_SHA=$SHA isel
 export GIT_SHA=$SHA
-J="docker compose -f deploy/compose.compute.yaml run --rm isel"
+J="$D run --rm isel"
 $J check-config
 $J pull-full --dry-run                       # catalog only; check heap_bytes, chunks, free disk
 $J pull-full                                 # needs TA approval; rerun until shards_missing = 0
@@ -537,7 +539,7 @@ $J verify-live --batch 20
 
 - 清單有問題：`$J rollback`，上一份清單立刻恢復。
 - Metric 要改回 V1：由助教把 `--select_db_url` 改回 `:5444`。
-- 移除：`docker image rm isel_r14725023:<sha>` 刪掉 image，再刪掉 `~/isel/src-<sha>`。容器用 `run --rm`，跑完就刪；也沒有專案網路要刪。共用主機上不跑 `docker system/image/volume prune`。
+- 移除：`docker image rm $ISEL_IMAGE:<sha>` 刪掉 image，再刪掉 `~/isel/src-<sha>`。容器用 `run --rm`，跑完就刪；也沒有專案網路要刪。共用主機上不跑 `docker system/image/volume prune`。
 
 ### 12.7 規模估計
 
