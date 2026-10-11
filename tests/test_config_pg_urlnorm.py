@@ -9,7 +9,13 @@ from conftest import BASE, FakeConn
 from isel.cli import _ids
 from isel.config import ConfigError, load_config
 from isel.features import LeakageError, resolve_set
-from isel.pg import Pacer, ReadOnlySession, ReadOnlyViolation, assert_read_only_sql
+from isel.pg import (
+    Pacer,
+    ReadOnlySession,
+    ReadOnlyViolation,
+    assert_read_only_sql,
+    require_env,
+)
 from isel.pull import probes, sample_sql
 from isel.urlnorm import DomainKeyer, ShardRouter, canonicalize, md5_number_lower
 
@@ -170,6 +176,21 @@ def test_statement_timeout_rejects_bad_values(seconds):
 def test_pull_statements_pass_the_gate(base_cfg):
     assert_read_only_sql(sample_sql(base_cfg, 12))
     assert "url_state_current_012" in sample_sql(base_cfg, 12)
+
+
+def test_require_env_reads_a_secret_file(tmp_path, monkeypatch):
+    secret = tmp_path / "dsn"
+    secret.write_text("postgresql://u@h:5445/selectdb\n")
+    monkeypatch.delenv("ISEL_TEST_DSN", raising=False)
+    monkeypatch.setenv("ISEL_TEST_DSN_FILE", str(secret))
+    assert require_env("ISEL_TEST_DSN") == "postgresql://u@h:5445/selectdb"
+    monkeypatch.setenv("ISEL_TEST_DSN", "postgresql://other")
+    with pytest.raises(RuntimeError, match="only one"):
+        require_env("ISEL_TEST_DSN")
+    monkeypatch.delenv("ISEL_TEST_DSN")
+    monkeypatch.delenv("ISEL_TEST_DSN_FILE")
+    with pytest.raises(RuntimeError, match="is not set"):
+        require_env("ISEL_TEST_DSN")
 
 
 def test_pacer_spaces_statements():

@@ -15,6 +15,7 @@ import statistics
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -59,14 +60,22 @@ class ReadOnlyViolation(RuntimeError):
 
 
 def require_env(name: str) -> str:
-    """Returns the value of env var `name` (DSNs never live in config).
+    """Returns env var `name`, or the content of the file named by `<name>_FILE`.
+
+    DSNs never live in config. Containers pass them as secret files under
+    `/run/secrets/`, so they do not show up in `docker inspect`.
 
     Raises:
-        RuntimeError: If the variable is unset or empty.
+        RuntimeError: If neither is set, both are set, or the value is empty.
     """
     value = os.environ.get(name, "")
+    path = os.environ.get(f"{name}_FILE", "")
+    if value and path:
+        raise RuntimeError(f"set only one of {name} and {name}_FILE")
+    if path:
+        value = Path(path).read_text(encoding="utf-8").strip()
     if not value:
-        raise RuntimeError(f"environment variable {name} is not set")
+        raise RuntimeError(f"environment variable {name} (or {name}_FILE) is not set")
     return value
 
 
