@@ -239,8 +239,11 @@ parse_threads = 8                        # pyarrow threads that parse the CSV CO
 connections = 4                          # crawlerdb sessions, one backend core each (Host1: 144)
 max_heap_mb_s = 2000.0                   # heap read cap for all sessions together; the hourly
                                          # metric scan reads 7-8 GB/s with await < 1 ms
-sample_percent = 1.0                     # derive-sample keeps rows whose salted URL hash is below it
+sample_percent = 2.0                     # derive-sample keeps rows whose salted URL hash is below it
 sample_salt = "sample-v1"                # changing it draws a different sample
+agg_share = 0.5                          # share of the sample that only feeds domain statistics;
+                                         # the rest gives negatives, the eval pool and tau
+agg_salt = "agg-v1"                      # splits the sample into those two halves
 kept_share_max_z = 6.0                   # score-full stops when its kept rows differ from
                                          # the sample's estimate by more than this many SDs
 

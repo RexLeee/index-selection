@@ -12,9 +12,10 @@ Leakage rules (see docs/DESIGN.md):
 * Columns the crawler derives from golden labels are in `FORBIDDEN` and can
   never enter a feature set.
 * A row's features never depend on whether the sample holds it. Domain and
-  lift statistics come from sample rows; a row outside the sample adds itself,
-  so it sees what it would see as a sample row. Otherwise positives, which are
-  mostly outside the sample, carry a label proxy.
+  lift statistics come from the sample's aggregate half; a row outside it adds
+  itself, so it sees what it would see inside. No training row comes from that
+  half: its rows share a group value that no other row can reach, which told
+  the sampled negatives from the positives.
 """
 
 from __future__ import annotations
@@ -101,7 +102,7 @@ FORBIDDEN = frozenset({
     "num_scheduled_90d", "num_fetch_ok_90d", "num_fetch_fail_90d", "num_content_update_90d",
     "num_consecutive_fail", "last_content_update",
 })
-ID_COLUMNS = ("url", "shard", "h", "dkey", "is_sample", "label", "in_head", "in_random",
+ID_COLUMNS = ("url", "shard", "h", "dkey", "is_sample", "in_agg", "label", "in_head", "in_random",
               "url_score", "source")
 # The crawl columns the full export keeps and the store loads, in export order.
 ROW_COLUMNS = (
@@ -173,8 +174,12 @@ class FeatureStore:
                                "move it away and run derive-positives")
         # A model fits the sample it was trained on; a new sample means a new model.
         self.fingerprint = {key: meta[key] for key in
-                            ("method", "sample_percent", "sample_salt", "export_started_at")}
-        self.rate = float(meta["sample_percent"]) / 100.0
+                            ("method", "sample_percent", "sample_salt", "agg_share", "agg_salt",
+                             "export_started_at")}
+        sampled = float(meta["sample_percent"]) / 100.0
+        # The aggregate half feeds the domain statistics; the rest is the pool sample.
+        self.agg_rate = sampled * float(meta["agg_share"])
+        self.rate = sampled - self.agg_rate
         self.snapshot_at = datetime.fromisoformat(meta["snapshot_at"])
         self.batches: list[Batch] = []
         self._keyer: DomainKeyer | None = None
@@ -189,16 +194,18 @@ class FeatureStore:
         if not sample:
             raise RuntimeError("no sample files; run derive-sample")
         cols = ", ".join(ROW_COLUMNS)
-        parts = [f"SELECT {cols}, true AS is_sample FROM read_parquet({sql_str(f)})"
+        parts = [f"SELECT {cols}, NOT in_agg AS is_sample, in_agg FROM read_parquet({sql_str(f)})"
                  for f in sample]
-        parts += [f"SELECT {cols}, false AS is_sample FROM read_parquet({sql_str(f)})"
+        parts += [f"SELECT {cols}, false AS is_sample, false AS in_agg "
+                  f"FROM read_parquet({sql_str(f)})"
                   for f in self._files("positives/batch=*.parquet")]
         con.execute(
             "CREATE OR REPLACE TEMP TABLE crawl0 AS SELECT *, "
             f"lower(regexp_extract(url, {sql_str(HOST_RE)}, 1)) AS host, "
             f"regexp_extract(url, {sql_str(PATH_RE)}, 1) AS path, md5_number_lower(url) AS h "
             f"FROM ({' UNION ALL BY NAME '.join(parts)}) "
-            "QUALIFY row_number() OVER (PARTITION BY url, shard ORDER BY is_sample DESC) = 1")
+            "QUALIFY row_number() OVER (PARTITION BY url, shard "
+            "ORDER BY is_sample OR in_agg DESC) = 1")
         files = golden_files(self.work_dir, cfg.golden.use_pseudo)
         golden = f"[{', '.join(sql_str(str(f)) for f in files)}]"
         excluded = list(cfg.golden.exclude_batches) or [-1]
@@ -239,7 +246,7 @@ class FeatureStore:
         self._key_columns("crawl", "crawl0")
         self._key_columns("gold", "gold0")
         con.execute("CREATE OR REPLACE TEMP TABLE sample_keys AS "
-                    "SELECT DISTINCT url, shard FROM crawl WHERE is_sample")
+                    "SELECT DISTINCT url, shard, in_agg FROM crawl WHERE is_sample OR in_agg")
         con.execute(
             "CREATE OR REPLACE TEMP TABLE spell AS SELECT batch_id, url, canonical_url, "
             "bool_or(in_head) AS in_head, bool_or(in_random) AS in_random FROM ("
@@ -301,7 +308,7 @@ class FeatureStore:
             con.execute(
                 f"CREATE OR REPLACE TEMP TABLE expo_{lvl} AS SELECT c.{lvl} AS k, b.batch_id, "
                 f"count(*) AS n{extra} FROM crawl c JOIN batches b ON c.last_fetch_ok < b.as_of "
-                "WHERE c.is_sample GROUP BY ALL")
+                "WHERE c.in_agg GROUP BY ALL")
             con.execute(
                 f"CREATE OR REPLACE TEMP TABLE hits_{lvl} AS SELECT {lvl} AS k, batch_id, "
                 "count(DISTINCT canonical_url) AS g FROM matches GROUP BY ALL")
@@ -339,20 +346,21 @@ class FeatureStore:
     def load_chunk(self, path: Path) -> None:
         """Replaces the crawl rows with one full-export file and keeps the sample aggregates.
 
-        The aggregate tables were built from the sample in `_prepare`, as for
-        training. A row of the file is a sample row when the sample holds its
-        (url, shard), and `frame_sql` counts every other row into its own
-        domain statistics, so each row gets the features it would get in
-        training, whether the sample holds it or not.
+        The aggregate tables were built from the sample's aggregate half in
+        `_prepare`, as for training. The sample files mark each row of the file
+        as an aggregate row, a pool sample row or neither, and `frame_sql` counts
+        every row outside the aggregate half into its own domain statistics, so
+        each row gets the features it would get in training.
         """
         # The file sits under a shard=NNN/ directory; its own shard column is the truth.
         source = f"read_parquet({sql_str(str(path))}, hive_partitioning = false)"
         self.con.execute(
-            "CREATE OR REPLACE TEMP TABLE crawl0 AS SELECT e.*, k.url IS NOT NULL AS is_sample, "
+            "CREATE OR REPLACE TEMP TABLE crawl0 AS SELECT e.*, "
+            "k.url IS NOT NULL AND NOT k.in_agg AS is_sample, coalesce(k.in_agg, false) AS in_agg, "
             f"lower(regexp_extract(e.url, {sql_str(HOST_RE)}, 1)) AS host, "
             f"regexp_extract(e.url, {sql_str(PATH_RE)}, 1) AS path, "
             f"md5_number_lower(e.url) AS h FROM {source} e "
-            "LEFT JOIN (SELECT url, shard FROM sample_keys "
+            "LEFT JOIN (SELECT url, shard, in_agg FROM sample_keys "
             f"WHERE shard IN (SELECT DISTINCT shard FROM {source})) k "
             "ON k.url = e.url AND k.shard = e.shard")
         self._host_keys("SELECT DISTINCT host FROM crawl0")
@@ -419,11 +427,12 @@ class FeatureStore:
 
         Args:
             batch_id: The batch whose pool, label and as-of time apply.
-            mode: "eval" keeps every sample row in the pool plus the batch's golden
+            mode: "eval" keeps every pool sample row plus the batch's golden
                 rows; "train" keeps the golden rows plus a hashed subsample of the
-                other sample rows at rate `dataset.neg_rate`, ordered by (url, shard)
-                because LightGBM bagging picks rows by position; "score" keeps
-                every crawl row in the pool (after `load_chunk`).
+                other pool sample rows at rate `dataset.neg_rate`, never an
+                aggregate row, ordered by (url, shard) because LightGBM bagging
+                picks rows by position; "score" keeps every crawl row in the pool
+                (after `load_chunk`).
         """
         if mode not in ("eval", "train", "score"):
             raise ValueError(f"unknown mode {mode!r}")
@@ -433,22 +442,22 @@ class FeatureStore:
         ppm = round(self.cfg.dataset.neg_rate * 1_000_000)
         salt = sql_str(f"{self.cfg.dataset.neg_salt}:{batch_id}")
         keep = {"eval": "(l.url IS NOT NULL OR c.is_sample)",
-                "train": f"(l.url IS NOT NULL OR (c.is_sample AND "
+                "train": f"NOT c.in_agg AND (l.url IS NOT NULL OR (c.is_sample AND "
                          f"md5_number_lower(c.url || {salt}) % 1000000 < {ppm}))",
                 "score": "true"}[mode]
-        rate = self.rate
-        # Every row counts in its own domain: sample rows through expo_*, others by `own`.
+        rate = self.agg_rate
+        # Every row counts in its own domain: aggregate rows through expo_*, others by `own`.
         n_dkey = "(coalesce(ds.n, 0) + c.own)"
 
         def exposure(alias: str) -> str:
-            # Sample rows count themselves in `ex`; any other row adds itself here.
+            # Aggregate rows count themselves in `ex`; any other row adds itself here.
             return f"(coalesce({alias}.ex, 0) + base.own * base.own_w)::DOUBLE / {rate!r}"
 
         return f"""
 WITH base AS (
   SELECT c.*, l.url IS NOT NULL AS label,
     coalesce(l.in_head, false) AS in_head, coalesce(l.in_random, false) AS in_random,
-    CASE WHEN c.is_sample THEN 0 ELSE 1 END AS own, {self._own_weight_sql(batch_id)} AS own_w
+    CASE WHEN c.in_agg THEN 0 ELSE 1 END AS own, {self._own_weight_sql(batch_id)} AS own_w
   FROM crawl c
   LEFT JOIN (SELECT * FROM label_urls WHERE batch_id = {batch_id}) l ON l.url = c.url
   WHERE c.last_fetch_ok < {_ts(b.as_of)} AND {keep}
@@ -479,8 +488,8 @@ s1 AS (
   SELECT s3.*, (coalesce(g_hp, 0) + {a}) / (coalesce(e_hp, 0) + {a} / r_host) AS r_hp
   FROM s3
 )
-SELECT c.url, c.shard, c.h, c.dkey, c.is_sample, c.label::INT AS label, c.in_head, c.in_random,
-  c.url_score, c.source,
+SELECT c.url, c.shard, c.h, c.dkey, c.is_sample, c.in_agg, c.label::INT AS label,
+  c.in_head, c.in_random, c.url_score, c.source,
   {self._static_sql()},
   date_diff('second', c.last_fetch_ok, {_ts(b.as_of)}) / 86400.0 AS fetch_age_days,
   (ln(1 + c.inlink_count_approx)::{EXACT} * {n_dkey} - coalesce(ds.sum_li, 0)

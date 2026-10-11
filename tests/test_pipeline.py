@@ -19,7 +19,6 @@ from isel.features import FeatureStore, resolve_set
 from isel.golden import PSEUDO, golden_table, pseudo_batch_path
 from isel.io import atomic_write_json, open_duckdb, read_json, write_parquet_atomic
 from isel.manifest import validate_run
-from isel.pull import FULL_SCHEMA
 from isel.urlnorm import canonicalize
 
 
@@ -207,11 +206,13 @@ def test_decay_weights_fall_with_age(work):
 def test_empirical_bayes_falls_back_to_parent(work):
     store = _store(small_cfg(work), work)
     rows = store.con.execute(
-        f"SELECT f.lift_hp, f.lift_host, l.ex, l.g FROM ({store.frame_sql(2, 'eval')}) f "
+        f"SELECT f.lift_hp, f.lift_host, l.ex, l.g, f.in_agg FROM ({store.frame_sql(2, 'eval')}) f "
         "JOIN crawl c USING (url, shard) "
         "LEFT JOIN (SELECT * FROM lvl_hp WHERE batch_id = 2) l ON l.k = c.hp").fetchall()
-    empty = [(hp, host) for hp, host, e, g in rows if not e and not g]
-    seen_no_hits = [(hp, host) for hp, host, e, g in rows if e and not g]
+    # A row outside the aggregate half adds its own exposure, so only aggregate rows
+    # can see an empty group.
+    empty = [(hp, host) for hp, host, e, g, agg in rows if agg and not e and not g]
+    seen_no_hits = [(hp, host) for hp, host, e, g, _ in rows if e and not g]
     assert empty and seen_no_hits
     assert all(np.isclose(hp, host) for hp, host in empty)
     assert all(hp < host for hp, host in seen_no_hits)
@@ -326,10 +327,11 @@ def test_label_audit_counts_other_spellings_of_golden_pages(work, world):
     raws = {r[7] for r in world.golden_rows if r[0] == 5}
     page = next(p for p in world.pages if p["url"] in raws and p["last_fetch_ok"] < early)
     variant = {k: v for k, v in page.items() if not k.startswith("_")}
-    variant.update(url=page["url"].replace("https://www.", "http://"), shard=0)
+    variant.update(url=page["url"].replace("https://www.", "http://"), shard=0, in_agg=False)
     path = work / "sample" / "shard=000.parquet"
-    write_parquet_atomic(pa.Table.from_pylist([*pq.read_table(path).to_pylist(), variant],
-                                              schema=FULL_SCHEMA), path)
+    sample = pq.read_table(path)
+    write_parquet_atomic(pa.Table.from_pylist([*sample.to_pylist(), variant],
+                                              schema=sample.schema), path)
     after = cmd_build_dataset(cfg, Namespace())
     assert after["5"]["neg_variant_golden"] - before["5"]["neg_variant_golden"] == 1
 

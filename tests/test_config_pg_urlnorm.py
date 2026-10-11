@@ -36,6 +36,8 @@ def test_base_config_loads(base_cfg):
     ("[full]\nsample_percent = 'x'\n", "expected float"),
     ("[full]\nsample_percent = 0.00001\n", "at most 4 decimals"),
     ("[full]\nsample_salt = 'isel'\n", "differ from dataset.neg_salt"),
+    ("[full]\nagg_share = 1.0\n", "agg_share must be in"),
+    ("[full]\nagg_salt = 'sample-v1'\n", "agg_salt must be set and differ"),
     ("[crawlerdb.session]\ndefault_transaction_read_only = 'off'\n", "read_only"),
     ("[eval]\nk_headline = 5\n", "k_headline"),
     ("[crawlerdb.session]\nstatement_timeout = '2min'\n", "statement_timeout"),

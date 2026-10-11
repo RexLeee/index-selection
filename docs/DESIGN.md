@@ -65,7 +65,7 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 | `pseudo/ledger.json` | 每個供應商在每個額度期間的呼叫次數 | `pseudo-*`、`trends-snapshot --source serpapi` |
 | `pseudo/calibration/batch=<b>_<tag>.{json,parquet}` | 校準結果；query 文字只在 Parquet | `pseudo-calibrate` |
 | `dims/split_hosts.parquet` | `shard_split_subdomain` 白名單 | `pull-dims` |
-| `sample/shard=NNN.parquet`、`_meta.json` | 從 export 逐列雜湊抽出的 1% sample。`method = "hash"`；`snapshot_at` 是 S0，等於 export 的 `started_at` | `derive-sample` |
+| `sample/shard=NNN.parquet`、`_meta.json` | 從 export 逐列雜湊抽出的 2% sample，`in_agg` 標出彙總半。`method = "hash"`；`snapshot_at` 是 S0，等於 export 的 `started_at` | `derive-sample` |
 | `positives/batch=<id>.parquet`、`_meta.json` | export 裡 URL 等於 golden 原始或 canonical 拼法的列，涵蓋所有 shard；`_meta.json` 記錄來源 export | `derive-positives` |
 | `datasets/summary.json` | 每批的候選池大小、正例數、有無歷史、標籤稽核（§5） | `build-dataset` |
 | `backtests/<id>/` | `results.json`、`report.md` | `backtest` |
@@ -84,6 +84,10 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 
 - 每個 batch b 有一個 as-of 時間：`as_of_b = min(created_b − lead_h, S0)`。`lead_h` 預設 30 小時，S0 是 export 的開始時間。
 - **sample：** `derive-sample` 從 full export 抽列。`md5_number_lower(url:shard:salt) mod 10⁶ < p × 10⁶` 的列進 sample，所以每一列是否進 sample 互相獨立。正例由 `derive-positives` 從同一份 export 取出。訓練、評估、打分的列都來自同一次讀取。
+- **sample 分兩半：** 第二個鹽值雜湊（`full.agg_salt`）把 sample 分成兩半。
+  - **彙總半（`in_agg`，比例 `full.agg_share`）：** 只用來算網域統計和 lift，不當訓練列。
+  - **候選池 sample（`is_sample`）：** 其餘的列。它們提供負例、評估用的候選池估計、τ、成員一致檢查和留下比例檢查。
+  - `full.sample_percent = 2`、`agg_share = 0.5`，所以兩半各佔母體 1%。
 - **為何不用 TABLESAMPLE SYSTEM：** SYSTEM 整頁取列。同一頁的列常屬同一網域，所以 sample 列的網域統計多算了同頁鄰居，非 sample 列沒有。2026-10-11 實測：依檔案順序相鄰兩列同 `domain_id` 佔 32.6%，隨機只有 0.012%。
 - **候選池：** pool_b = {`last_fetch_ok` < as_of_b}。每個 URL 只爬一次，所以這等於重建 batch 出現前的爬取狀態。
 - **golden 衍生特徵：** batch b 只用 `created_b′ < created_b` 且 `available_b′ ≤ as_of_b` 的 batch b′。官方 batch 的 `available_at` 等於建立時間；偽 batch 的 `available_at` 是 SERP 抓取時間（§5.1）。
@@ -109,7 +113,9 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 
 `url_score` 和 `source` 仍會被拉下來，但只給前瞻評估的 baseline 用。
 
-**成員不變式：** 一列的特徵值不能取決於它在不在 sample 裡。網域統計和 lift 只用 sample 列算；不在 sample 的列（大多數正例、幾乎所有打分列）在 frame SQL 裡把自己加進去（`own = 1`）：n 加 1，`sum_li`、`sum_le`、`n_ext` 加上自己的值，e 加上自己的衰減權重 `own_w`。所以每一列看到的都是「自己 + 其他 sample 列」。`tests/test_membership.py` 用同一頁在 sample 內外兩個世界比對全部特徵，要求完全相同。
+**成員不變式：** 一列的特徵值不能取決於它在不在彙總半裡。網域統計和 lift 只用彙總半的列算。彙總半以外的列（全部負例、正例、幾乎所有打分列）在 frame SQL 裡把自己加進去（`own = 1`）：n 加 1，`sum_li`、`sum_le`、`n_ext` 加上自己的值，e 加上自己的衰減權重 `own_w`。所以每一列看到的都是「自己 + 其他彙總列」。`tests/test_membership.py` 用同一頁在彙總半內外兩個世界比對全部特徵，要求完全相同。
+
+**訓練列不能來自彙總半：** 只有逐列不變還不夠。彙總半的列共用一個群組值，例如 `.com` 的 `lift_tld`；彙總半以外的列多加了自己，值稍有不同，所以永遠拿不到那個共用值。2026-10-11 的第一版 M0' 用整個 sample 當負例：`.com` 的 62 萬個負例共用同一個 `lift_tld`，1,729 個正例有 11 種略低的值。LightGBM 給這些值各自的 bin，模型只要切一刀就能分開正負例。結果 batch 19 的驗證 logloss 從第 20 輪起上升，early stopping 停在 33 輪；只拿掉 `lift_tld`，曲線就恢復正常。所以 `train` 模式排除彙總列，負例只從候選池 sample 取。`test_training_rows_share_group_values_whatever_their_label` 檢查同一 TLD、同一抓取時段的訓練列，不論標籤，`lift_tld` 都只有一個值。
 
 這條不變式修正了 2026-10-11 的洩漏：舊版正例不含自己，網域不在 sample 時 `log_size_dkey = 0`、`rel_*` 為 NULL，而負例永遠不會這樣。M0 對這個模式加了 +17.4 logit，`score-full` 多留下 3,814 萬列（11.23% 對 8.93%）。
 
@@ -517,7 +523,10 @@ $J derive-sample                             # reads only the export; score-full
                                              # a sample whose differing_duplicates > 0
 $J derive-positives                          # official batches
 $J --config /app/config/pseudo.toml derive-positives --batches 10019,10100
-# Mac: rsync sample/ and positives/ back, train M0, rsync work/models/<M0> to Host2
+$J build-dataset                            # the 2 % sample needs more RAM than the Mac's 24 GB
+$J backtest --feature-sets full,no_inlinks,no_domain,no_history \
+   --baselines random,inlinks,ext,domain_prior,logreg,v1_features,later_unlabeled
+$J train                                    # M0; freeze before 2026-10-15 06:00 UTC
 $J score-full --model-dir /work/models/<M0>  # stops if sample rows score differently or the
                                              # kept share leaves the sample's estimate
 $J select-full

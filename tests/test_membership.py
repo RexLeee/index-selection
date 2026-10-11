@@ -1,10 +1,11 @@
 """A page's features must not depend on whether the sample holds it.
 
-Training negatives are sample rows; positives and almost every scored row are
-not. Any feature that moves with sample membership becomes a label proxy in
-training and a bias at scoring time (docs/DESIGN.md §4.2). Each test builds the
-same world twice: W1 samples page u, W2 is W1 with u taken out of the sample
-files, and u must get the same feature values in both.
+The aggregate half of the sample feeds the domain statistics; positives and
+almost every scored row are outside it. Any feature that moves with that
+membership becomes a label proxy in training and a bias at scoring time
+(docs/DESIGN.md §4.2). Each test builds the same world twice: W1 puts page u
+in the aggregate half, W2 is W1 with u taken out of the sample files, and u
+must get the same feature values in both.
 """
 
 from __future__ import annotations
@@ -29,15 +30,17 @@ PERCENT = 50.0     # below 100, so a wrong 1/rate scale shows
 LABEL_BATCH = 8
 
 
-def _sampled(url: str, shard: int, salt: str) -> bool:
-    return md5_number_lower(f"{url}:{shard}:{salt}") % 1_000_000 < PERCENT * 10_000
+def _in_agg(url: str, shard: int, full) -> bool:
+    sampled = md5_number_lower(f"{url}:{shard}:{full.sample_salt}") % 1_000_000
+    agg = md5_number_lower(f"{url}:{shard}:{full.agg_salt}") % 1_000_000
+    return sampled < PERCENT * 10_000 and agg < full.agg_share * 1_000_000
 
 
-def _lone_page(world, salt):
+def _lone_page(world, full):
     """A golden page alone in its domain, fetched between two batches' as-of times."""
     base = world.pages[0]
     url = next(u for u in (f"https://www.lonely{i}.org/" for i in range(1000))
-               if _sampled(u, base["shard"], salt))
+               if _in_agg(u, base["shard"], full))
     fetched = FIRST_BATCH + timedelta(days=14 * 3 + 5)
     page = {**base, "url": url, "domain_id": 10_000, "last_fetch_ok": fetched}
     created = world.batches[LABEL_BATCH]
@@ -46,20 +49,20 @@ def _lone_page(world, salt):
                                golden_rows=[*world.golden_rows, row]), page
 
 
-def _crowded_page(world, salt):
-    """A sampled golden page of label batch in a domain with many sampled rows."""
+def _crowded_page(world, full):
+    """A golden page of the label batch in the aggregate half, in a domain of many rows."""
     golden = {r[7] for r in world.golden_rows if r[0] == LABEL_BATCH}
     page = next(p for p in world.pages if p["url"] in golden
                 and p["last_fetch_ok"] < world.batches[LABEL_BATCH] - timedelta(days=3)
-                and _sampled(p["url"], p["shard"], salt))
+                and _in_agg(p["url"], p["shard"], full))
     return world, page
 
 
 @pytest.fixture(scope="module", params=["lone", "crowded"])
 def worlds(request, tmp_path_factory):
-    salt = small_cfg(tmp_path_factory.mktemp("cfg")).full.sample_salt
+    full = small_cfg(tmp_path_factory.mktemp("cfg")).full
     pick = _lone_page if request.param == "lone" else _crowded_page
-    world, page = pick(make_world(), salt)
+    world, page = pick(make_world(), full)
     w1 = tmp_path_factory.mktemp("w1")
     write_work_dir(world, w1, PERCENT)
     w2 = tmp_path_factory.mktemp("w2")
@@ -81,16 +84,16 @@ def _features(row: dict) -> dict:
     return {name: row[name] for name in FEATURES}
 
 
-def test_a_positive_gets_the_features_it_would_get_as_a_sample_row(worlds):
+def test_a_positive_gets_the_features_it_would_get_in_the_aggregate_half(worlds):
     w1, w2, page = worlds
     rows = [_row(open_store(small_cfg(w), w).frame(LABEL_BATCH, "eval"), page["url"])
             for w in (w1, w2)]
-    assert [r["is_sample"] for r in rows] == [True, False]
+    assert [r["in_agg"] for r in rows] == [True, False]
     assert all(r["label"] == 1 for r in rows)
     assert _features(rows[1]) == _features(rows[0])
 
 
-def test_a_scored_row_gets_the_features_it_would_get_as_a_sample_row(worlds):
+def test_a_scored_row_gets_the_features_it_would_get_in_the_aggregate_half(worlds):
     w1, w2, page = worlds
     rows = []
     for w in (w1, w2):
@@ -99,5 +102,21 @@ def test_a_scored_row_gets_the_features_it_would_get_as_a_sample_row(worlds):
                     if page["url"] in pq.read_table(f, columns=["url"]).column("url").to_pylist())
         store.load_chunk(part)
         rows.append(_row(store.frame(store.batches[-1].batch_id, "score"), page["url"]))
-    assert [r["is_sample"] for r in rows] == [True, False]
+    assert [r["in_agg"] for r in rows] == [True, False]
     assert _features(rows[1]) == _features(rows[0])
+
+
+def test_training_rows_share_group_values_whatever_their_label(tmp_path):
+    # Sample rows used to share a TLD's lift value that no other row could reach, so the
+    # value alone told the sample negatives from the positives (2026-10-11, M0').
+    write_work_dir(make_world(), tmp_path, PERCENT)
+    store = open_store(small_cfg(tmp_path), tmp_path)
+    frame = store.frame(LABEL_BATCH, "train")
+    assert not any(frame.column("in_agg").to_pylist())
+    first = min(b.as_of for b in store.batches if b.created_at < store.batch(LABEL_BATCH).created_at)
+    # Rows fetched before every source batch count in every source pool: same own weight.
+    age = (store.batch(LABEL_BATCH).as_of - first).total_seconds() / 86400.0
+    old = frame.filter(pc.greater(frame.column("fetch_age_days"), age))
+    labels = set(old.column("label").to_pylist())
+    assert labels == {0, 1}
+    assert len(set(old.column("lift_tld").to_pylist())) == 1

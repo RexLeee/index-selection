@@ -44,6 +44,10 @@ def test_derive_sample_keeps_a_fixed_salted_share_of_the_export(tmp_path, world)
         meta = read_json(work / "sample" / "_meta.json")
         assert report["rows"] == len(picks[name])
         assert meta["method"] == "hash" and meta["snapshot_at"] == SNAPSHOT.isoformat()
+    agg = [r["in_agg"] for r in _rows(tmp_path / "a" / "sample", "shard=*.parquet")]
+    assert 0.4 < sum(agg) / len(agg) < 0.6
+    meta = read_json(tmp_path / "a" / "sample" / "_meta.json")
+    assert (meta["agg_share"], meta["agg_salt"]) == (0.5, "agg-v1")
     sample = set(picks["a"])
     assert len(sample) == len(picks["a"]) and sample <= exported
     assert 0.45 < len(sample) / len(exported) < 0.55

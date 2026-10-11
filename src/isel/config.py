@@ -189,6 +189,8 @@ class FullCfg:
     max_heap_mb_s: float
     sample_percent: float
     sample_salt: str
+    agg_share: float
+    agg_salt: str
     kept_share_max_z: float
 
 
@@ -482,6 +484,9 @@ def _validate_full(cfg: Config, need: Any) -> None:
          "full.sample_percent must be in (0, 100] with at most 4 decimals")
     need(bool(f.sample_salt) and f.sample_salt != cfg.dataset.neg_salt,
          "full.sample_salt must be set and differ from dataset.neg_salt")
+    need(0 < f.agg_share < 1, "full.agg_share must be in (0, 1)")
+    need(bool(f.agg_salt) and f.agg_salt not in (f.sample_salt, cfg.dataset.neg_salt),
+         "full.agg_salt must be set and differ from full.sample_salt and dataset.neg_salt")
     need(f.kept_share_max_z >= 0, "full.kept_share_max_z must be >= 0")
     need(f.connections > 0 and f.max_heap_mb_s > 0,
          "full.connections and full.max_heap_mb_s must be > 0")

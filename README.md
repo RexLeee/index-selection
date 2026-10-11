@@ -13,7 +13,7 @@
 ## 里程碑
 
 - **里程碑 1（離線研究）：**
-  - 資料來源是 metricdb 的 golden，和 crawlerdb 全量匯出裡依 URL 雜湊抽出的 1% sample 與 golden 列。
+  - 資料來源是 metricdb 的 golden，和 crawlerdb 全量匯出裡依 URL 雜湊抽出的 2% sample（一半只算網域統計，一半當負例和評估池）與 golden 列。
   - 主要數字是凍結模型對之後新 batch 的前瞻評估。
 - **里程碑 2（串上 Metric，目標 batch 20）：**
   - 全量匯出已爬列，用凍結模型打分，取精確的 1.28 億列。

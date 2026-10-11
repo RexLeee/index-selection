@@ -56,7 +56,8 @@ def test_full_scores_equal_select_sample_and_cover_pages_outside_the_sample(tmp_
                     strict=True))
     sample = dict(zip(manifest.column("url").to_pylist(), manifest.column("score").to_pylist(),
                       strict=True))
-    assert len(sample) == 500
+    # The pool sample is the half of the 50 % sample outside the aggregate half.
+    assert len(sample) == round(1000 * 0.5 * (1 - cfg.full.agg_share))
     assert {u: full.get(u) for u in sample} == sample
     assert read_json(tmp_path / "full" / "scored" / "_meta.json")["model_meta"]["train_batches"]
 

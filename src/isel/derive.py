@@ -55,6 +55,8 @@ def _one_per(keys: str, rows_sql: str) -> str:
 def derive_sample(cfg: Config, work_dir: Path) -> dict[str, Any]:
     """Writes `sample/shard=NNN.parquet` and `_meta.json` from the full export.
 
+    `in_agg` splits the sample by a second salted hash: that half only feeds the
+    domain statistics, and the other half gives negatives, the eval pool and tau.
     The meta counts sample keys read more than once, and those whose copies
     differ in a feature input; `score_full` refuses a sample with any of the latter.
 
@@ -68,6 +70,8 @@ def derive_sample(cfg: Config, work_dir: Path) -> dict[str, Any]:
     ppm = round(cfg.full.sample_percent * _PPM / 100)
     member = (f"md5_number_lower(url || ':' || shard::VARCHAR || "
               f"{sql_str(':' + cfg.full.sample_salt)}) % {_PPM} < {ppm}")
+    in_agg = (f"md5_number_lower(url || ':' || shard::VARCHAR || "
+              f"{sql_str(':' + cfg.full.agg_salt)}) % {_PPM} < {round(cfg.full.agg_share * _PPM)}")
     cols = ", ".join(_COLUMNS)
     con = open_duckdb(cfg, work_dir / "duckdb_tmp")
     rows: dict[str, int] = {}
@@ -79,8 +83,9 @@ def derive_sample(cfg: Config, work_dir: Path) -> dict[str, Any]:
             continue
         source = _read(files)
         rows[str(shard)] = copy_atomic(
-            con, _one_per("url, shard", f"SELECT {cols} FROM {source} WHERE {member}")
-            + " ORDER BY url", out / f"shard={shard:03d}.parquet")
+            con, f"SELECT *, {in_agg} AS in_agg FROM ("
+            + _one_per("url, shard", f"SELECT {cols} FROM {source} WHERE {member}")
+            + ") ORDER BY url", out / f"shard={shard:03d}.parquet")
         latest.append(con.execute(f"SELECT max(last_fetch_ok) FROM {source}").fetchone()[0])
         copies, apart = con.execute(
             "SELECT count(*) FILTER (WHERE n > 1), count(*) FILTER (WHERE d > 1) FROM ("
@@ -90,7 +95,8 @@ def derive_sample(cfg: Config, work_dir: Path) -> dict[str, Any]:
         differing += apart
     newest = max((t for t in latest if t is not None), default=None)
     meta = {"method": SAMPLE_METHOD, "sample_percent": cfg.full.sample_percent,
-            "sample_salt": cfg.full.sample_salt, "snapshot_at": exported["started_at"],
+            "sample_salt": cfg.full.sample_salt, "agg_share": cfg.full.agg_share,
+            "agg_salt": cfg.full.agg_salt, "snapshot_at": exported["started_at"],
             "export_started_at": exported["started_at"],
             "frozen_probe": exported.get("frozen_probe"), "rows": rows,
             "shards_done": sorted(int(s) for s in rows),
