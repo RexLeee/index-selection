@@ -188,6 +188,7 @@ class FullCfg:
     chunks_per_file: int
     min_free_gb: float
     tau_margin: float
+    parse_threads: int
 
 
 @dataclass(frozen=True)
@@ -261,6 +262,10 @@ KNOWN_BASELINES = (
 )
 # LightGBM 4.7 aliases of num_threads; predict would not see a thread count set this way.
 LGBM_THREAD_ALIASES = ("n_jobs", "nthread", "nthreads", "num_thread")
+# crawlerdb session settings that fix the CSV text the full export parses: other
+# values fail the parse, or round url_score (extra_float_digits < 1).
+CSV_SESSION = {"datestyle": "ISO", "extra_float_digits": "1", "client_encoding": "UTF8"}
+
 
 
 def _deep_merge(base: dict[str, Any], over: Mapping[str, Any]) -> dict[str, Any]:
@@ -478,6 +483,9 @@ def _validate_full(cfg: Config, need: Any) -> None:
          "full.chunk_blocks must be readable at guard.min_mb_s within guard.timeout_cap_s")
     need(f.min_free_gb >= 0 and f.tau_margin >= 0,
          "full.min_free_gb and full.tau_margin must be >= 0")
+    need(f.parse_threads > 0, "full.parse_threads must be > 0")
+    need(all(cfg.crawlerdb.session.get(k) == v for k, v in CSV_SESSION.items()),
+         f"crawlerdb.session must set {CSV_SESSION} for the CSV text the full export parses")
     need(len({s.admin_dsn_env, s.reader_dsn_env, cfg.crawlerdb.dsn_env,
               cfg.metricdb.dsn_env}) == 4,
          "selectdb DSN env vars must differ from each other and from the read-only DBs")

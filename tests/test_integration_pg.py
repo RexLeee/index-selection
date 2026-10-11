@@ -68,7 +68,11 @@ def _router() -> ShardRouter:
 
 
 def _urls() -> list[str]:
-    return [f"https://site{d}.com/p{i}" for d in range(40) for i in range(25)]
+    plain = [f"https://site{d}.com/p{i}" for d in range(40) for i in range(25)]
+    # Quotes, commas, newlines, backslashes and CJK, so the CSV full export is checked
+    # against the binary sample; ten of them keep len(_urls()) a multiple of 10.
+    tricky = [f'https://tricky{i}.example/a?q="x,{i}"\n\\p/中文/NULL' for i in range(10)]
+    return plain + tricky
 
 
 def _load(dsn: str) -> None:
@@ -78,11 +82,13 @@ def _load(dsn: str) -> None:
             conn.execute(URL_TABLE.format(shard))
         for n, url in enumerate(_urls()):
             shard = router.shard_for_key(router.keyer.key(url))
-            fetched = None if n % 10 == 0 else FETCHED + timedelta(minutes=n)
+            fetched = None if n % 10 == 0 else FETCHED + timedelta(minutes=n, microseconds=7 * n)
             conn.execute(
                 f"INSERT INTO url_state_current_{shard:03d} VALUES "
-                "(%s, %s, %s, %s, NULL, 1, 1, false, 0, true, 0, NULL, 'max-age=60', %s, %s, 0.5, "
-                "0, 1)", (url, n // 25, fetched, "t" * 500, n % 7, n % 3))
+                "(%s, %s, %s, %s, %s, %s, 1, %s, 0, true, 0, NULL, 'max-age=60', %s, %s, %s, "
+                "0, 1)", (url, n // 25, fetched, "t" * 500, "a" if n % 2 else None,
+                          None if n % 4 == 0 else n % 5, None if n % 5 == 0 else n % 3 == 0,
+                          n % 7, n % 3, n / 3))
         conn.execute("CREATE TABLE shard_split_subdomain (host text, migrated_at timestamptz)")
         conn.execute("INSERT INTO shard_split_subdomain VALUES ('news.site1.com', NULL)")
         conn.execute("CREATE TABLE metric_batches (id bigint, created_at timestamptz)")
@@ -220,6 +226,20 @@ def test_full_export_reads_every_crawled_row_once(cfg, tmp_path, dsn):
     assert exported.schema.equals(FULL_SCHEMA, check_metadata=False)
     meta = read_json(tmp_path / "export" / "_meta.json")
     assert "finished_at" in meta and "end_probe" in meta
+
+
+def test_the_csv_full_export_equals_the_binary_sample(cfg, tmp_path):
+    cfg = replace(cfg, "full", chunk_blocks=1, chunks_per_file=3, min_free_gb=0.0)
+    session = _session(cfg)
+    try:
+        pull_sample(cfg, session, tmp_path / "sample", now=ALLOWED)
+        pull_full(cfg, session, tmp_path / "export", now=ALLOWED)
+    finally:
+        session.close()
+    binary = pq.read_table(tmp_path / "sample").select(FULL_SCHEMA.names).cast(FULL_SCHEMA)
+    csv = _files(tmp_path / "export").cast(FULL_SCHEMA)
+    assert csv.sort_by("url").equals(binary.sort_by("url"))
+    assert sum("\n" in u for u in csv.column("url").to_pylist()) == 9
 
 
 OPEN = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)

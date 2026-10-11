@@ -30,11 +30,12 @@ class FakeSession:
     """Answers the catalog and probe queries `pull` sends; COPY returns no rows."""
 
     def __init__(self, relpages: dict[str, int], probe: tuple, failing: set[str] = frozenset(),
-                 sizes: dict[str, list[int]] | None = None):
+                 sizes: dict[str, list[int]] | None = None, csv: bytes = b""):
         self.relpages = relpages
         self.probe = probe
         self.failing = set(failing)
         self.sizes = {t: list(v) for t, v in (sizes or {}).items()}   # successive heap sizes
+        self.csv = csv
         self.timeout_s = 120
         self.copies: list[tuple[str, int]] = []
 
@@ -58,6 +59,13 @@ class FakeSession:
         if any(f"FROM {table} " in query for table in self.failing):
             raise errors.QueryCanceled("canceling statement due to statement timeout")
         yield from ()
+
+    def copy_bytes(self, query):
+        assert_read_only_sql(query)
+        self.copies.append((query, self.timeout_s))
+        if any(f"FROM {table} " in query for table in self.failing):
+            raise errors.QueryCanceled("canceling statement due to statement timeout")
+        return bytearray(self.csv)
 
 
 PROBE = (datetime(2026, 10, 6, 8, 2, 16, tzinfo=UTC), 123_456)
@@ -222,6 +230,39 @@ def test_full_export_resumes_a_failed_shard_from_its_unfinished_files(tmp_path, 
     out = pull_full(cfg, retry, tmp_path, now=T1)
     assert _ranges(retry) == [("url_state_current_001", 10, 20)]
     assert out["shards_failed"] == [] and "finished_at" in read_json(tmp_path / "_meta.json")
+
+
+# PostgreSQL `COPY ... (FORMAT CSV)` output: NULL is an unquoted empty field, an
+# empty string is "", quotes inside a quoted field are doubled.
+CSV_CHUNK = (
+    b'"https://a.com/x?q=""a,b""\nnext",7,2026-10-09 05:39:22.423515,12,t,1,2,f,0,t,3,f,t,'
+    b'100,5,0.30000000000000004,0\n'
+    b'https://b.com/NULL,8,2026-09-01 00:01:00,,f,,,,,,,f,f,,,-Infinity,\n'
+)
+
+
+def test_full_export_parses_the_csv_copy_output(tmp_path, base_cfg):
+    session = FakeSession({}, PROBE, sizes={"url_state_current_000": [10]}, csv=CSV_CHUNK)
+    pull_full(_full_cfg(base_cfg), session, tmp_path, shards=[0], now=T0)
+    assert "TO STDOUT (FORMAT CSV)" in session.copies[0][0]
+    got = pq.read_table(tmp_path / "shard=000" / "part-0000000000-0000000010.parquet")
+    assert got.schema.equals(FULL_SCHEMA, check_metadata=False)
+    unset = dict.fromkeys(("title_len", "discovery_source_type", "robots_bits", "is_redirect",
+                           "redirect_hop_count", "has_json_ld", "hreflang_count",
+                           "inlink_count_approx", "inlink_count_external", "source"))
+    assert got.to_pylist() == [
+        {"url": 'https://a.com/x?q="a,b"\nnext', "domain_id": 7,
+         "last_fetch_ok": datetime(2026, 10, 9, 5, 39, 22, 423515, tzinfo=UTC),
+         "title_len": 12, "has_anchor": True, "discovery_source_type": 1, "robots_bits": 2,
+         "is_redirect": False, "redirect_hop_count": 0, "has_json_ld": True,
+         "hreflang_count": 3, "has_last_modified": False, "has_cache_control": True,
+         "inlink_count_approx": 100, "inlink_count_external": 5,
+         "url_score": 0.30000000000000004, "source": 0, "shard": 0},
+        {**unset, "url": "https://b.com/NULL", "domain_id": 8,
+         "last_fetch_ok": datetime(2026, 9, 1, 0, 1, tzinfo=UTC), "has_anchor": False,
+         "has_last_modified": False, "has_cache_control": False, "url_score": float("-inf"),
+         "shard": 0},
+    ]
 
 
 def test_full_export_reads_pages_appended_during_the_export(tmp_path, base_cfg):

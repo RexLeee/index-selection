@@ -4,8 +4,9 @@ Every statement is a single read through `ReadOnlySession`, paced by
 `pull.min_interval_s` and held by the read guard. The sample is one
 `COPY ... TABLESAMPLE SYSTEM` per shard, so each statement reads about
 `sample_percent` of the shard's pages. The full export reads each shard in
-ctid block ranges, one short `COPY` per range. No statement sorts or
-aggregates on the server.
+ctid block ranges, one short `COPY ... (FORMAT CSV)` per range; pyarrow parses
+the CSV in C++ and a worker thread writes it while the next range streams. No
+statement sorts or aggregates on the server.
 """
 
 from __future__ import annotations
@@ -15,11 +16,13 @@ import math
 import shutil
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
 from psycopg import errors
 
@@ -64,11 +67,22 @@ CRAWL_SCHEMA = pa.schema(
 )
 _OIDS = [oid for _, _, oid in CRAWL_COLUMNS]
 # The full export drops what FeatureStore never loads, so its rows score like sample rows.
-FULL_COLUMNS = tuple(c for c in CRAWL_COLUMNS if c[0] not in UNLOADED_COLUMNS)
+# It reads CSV: pyarrow parses it about 15x faster than psycopg decodes binary rows, and
+# the server writes CSV no slower. A naive UTC timestamp keeps the text zone-free.
+_CSV_EXPRESSIONS = {"last_fetch_ok": "(last_fetch_ok AT TIME ZONE 'UTC')"}
+FULL_COLUMNS = tuple((name, _CSV_EXPRESSIONS.get(name, expr), oid)
+                     for name, expr, oid in CRAWL_COLUMNS if name not in UNLOADED_COLUMNS)
 FULL_SCHEMA = pa.schema(
     [(name, _ARROW[oid]) for name, _, oid in FULL_COLUMNS] + [("shard", pa.int16())]
 )
-_FULL_OIDS = [oid for _, _, oid in FULL_COLUMNS]
+_CSV_NAMES = [name for name, _, _ in FULL_COLUMNS]
+# PostgreSQL CSV: NULL is an unquoted empty field and an empty string is "".
+_CSV_CONVERT = pcsv.ConvertOptions(
+    column_types={name: (pa.timestamp("us") if oid == TSTZ else _ARROW[oid])
+                  for name, _, oid in FULL_COLUMNS},
+    true_values=["t"], false_values=["f"], null_values=[""],
+    strings_can_be_null=True, quoted_strings_can_be_null=False)
+_CSV_PARSE = pcsv.ParseOptions(newlines_in_values=True)
 _BATCH_ROWS = 200_000
 PAGE_BYTES = 8192
 # A shard that hits its timeout or lock_timeout is retried on the next run.
@@ -77,12 +91,12 @@ _RETRYABLE = (errors.QueryCanceled, errors.LockNotAvailable)
 log = logging.getLogger(__name__)
 
 
-def _table(rows: Sequence[tuple], shard: int, schema: pa.Schema = CRAWL_SCHEMA) -> pa.Table:
-    width = len(schema) - 1
+def _table(rows: Sequence[tuple], shard: int) -> pa.Table:
+    width = len(CRAWL_SCHEMA) - 1
     columns = list(zip(*rows, strict=True)) if rows else [[] for _ in range(width)]
-    arrays = [pa.array(col, type=schema.field(i).type) for i, col in enumerate(columns)]
+    arrays = [pa.array(col, type=CRAWL_SCHEMA.field(i).type) for i, col in enumerate(columns)]
     arrays.append(pa.array([shard] * len(rows), pa.int16()))
-    return pa.Table.from_arrays(arrays, schema=schema)
+    return pa.Table.from_arrays(arrays, schema=CRAWL_SCHEMA)
 
 
 def _shards(cfg: Config, shards: Iterable[int] | None) -> list[int]:
@@ -333,7 +347,18 @@ def full_sql(cfg: Config, shard: int, lo: int, hi: int) -> str:
     """One COPY over heap blocks [lo, hi): a TID range scan that reads only those blocks."""
     return (f"COPY (SELECT {_select_list(cfg, FULL_COLUMNS)} FROM {_table_name(cfg, shard)} "
             f"WHERE ctid >= '({int(lo)},0)'::tid AND ctid < '({int(hi)},0)'::tid "
-            "AND last_fetch_ok IS NOT NULL) TO STDOUT (FORMAT BINARY)")
+            "AND last_fetch_ok IS NOT NULL) TO STDOUT (FORMAT CSV)")
+
+
+def _csv_table(data: bytes | bytearray, shard: int) -> pa.Table:
+    """Parses one chunk of `full_sql` output into `FULL_SCHEMA` rows of `shard`."""
+    if not data:
+        return FULL_SCHEMA.empty_table()
+    table = pcsv.read_csv(pa.BufferReader(data), pcsv.ReadOptions(column_names=_CSV_NAMES),
+                          _CSV_PARSE, _CSV_CONVERT)
+    table = table.append_column("shard", pa.repeat(pa.scalar(shard, pa.int16()),
+                                                   table.num_rows))
+    return table.cast(FULL_SCHEMA)
 
 
 def estimate_full(cfg: Config, session: ReadOnlySession,
@@ -360,19 +385,23 @@ def _check_disk(cfg: Config, path: Path) -> None:
 
 def _export_file(cfg: Config, session: ReadOnlySession, final: Path, shard: int,
                  lo: int, hi: int) -> int:
-    """Streams blocks [lo, hi) of one shard into `final`, one COPY per chunk."""
+    """Streams blocks [lo, hi) of one shard into `final`, one COPY per chunk.
+
+    A worker thread parses and writes each chunk while the next COPY streams;
+    pyarrow releases the GIL, so the server rarely waits for this client.
+    """
     span = cfg.full.chunk_blocks
-    with AtomicParquetWriter(final, FULL_SCHEMA) as writer:
+    with AtomicParquetWriter(final, FULL_SCHEMA) as writer, ThreadPoolExecutor(1) as pool:
+        pending = None
         for c_lo in range(lo, hi, span):
             c_hi = min(c_lo + span, hi)
             session.set_statement_timeout(_timeout_for_bytes(cfg, (c_hi - c_lo) * PAGE_BYTES))
-            buffer: list[tuple] = []
-            for row in session.copy_rows(full_sql(cfg, shard, c_lo, c_hi), _FULL_OIDS):
-                buffer.append(row)
-                if len(buffer) >= _BATCH_ROWS:
-                    writer.write(_table(buffer, shard, FULL_SCHEMA))
-                    buffer = []
-            writer.write(_table(buffer, shard, FULL_SCHEMA))
+            data = session.copy_bytes(full_sql(cfg, shard, c_lo, c_hi))
+            if pending is not None:
+                pending.result()
+            pending = pool.submit(lambda d=data: writer.write(_csv_table(d, shard)))
+        if pending is not None:
+            pending.result()
     return writer.rows
 
 
@@ -435,6 +464,7 @@ def pull_full(cfg: Config, session: ReadOnlySession, out_dir: Path,
     def save() -> None:
         atomic_write_json(meta_path, meta)
 
+    pa.set_cpu_count(cfg.full.parse_threads)
     for i, shard in enumerate(todo, start=1):
         key = str(shard)
         if key not in extents:

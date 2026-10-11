@@ -433,6 +433,17 @@ class ReadOnlySession:
             copy.set_types(list(type_oids))
             yield from copy.rows()
 
+    def copy_bytes(self, query: str | sql.Composable) -> bytearray:
+        """Returns the whole output of a `COPY ... TO STDOUT` statement."""
+        text = self._text(query)
+        assert_read_only_sql(text)
+        self._admit()
+        out = bytearray()
+        with self.conn.cursor() as cur, cur.copy(text) as copy:
+            for block in copy:
+                out += block
+        return out
+
     def close(self) -> None:
         self.conn.close()
 

@@ -51,6 +51,10 @@ def test_base_config_loads(base_cfg):
     ("[guard]\nmonth_window = ['20:00', '00:00']\n", "wrap"),
     ("[guard]\nmonth_window = ['00:00', '25:00']\n", "HH:MM"),
     ("[full]\nchunk_blocks = 1000000\n", "readable at guard.min_mb_s"),
+    ("[full]\nparse_threads = 0\n", "full.parse_threads must be > 0"),
+    # extra_float_digits = 0 would round url_score in the CSV text the full export parses.
+    ("[crawlerdb.session]\nextra_float_digits = '0'\n", "CSV text"),
+    ("[crawlerdb.session]\ndatestyle = 'SQL'\n", "CSV text"),
     ("[selectdb]\nadmin_dsn_env = 'ISEL_CRAWLERDB_DSN'\n", "must differ"),
     ("[selectdb]\nforbidden_ports = []\n", "forbidden_ports"),
     ("[schedule]\nswap_freeze_window = ['20:00', '11:30']\n", "swap_freeze_window"),
@@ -198,6 +202,7 @@ def test_full_export_statement_passes_the_gate(base_cfg):
     text = full_sql(base_cfg, 7, 131072, 262144)
     assert_read_only_sql(text)
     assert "ctid >= '(131072,0)'::tid AND ctid < '(262144,0)'::tid" in text
+    assert text.endswith("TO STDOUT (FORMAT CSV)")
     assert "left(title" not in text and "num_fetch_ok_90d" not in text
 
 
