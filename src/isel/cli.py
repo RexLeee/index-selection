@@ -103,6 +103,31 @@ def cmd_pull_sample(cfg: Config, args: argparse.Namespace) -> Any:
         session.close()
 
 
+def cmd_pull_full(cfg: Config, args: argparse.Namespace) -> Any:
+    import shutil
+    from datetime import UTC, datetime
+
+    from isel.pg import next_allowed_start, next_forbidden_window, open_crawlerdb
+    from isel.pull import estimate_full, pull_full
+
+    out = cfg.work_dir / "full" / "export"
+    out.mkdir(parents=True, exist_ok=True)
+    session = open_crawlerdb(cfg)
+    try:
+        if args.dry_run:
+            estimate = estimate_full(cfg, session, _ids(args.shards))
+            now = datetime.now(UTC)
+            return {**estimate, "io_waiters_now": session.io_waiters(),
+                    "work_dir_free_gb": round(shutil.disk_usage(out).free / 1e9, 1),
+                    "forbidden_window_next": [t.isoformat()
+                                              for t in next_forbidden_window(now, cfg.guard)],
+                    "next_chunk_start": next_allowed_start(
+                        now, estimate["chunk_timeout_s"], cfg.guard).isoformat()}
+        return pull_full(cfg, session, out, _ids(args.shards))
+    finally:
+        session.close()
+
+
 def cmd_advance_snapshot(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.pg import open_crawlerdb
     from isel.pull import advance_snapshot
@@ -310,6 +335,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pull-sample")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--shards")
+    p = sub.add_parser("pull-full", help="export every crawled row in ctid block ranges")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--shards")
     sub.add_parser("advance-snapshot")
     p = sub.add_parser("pull-positives")
     p.add_argument("--batches")
@@ -359,6 +387,7 @@ COMMANDS = {
     "pull-golden": cmd_pull_golden,
     "pull-dims": cmd_pull_dims,
     "pull-sample": cmd_pull_sample,
+    "pull-full": cmd_pull_full,
     "advance-snapshot": cmd_advance_snapshot,
     "pull-positives": cmd_pull_positives,
     "trends-snapshot": cmd_trends_snapshot,

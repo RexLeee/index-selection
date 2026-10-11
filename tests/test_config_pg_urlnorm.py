@@ -16,7 +16,7 @@ from isel.pg import (
     assert_read_only_sql,
     require_env,
 )
-from isel.pull import probes, sample_sql
+from isel.pull import full_sql, probes, sample_sql
 from isel.urlnorm import DomainKeyer, ShardRouter, canonicalize, md5_number_lower
 
 
@@ -50,6 +50,7 @@ def test_base_config_loads(base_cfg):
     ("[guard]\ntimeout_cap_s = 2880\n", "hourly open gap"),
     ("[guard]\nmonth_window = ['20:00', '00:00']\n", "wrap"),
     ("[guard]\nmonth_window = ['00:00', '25:00']\n", "HH:MM"),
+    ("[full]\nchunk_blocks = 1000000\n", "readable at guard.min_mb_s"),
     # num_threads = 0 lets OpenMP start one thread per host CPU, past the container quota.
     ("[model.params]\nnum_threads = 0\n", "num_threads must be an integer > 0"),
     ("[model.params]\nnum_threads = 2.5\n", "num_threads must be an integer > 0"),
@@ -188,6 +189,13 @@ def test_statement_timeout_rejects_bad_values(seconds):
 def test_pull_statements_pass_the_gate(base_cfg):
     assert_read_only_sql(sample_sql(base_cfg, 12))
     assert "url_state_current_012" in sample_sql(base_cfg, 12)
+
+
+def test_full_export_statement_passes_the_gate(base_cfg):
+    text = full_sql(base_cfg, 7, 131072, 262144)
+    assert_read_only_sql(text)
+    assert "ctid >= '(131072,0)'::tid AND ctid < '(262144,0)'::tid" in text
+    assert "left(title" not in text and "num_fetch_ok_90d" not in text
 
 
 def test_require_env_reads_a_secret_file(tmp_path, monkeypatch):

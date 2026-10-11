@@ -230,3 +230,8 @@ reason_top_n = 3                         # top feature contributions kept per ro
 threads = 8
 memory_limit = "16GB"
 max_temp_directory_size = "50GB"
+
+[full]                                   # full crawled pool: export, score, exact top-K
+chunk_blocks = 65536                     # heap blocks per COPY (512 MiB); its timeout is the 120 s floor
+chunks_per_file = 16                     # COPY chunks per Parquet file (8 GiB of heap), the resume unit
+min_free_gb = 150.0                      # stop exporting below this much free work_dir disk

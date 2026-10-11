@@ -183,6 +183,13 @@ class DuckDbCfg:
 
 
 @dataclass(frozen=True)
+class FullCfg:
+    chunk_blocks: int
+    chunks_per_file: int
+    min_free_gb: float
+
+
+@dataclass(frozen=True)
 class Config:
     run: RunCfg
     guard: GuardCfg
@@ -200,6 +207,7 @@ class Config:
     eval: EvalCfg
     manifest: ManifestCfg
     duckdb: DuckDbCfg
+    full: FullCfg
 
     @property
     def work_dir(self) -> Path:
@@ -430,6 +438,17 @@ def _validate(cfg: Config) -> None:
     need(cfg.manifest.index_shards > 0, "manifest.index_shards must be > 0")
     need(cfg.manifest.reason_top_n >= 0, "manifest.reason_top_n must be >= 0")
     need(cfg.duckdb.threads > 0, "duckdb.threads must be > 0")
+    _validate_full(cfg, need)
+
+
+def _validate_full(cfg: Config, need: Any) -> None:
+    f, g = cfg.full, cfg.guard
+    need(f.chunk_blocks > 0 and f.chunks_per_file > 0,
+         "full.chunk_blocks and full.chunks_per_file must be > 0")
+    # A chunk read at the worst-case speed must still finish inside its timeout.
+    need(f.chunk_blocks * 8192 <= g.min_mb_s * 1_000_000 * g.timeout_cap_s,
+         "full.chunk_blocks must be readable at guard.min_mb_s within guard.timeout_cap_s")
+    need(f.min_free_gb >= 0, "full.min_free_gb must be >= 0")
 
 
 def load_config(paths: Sequence[str | Path]) -> Config:

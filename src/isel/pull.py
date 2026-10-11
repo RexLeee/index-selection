@@ -1,15 +1,18 @@
-"""Read-only pulls from crawlerdb: the split table, a block sample and golden lookups.
+"""Read-only pulls from crawlerdb: split table, sample, golden lookups, full pool.
 
 Every statement is a single read through `ReadOnlySession`, paced by
 `pull.min_interval_s` and held by the read guard. The sample is one
 `COPY ... TABLESAMPLE SYSTEM` per shard, so each statement reads about
-`sample_percent` of the shard's pages and never sorts or aggregates on the server.
+`sample_percent` of the shard's pages. The full export reads each shard in
+ctid block ranges, one short `COPY` per range. No statement sorts or
+aggregates on the server.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import shutil
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
@@ -17,9 +20,11 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 from psycopg import errors
 
 from isel.config import Config
+from isel.features import UNLOADED_COLUMNS
 from isel.io import AtomicParquetWriter, atomic_write_json, read_json, write_parquet_atomic
 from isel.pg import ReadOnlySession
 from isel.urlnorm import ShardRouter
@@ -58,6 +63,12 @@ CRAWL_SCHEMA = pa.schema(
     [(name, _ARROW[oid]) for name, _, oid in CRAWL_COLUMNS] + [("shard", pa.int16())]
 )
 _OIDS = [oid for _, _, oid in CRAWL_COLUMNS]
+# The full export drops what FeatureStore never loads, so its rows score like sample rows.
+FULL_COLUMNS = tuple(c for c in CRAWL_COLUMNS if c[0] not in UNLOADED_COLUMNS)
+FULL_SCHEMA = pa.schema(
+    [(name, _ARROW[oid]) for name, _, oid in FULL_COLUMNS] + [("shard", pa.int16())]
+)
+_FULL_OIDS = [oid for _, _, oid in FULL_COLUMNS]
 _BATCH_ROWS = 200_000
 PAGE_BYTES = 8192
 # A shard that hits its timeout or lock_timeout is retried on the next run.
@@ -66,11 +77,12 @@ _RETRYABLE = (errors.QueryCanceled, errors.LockNotAvailable)
 log = logging.getLogger(__name__)
 
 
-def _table(rows: Sequence[tuple], shard: int) -> pa.Table:
-    columns = list(zip(*rows, strict=True)) if rows else [[] for _ in CRAWL_COLUMNS]
-    arrays = [pa.array(col, type=CRAWL_SCHEMA.field(i).type) for i, col in enumerate(columns)]
+def _table(rows: Sequence[tuple], shard: int, schema: pa.Schema = CRAWL_SCHEMA) -> pa.Table:
+    width = len(schema) - 1
+    columns = list(zip(*rows, strict=True)) if rows else [[] for _ in range(width)]
+    arrays = [pa.array(col, type=schema.field(i).type) for i, col in enumerate(columns)]
     arrays.append(pa.array([shard] * len(rows), pa.int16()))
-    return pa.Table.from_arrays(arrays, schema=CRAWL_SCHEMA)
+    return pa.Table.from_arrays(arrays, schema=schema)
 
 
 def _shards(cfg: Config, shards: Iterable[int] | None) -> list[int]:
@@ -82,9 +94,9 @@ def _table_name(cfg: Config, shard: int) -> str:
     return cfg.crawlerdb.url_table_fmt.format(shard)
 
 
-def _select_list(cfg: Config) -> str:
+def _select_list(cfg: Config, columns: Sequence[tuple[str, str, int]] = CRAWL_COLUMNS) -> str:
     return ", ".join(f"{expr.format(title_chars=int(cfg.pull.title_chars))} AS {name}"
-                     for name, expr, _ in CRAWL_COLUMNS)
+                     for name, expr, _ in columns)
 
 
 def _table_size(cfg: Config, session: ReadOnlySession, shard: int) -> tuple[int, int]:
@@ -94,11 +106,15 @@ def _table_size(cfg: Config, session: ReadOnlySession, shard: int) -> tuple[int,
     return (max(int(r[0]), 0), int(r[1])) if r is not None else (0, 0)
 
 
+def _timeout_for_bytes(cfg: Config, heap_bytes: float) -> int:
+    g = cfg.guard
+    seconds = math.ceil(heap_bytes / (g.min_mb_s * 1_000_000))
+    return min(max(seconds, g.timeout_floor_s), g.timeout_cap_s)
+
+
 def timeout_for(cfg: Config, relpages: int) -> int:
     """Statement timeout for sampling a table of `relpages` at the worst-case read speed."""
-    g = cfg.guard
-    seconds = math.ceil(relpages * cfg.sample_rate * PAGE_BYTES / (g.min_mb_s * 1_000_000))
-    return min(max(seconds, g.timeout_floor_s), g.timeout_cap_s)
+    return _timeout_for_bytes(cfg, relpages * cfg.sample_rate * PAGE_BYTES)
 
 
 def probe_frozen(cfg: Config, session: ReadOnlySession, now: datetime) -> dict[str, Any]:
@@ -303,3 +319,149 @@ def pull_positives(cfg: Config, session: ReadOnlySession, router: ShardRouter,
         old = read_json(out_dir / "_report.json") or {}
         atomic_write_json(out_dir / "_report.json", {**old, **report})
     return report
+
+
+def _relation_blocks(cfg: Config, session: ReadOnlySession, shard: int) -> int:
+    """Current heap size of a shard table in blocks (not the stale `relpages`); 0 if missing."""
+    (blocks,) = session.fetchone(
+        "SELECT coalesce(pg_relation_size(to_regclass(%s)), 0) "
+        "/ current_setting('block_size')::int8", (_table_name(cfg, shard),))
+    return int(blocks)
+
+
+def full_sql(cfg: Config, shard: int, lo: int, hi: int) -> str:
+    """One COPY over heap blocks [lo, hi): a TID range scan that reads only those blocks."""
+    return (f"COPY (SELECT {_select_list(cfg, FULL_COLUMNS)} FROM {_table_name(cfg, shard)} "
+            f"WHERE ctid >= '({int(lo)},0)'::tid AND ctid < '({int(hi)},0)'::tid "
+            "AND last_fetch_ok IS NOT NULL) TO STDOUT (FORMAT BINARY)")
+
+
+def estimate_full(cfg: Config, session: ReadOnlySession,
+                  shards: Iterable[int] | None = None) -> dict[str, Any]:
+    """Reads only catalog sizes: heap bytes, COPY statements and worst-case hours."""
+    blocks = {s: _relation_blocks(cfg, session, s) for s in _shards(cfg, shards)}
+    heap = sum(blocks.values()) * PAGE_BYTES
+    return {
+        "shards": len(blocks), "heap_bytes": heap,
+        "chunks": sum(math.ceil(b / cfg.full.chunk_blocks) for b in blocks.values()),
+        "chunk_timeout_s": _timeout_for_bytes(cfg, cfg.full.chunk_blocks * PAGE_BYTES),
+        "hours_at_min_mb_s": round(heap / (cfg.guard.min_mb_s * 1_000_000) / 3600, 1),
+        "largest_shard": max(blocks, key=blocks.get) if blocks else None,
+        "blocks": {str(s): b for s, b in blocks.items()},
+    }
+
+
+def _check_disk(cfg: Config, path: Path) -> None:
+    free = shutil.disk_usage(path).free
+    if free < cfg.full.min_free_gb * 1e9:
+        raise RuntimeError(f"only {free / 1e9:.0f} GB free under {path}; "
+                           f"full.min_free_gb is {cfg.full.min_free_gb:.0f}")
+
+
+def _export_file(cfg: Config, session: ReadOnlySession, final: Path, shard: int,
+                 lo: int, hi: int) -> int:
+    """Streams blocks [lo, hi) of one shard into `final`, one COPY per chunk."""
+    span = cfg.full.chunk_blocks
+    with AtomicParquetWriter(final, FULL_SCHEMA) as writer:
+        for c_lo in range(lo, hi, span):
+            c_hi = min(c_lo + span, hi)
+            session.set_statement_timeout(_timeout_for_bytes(cfg, (c_hi - c_lo) * PAGE_BYTES))
+            buffer: list[tuple] = []
+            for row in session.copy_rows(full_sql(cfg, shard, c_lo, c_hi), _FULL_OIDS):
+                buffer.append(row)
+                if len(buffer) >= _BATCH_ROWS:
+                    writer.write(_table(buffer, shard, FULL_SCHEMA))
+                    buffer = []
+            writer.write(_table(buffer, shard, FULL_SCHEMA))
+    return writer.rows
+
+
+def _export_shard(cfg: Config, session: ReadOnlySession, out_dir: Path, shard: int,
+                  extents: list[list[int]], save: Any) -> int:
+    """Exports every extent of a shard as files of `chunks_per_file` chunks; skips done files.
+
+    Pages appended while the export runs become one more extent, so rows that
+    moved to the end of the heap are still read.
+    """
+    span = cfg.full.chunk_blocks * cfg.full.chunks_per_file
+    shard_dir = out_dir / f"shard={shard:03d}"
+    rows, i = 0, 0
+    while i < len(extents):
+        lo, hi = extents[i]
+        for f_lo in range(lo, hi, span):
+            f_hi = min(f_lo + span, hi)
+            final = shard_dir / f"part-{f_lo:010d}-{f_hi:010d}.parquet"
+            if final.exists():
+                rows += pq.ParquetFile(final).metadata.num_rows
+                continue
+            _check_disk(cfg, out_dir)
+            rows += _export_file(cfg, session, final, shard, f_lo, f_hi)
+        i += 1
+        if i == len(extents):
+            grown = _relation_blocks(cfg, session, shard)
+            if grown > extents[-1][1]:
+                extents.append([extents[-1][1], grown])
+                save()
+    return rows
+
+
+def pull_full(cfg: Config, session: ReadOnlySession, out_dir: Path,
+              shards: Iterable[int] | None = None, now: datetime | None = None) -> dict[str, Any]:
+    """Exports every crawled row into `shard=NNN/part-<lo>-<hi>.parquet`, resumably.
+
+    The first visit of a shard records its heap size in `_meta.json` as a block
+    extent; a resumed run reuses it, so file ranges never move. A shard whose
+    COPY hits its timeout or lock_timeout is recorded in `shards_failed` and
+    resumed by the next run at file granularity. `finished_at` is set once every
+    configured shard is done. The pool filter `last_fetch_ok < as_of` drops rows
+    fetched after the sample's S0, so a later export still scores consistently.
+    """
+    now = now or datetime.now(UTC)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = out_dir / "_meta.json"
+    meta = read_json(meta_path) or {}
+    layout = {"chunk_blocks": cfg.full.chunk_blocks, "chunks_per_file": cfg.full.chunks_per_file}
+    if meta and any(meta.get(k) != v for k, v in layout.items()):
+        raise RuntimeError("the existing export used a different full.chunk_blocks or "
+                           "full.chunks_per_file; finish it with the same config")
+    if "started_at" not in meta:
+        meta.update(layout, started_at=now.isoformat(),
+                    frozen_probe=probe_frozen(cfg, session, now))
+    extents: dict[str, list[list[int]]] = meta.setdefault("extents", {})
+    done = set(meta.get("shards_done", []))
+    failed: dict[str, str] = meta.get("shards_failed", {})
+    todo = [s for s in _shards(cfg, shards) if s not in done]
+
+    def save() -> None:
+        atomic_write_json(meta_path, meta)
+
+    for i, shard in enumerate(todo, start=1):
+        key = str(shard)
+        if key not in extents:
+            extents[key] = [[0, _relation_blocks(cfg, session, shard)]]
+            save()
+        try:
+            rows = _export_shard(cfg, session, out_dir, shard, extents[key], save)
+        except _RETRYABLE as exc:
+            failed[key] = type(exc).__name__
+            log.warning("shard %03d failed (%s); it resumes on the next run",
+                        shard, type(exc).__name__)
+        else:
+            done.add(shard)
+            failed.pop(key, None)
+            meta.setdefault("rows", {})[key] = rows
+            log.info("shard %03d: %d crawled rows (%d/%d)", shard, rows, i, len(todo))
+        meta["shards_done"] = sorted(done)
+        meta["shards_failed"] = failed
+        save()
+    missing = sorted(set(_shards(cfg, None)) - done)
+    if missing:
+        meta.pop("finished_at", None)
+    elif "finished_at" not in meta:
+        finished = datetime.now(UTC)
+        meta.update(finished_at=finished.isoformat(),
+                    end_probe=probe_frozen(cfg, session, finished))
+    save()
+    return {"shards_done": len(done), "shards_missing": len(missing),
+            "shards_failed": sorted(int(s) for s in failed),
+            "rows": sum(meta.get("rows", {}).values())}

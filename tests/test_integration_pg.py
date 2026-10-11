@@ -13,17 +13,22 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import psycopg
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 from conftest import replace
 
 from isel.golden import golden_table, pull_golden
+from isel.io import read_json
 from isel.pg import ReadGuard, ReadOnlyViolation, open_crawlerdb, open_metricdb
 from isel.pull import (
     CRAWL_SCHEMA,
+    FULL_SCHEMA,
     advance_snapshot,
+    estimate_full,
     estimate_sample,
     pull_dims,
+    pull_full,
     pull_positives,
     pull_sample,
 )
@@ -185,3 +190,24 @@ def test_golden_pull_reads_metricdb_tables(cfg, tmp_path):
     assert summary["1"]["head"]["distinct_raw_urls"] == 2
     pool = pq.read_table(tmp_path / "golden" / "pool.parquet").to_pylist()
     assert sorted((r["keyword"], r["tags"]) for r in pool) == [("q1", ["head"]), ("q2", [])]
+
+
+def _files(root):
+    return pa.concat_tables([pq.read_table(p) for p in sorted(root.glob("shard=*/part-*.parquet"))])
+
+
+def test_full_export_reads_every_crawled_row_once(cfg, tmp_path, dsn):
+    cfg = replace(cfg, "full", chunk_blocks=1, chunks_per_file=3, min_free_gb=0.0)
+    session = _session(cfg)
+    try:
+        assert estimate_full(cfg, session)["chunks"] > SHARDS
+        out = pull_full(cfg, session, tmp_path / "export", now=ALLOWED)
+    finally:
+        session.close()
+    exported = _files(tmp_path / "export")
+    crawled = [u for n, u in enumerate(_urls()) if n % 10 != 0]
+    assert out["shards_missing"] == 0 and out["rows"] == exported.num_rows == len(crawled)
+    assert sorted(exported.column("url").to_pylist()) == sorted(crawled)
+    assert exported.schema.equals(FULL_SCHEMA, check_metadata=False)
+    meta = read_json(tmp_path / "export" / "_meta.json")
+    assert "finished_at" in meta and "end_probe" in meta
