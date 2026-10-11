@@ -37,11 +37,11 @@ from isel.model import (
 )
 
 
-def _store(cfg: Config, work_dir: Path, next_batch: bool = False) -> FeatureStore:
+def open_store(cfg: Config, work_dir: Path, next_batch: bool = False) -> FeatureStore:
     return FeatureStore(cfg, open_duckdb(cfg, work_dir / "duckdb_tmp"), work_dir, next_batch)
 
 
-def _model_name(feature_set: str) -> str:
+def model_name(feature_set: str) -> str:
     return f"lgbm:{feature_set}"
 
 
@@ -62,7 +62,7 @@ def _fit_all(cfg: Config, store: FeatureStore, batches: list[int], feature_sets:
     offset = case_control_offset(store.rate, cfg.dataset.neg_rate)
     official = [store.batch(b) for b in batches if store.batch(b).official]
     valid = max(official, key=lambda b: b.created_at).batch_id if official else None
-    models = {_model_name(fs): fit_lgbm(cfg, m, resolve_set(cfg, fs), offset, valid)
+    models = {model_name(fs): fit_lgbm(cfg, m, resolve_set(cfg, fs), offset, valid)
               for fs in feature_sets}
     if "v1_features" in baselines:
         models["v1_features"] = fit_lgbm(cfg, m, resolve_set(cfg, "v1_features"), offset,
@@ -111,9 +111,9 @@ def _evaluate(cfg: Config, store: FeatureStore, batch: int, models: dict[str, Tr
 def run_backtest(cfg: Config, work_dir: Path, feature_sets: list[str],
                  baselines: list[str]) -> Path:
     """Trains on batches before each test batch and evaluates every scorer on it."""
-    store = _store(cfg, work_dir)
+    store = open_store(cfg, work_dir)
     golden_rows = read_golden(work_dir).to_pylist()
-    reference = _model_name(cfg.model.feature_set)
+    reference = model_name(cfg.model.feature_set)
     if cfg.model.feature_set not in feature_sets:
         feature_sets = [cfg.model.feature_set, *feature_sets]
     rules = [b for b in baselines if b in RULE_BASELINES]
@@ -153,7 +153,7 @@ def run_backtest(cfg: Config, work_dir: Path, feature_sets: list[str],
 
 def train_frozen(cfg: Config, work_dir: Path, baselines: list[str]) -> Path:
     """Trains on every batch visible at the snapshot and saves the models for later."""
-    store = _store(cfg, work_dir, next_batch=True)
+    store = open_store(cfg, work_dir, next_batch=True)
     target = store.batches[-1].batch_id
     train = train_batches(cfg, store, target)
     if not train:
@@ -169,7 +169,7 @@ def train_frozen(cfg: Config, work_dir: Path, baselines: list[str]) -> Path:
     return out
 
 
-def _load_models(model_dir: Path, num_threads: int) -> dict[str, TrainedModel]:
+def load_models(model_dir: Path, num_threads: int) -> dict[str, TrainedModel]:
     models = {}
     for sub in sorted(p for p in model_dir.iterdir() if (p / "meta.json").exists()):
         model = TrainedModel.load(sub, num_threads)
@@ -222,10 +222,11 @@ def forward_eval(cfg: Config, work_dir: Path, model_dirs: list[Path], batch: int
     """
     groups: dict[bool, dict[str, TrainedModel]] = defaultdict(dict)
     for model_dir in model_dirs:
-        for name, model in _load_models(model_dir, cfg.model.num_threads).items():
+        for name, model in load_models(model_dir, cfg.model.num_threads).items():
             use = bool(model.meta.get("use_pseudo", False))
             groups[use][f"{name}+pseudo" if use else name] = model
-    stores = {use: _store(replace(cfg, golden=replace(cfg.golden, use_pseudo=use)), work_dir)
+    stores = {use: open_store(replace(cfg, golden=replace(cfg.golden, use_pseudo=use)),
+                              work_dir)
               for use in groups}
     base_use = False not in stores   # official-only features when present
     base = stores[base_use]
@@ -243,7 +244,7 @@ def forward_eval(cfg: Config, work_dir: Path, model_dirs: list[Path], batch: int
     raw = {name: m.raw_score(frames[use]) for use, models in groups.items()
            for name, m in models.items()}
     rules = [r for r in baselines if r in RULE_BASELINES]
-    reference = _model_name(cfg.model.feature_set)
+    reference = model_name(cfg.model.feature_set)
     reference = reference if reference in raw else next(iter(raw))
     models = {name: m for ms in groups.values() for name, m in ms.items()}
     result, hits, golden = _batch_result(cfg, base, batch, base_frame, models, raw, rules,
@@ -276,9 +277,9 @@ def select_sample(cfg: Config, work_dir: Path, model_dir: Path, k: int) -> dict[
     The rows are the sample rows whose rank is within round(K·p); this exercises
     the manifest contract at sample scale without touching any database.
     """
-    store = _store(cfg, work_dir, next_batch=True)
-    models = _load_models(model_dir, cfg.model.num_threads)
-    model = models[_model_name(cfg.model.feature_set)]
+    store = open_store(cfg, work_dir, next_batch=True)
+    models = load_models(model_dir, cfg.model.num_threads)
+    model = models[model_name(cfg.model.feature_set)]
     target = store.batches[-1].batch_id
     frame = store.frame(target, "eval")
     frame = frame.filter(frame.column("is_sample"))

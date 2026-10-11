@@ -235,3 +235,4 @@ max_temp_directory_size = "50GB"
 chunk_blocks = 65536                     # heap blocks per COPY (512 MiB); its timeout is the 120 s floor
 chunks_per_file = 16                     # COPY chunks per Parquet file (8 GiB of heap), the resume unit
 min_free_gb = 150.0                      # stop exporting below this much free work_dir disk
+tau_margin = 0.15                        # score floor = sample score at rank round(K·p·(1 + margin))

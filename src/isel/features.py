@@ -159,6 +159,7 @@ class FeatureStore:
         self.rate = float(meta["sample_percent"]) / 100.0
         self.snapshot_at = datetime.fromisoformat(meta["snapshot_at"])
         self.batches: list[Batch] = []
+        self._keyer: DomainKeyer | None = None
         self._prepare(next_batch)
 
     def _files(self, pattern: str) -> list[str]:
@@ -216,7 +217,7 @@ class FeatureStore:
             f"lower(regexp_extract(g.canonical_url, {sql_str(HOST_RE)}, 1)) AS host, "
             f"regexp_extract(g.canonical_url, {sql_str(PATH_RE)}, 1) AS path "
             f"FROM read_parquet({golden}) g SEMI JOIN batches b USING (batch_id)")
-        self._host_keys()
+        self._host_keys("SELECT DISTINCT host FROM crawl0 UNION SELECT DISTINCT host FROM gold0")
         self._key_columns("crawl", "crawl0")
         self._key_columns("gold", "gold0")
         con.execute(
@@ -236,25 +237,34 @@ class FeatureStore:
             "ON s.created_at < d.created_at AND s.available_at <= d.as_of")
         self._aggregates()
 
-    def _host_keys(self) -> None:
-        split = self.work_dir / "dims" / "split_hosts.parquet"
-        hosts = [] if not split.exists() else self.con.execute(
-            f"SELECT host FROM read_parquet({sql_str(str(split))})").fetchall()
-        keyer = DomainKeyer([h for (h,) in hosts], offline=self.cfg.routing.tldextract_offline)
-        distinct = [h for (h,) in self.con.execute(
-            "SELECT DISTINCT host FROM crawl0 UNION SELECT DISTINCT host FROM gold0").fetchall()]
+    def _domain_keyer(self) -> DomainKeyer:
+        if self._keyer is None:
+            split = self.work_dir / "dims" / "split_hosts.parquet"
+            hosts = [] if not split.exists() else self.con.execute(
+                f"SELECT host FROM read_parquet({sql_str(str(split))})").fetchall()
+            self._keyer = DomainKeyer([h for (h,) in hosts],
+                                      offline=self.cfg.routing.tldextract_offline)
+        return self._keyer
+
+    def _host_keys(self, hosts_sql: str) -> None:
+        keyer = self._domain_keyer()
+        distinct = [h for (h,) in self.con.execute(hosts_sql).fetchall()]
         keys = [keyer.key_for_host(h or "") for h in distinct]
-        table = pa.table({"host": distinct, "dkey": keys})
+        # Typed, so an empty export file still joins with the VARCHAR aggregate keys.
+        table = pa.table({"host": pa.array(distinct, pa.string()),
+                          "dkey": pa.array(keys, pa.string())})
         self.con.register("host_keys_arrow", table)
         self.con.execute("CREATE OR REPLACE TEMP TABLE host_keys AS SELECT * FROM host_keys_arrow")
         self.con.unregister("host_keys_arrow")
 
     def _key_columns(self, name: str, source: str) -> None:
+        """Moves `source` into `name` with the key columns; `source` is dropped to free memory."""
         self.con.execute(
             f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT s.*, k.dkey, "
             "s.host || '/' || regexp_extract(s.path, '^/([^/]*)', 1) AS hp, "
             "regexp_extract(s.host, '([^.]+)$', 1) AS tld "
             f"FROM {source} s LEFT JOIN host_keys k USING (host)")
+        self.con.execute(f"DROP TABLE {source}")
 
     def _aggregates(self) -> None:
         """Per-level exposure, hits and demand, decayed into each destination batch."""
@@ -306,6 +316,23 @@ class FeatureStore:
             "JOIN batches s ON s.batch_id = p.src JOIN batches d ON d.batch_id = p.dst "
             "GROUP BY ALL")
 
+    def load_chunk(self, path: Path) -> None:
+        """Replaces the crawl rows with one full-export file and keeps the sample aggregates.
+
+        The aggregate tables were built from the sample in `_prepare`, as for
+        training, and every feature is a per-row value or a lookup into them,
+        so `frame_sql(..., "score")` gives each row exactly the features it
+        would get as a sample row, whichever file it came in.
+        """
+        # The file sits under a shard=NNN/ directory; its own shard column is the truth.
+        self.con.execute(
+            "CREATE OR REPLACE TEMP TABLE crawl0 AS SELECT *, false AS is_sample, "
+            f"lower(regexp_extract(url, {sql_str(HOST_RE)}, 1)) AS host, "
+            f"regexp_extract(url, {sql_str(PATH_RE)}, 1) AS path, md5_number_lower(url) AS h "
+            f"FROM read_parquet({sql_str(str(path))}, hive_partitioning = false)")
+        self._host_keys("SELECT DISTINCT host FROM crawl0")
+        self._key_columns("crawl", "crawl0")
+
     def batch(self, batch_id: int) -> Batch:
         for b in self.batches:
             if b.batch_id == batch_id:
@@ -356,18 +383,20 @@ class FeatureStore:
             mode: "eval" keeps every sample row in the pool plus the batch's golden
                 rows; "train" keeps the golden rows plus a hashed subsample of the
                 other sample rows at rate `dataset.neg_rate`, ordered by (url, shard)
-                because LightGBM bagging picks rows by position.
+                because LightGBM bagging picks rows by position; "score" keeps
+                every crawl row in the pool (after `load_chunk`).
         """
-        if mode not in ("eval", "train"):
+        if mode not in ("eval", "train", "score"):
             raise ValueError(f"unknown mode {mode!r}")
         order = "ORDER BY c.url, c.shard" if mode == "train" else ""
         b = self.batch(batch_id)
         a = float(self.cfg.features.eb_pseudo_hits)
         ppm = round(self.cfg.dataset.neg_rate * 1_000_000)
         salt = sql_str(f"{self.cfg.dataset.neg_salt}:{batch_id}")
-        keep = ("(l.url IS NOT NULL OR c.is_sample)" if mode == "eval" else
-                f"(l.url IS NOT NULL OR (c.is_sample AND "
-                f"md5_number_lower(c.url || {salt}) % 1000000 < {ppm}))")
+        keep = {"eval": "(l.url IS NOT NULL OR c.is_sample)",
+                "train": f"(l.url IS NOT NULL OR (c.is_sample AND "
+                         f"md5_number_lower(c.url || {salt}) % 1000000 < {ppm}))",
+                "score": "true"}[mode]
         rate = self.rate
         return f"""
 WITH base AS (
