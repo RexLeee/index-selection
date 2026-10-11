@@ -71,7 +71,7 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 | `models/<id>/` | 凍結的 LightGBM 模型和 meta | `train` |
 | `forward_evals/batch=<b>_<id>/` | 前瞻評估結果 | `forward-eval` |
 | `selection/run=<id>/` | manifest 和 delta | `select-sample` |
-| `full/export/shard=NNN/part-<lo>-<hi>.parquet`、`_meta.json` | 全部已爬列，依 heap block 範圍分檔；`_meta.json` 記錄每個 shard 的 block 範圍、`frozen_probe` 和 `end_probe` | `pull-full` |
+| `full/export/shard=NNN/part-<lo>-<hi>.parquet`、`_meta.json` | 全部已爬列，依 heap block 範圍分檔；`_meta.json` 記錄每個 shard 的 block 範圍、`frozen_probe`、`end_probe`，以及每個 shard 期間的全叢集 WAL 和寫入量（`io`） | `pull-full` |
 | `full/scored/shard=NNN.parquet`、`_meta.json` | 分數 ≥ τ 的列（url、shard、h、score）；`_meta.json` 記錄模型、K、τ | `score-full` |
 | `full/selection/run=<id>/selected.parquet`、`_meta.json` | 精確的 top-K（url、score）；`_meta.json` 最後寫 | `select-full` |
 
@@ -359,7 +359,9 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 | 資料不完整 | `FeatureStore` 拒絕三種狀況：sample 沒有 `finished_at`、任何 batch 缺 `positives/batch=<id>.parquet`、同一個 batch id 同時有官方和偽 golden 列 |
 | 憑證外洩 | DSN 只放環境變數，或放在 `<NAME>_FILE` 指向的 secret 檔（容器用這種）；所有 JSON 輸出經過 `assert_no_secrets` |
 | 寫入 selectdb | 只有 `publish.py` 會寫 DB。連線前，DSN 的 port 若在 `selectdb.forbidden_ports`（5432、5433、5444）就拒絕；連上後，資料庫若有 `url_state_current_000` 或 `metric_url` 也拒絕。`verify-live` 用 `default_transaction_read_only=on` 的讀者連線 |
-| 全量讀取 | `pull-full` 每塊一條 `COPY`，只讀 `chunk_blocks` 個 heap block（TID range scan）。每塊 512 MiB，逾時取下限 120 秒，所以每個禁讀時段前只保留 2 分鐘。逾時依區塊大小計算，照樣經過 SQL gate、`ReadGuard` 和限速。heap 大小用 `pg_relation_size` 量，不用過期的 `relpages`；匯出途中新增的頁面會補成新的範圍 |
+| 全量讀取 | `pull-full` 每塊一條 `COPY`，只讀 `chunk_blocks` 個 heap block（TID range scan）。每塊 512 MiB，逾時取下限 120 秒，所以每個禁讀時段前只保留 2 分鐘。逾時依區塊大小計算，照樣經過 SQL gate、`ReadGuard` 和限速。heap 大小用 `pg_relation_size` 量，不用過期的 `relpages`；匯出途中新增的頁面會補成新的範圍。輸出用 `FORMAT CSV`：pyarrow 在 C++ 解析，另一條執行緒寫 Parquet，下一塊同時在傳。CSV 的文字由 `crawlerdb.session` 的 `datestyle`、`extra_float_digits`、`client_encoding` 固定，設定檢查會擋住其他值。每個 shard 前後讀 `pg_stat_wal` 和 `pg_stat_io`，差值寫進 `_meta.json` 的 `io`。這是全叢集的數字，要和沒在讀的時段比較 |
+| 多條連線 | 助教同意後（2026-10-11），`pull-full` 開 `full.connections` 條連線（預設 4），各自從共用佇列取整個 shard，`_meta.json` 的讀寫加鎖。每條連線有自己的 `ReadGuard`。IO 探測排除同一個 `application_name` 的連線，所以只數別人的 IO 等待：評分程式被我們拖慢時才會暫停。所有連線共用一個 `ByteRate`，每塊開讀前預約 heap 位元組，合計不超過 `full.max_heap_mb_s`（預設 2,000 MB/s），閒置不累積額度。依據：Host1 有 144 個執行緒，平常 CPU 只用 5.5–7.5%；Metric 整點掃描讀 7–8 GB/s 時 await 仍低於 1 ms，2 GB/s 約是它的 1/4。任一連線發生非重試型錯誤，其他連線做完手上的 shard 就停，錯誤往外拋 |
+| 讀取對 DB 的影響 | 2026-10-11 的 catalog：Metric 每小時用 16 條連線對 256 個表各跑一次 `count(*)`（`CrawlerStatusMeasure.py`），每個表約每小時被 seq scan 1.75 次。hint bit 和 on-access pruning 都已由它做掉；`data_checksums`、`wal_log_hints` 都關，補 hint bit 也不寫 WAL。所以全量讀取幾乎不增加寫入。TID range scan 不用 buffer ring（PG16 `tableam.h`），會流過 `shared_buffers`；小於 `shared_buffers`/4（32 GB）的表用 seq scan 也一樣，而每小時的掃描本來就在輪替快取。`last_fetch_ok` 沒有索引，約 97% 的頁至少有一列已爬，所以 bitmap scan 不划算 |
 
 ---
 
@@ -529,8 +531,8 @@ $J verify-live --batch 20
 
 | 項目 | 估計 | 依據 |
 |---|---|---|
-| crawlerdb heap | 約 3.4–4.9 TB | 3.4 TB 是 10-09 的 `relpages`（4.14 億頁），4.9 TB 是 10-05 的 `url_state_current` 大小；`pull-full --dry-run` 會給實際值 |
-| 匯出時間 | 3.4 TB 時約 3–20 小時 | 單連線 67–440 MB/s；禁讀時段和探測讓約 28% 的時間不能讀（repo 的 `next_allowed_start` 模擬）。第一個 shard 量完再定 |
+| crawlerdb heap | 3.43 TB | 2026-10-11 的 `pg_relation_size` 總和（4.17 億頁，75% all-visible，每頁約 16 列）；`pull-full --dry-run` 會再量一次 |
+| 匯出時間 | 4 條連線約 40–80 分鐘（信心低） | 單一連線推估 2–3 小時：本機 CSV 路徑比 binary 快 2.65 倍，每塊約 0.7–1.1 秒。本機 4 個 shard 表：4 條連線比 1 條快 1.85 倍（伺服器和用戶端搶同一台 Mac 的 CPU）；300 MB/s 上限時實測 294 MB/s。Host1 上 4 條連線的上限是 2 GB/s，3.43 TB 約 29 分鐘，再加上禁讀時段和探測（約 28%）。每個檔的 log 有 heap MB/s，第一批 shard 量完再定 |
 | 匯出檔 | 約 90 GB | 約 16 億列 × 每列約 55 B（V2 量測） |
 | 打分結果 | 約 1.5 億列，約 12 GB | τ 只留約 K·(1 + `tau_margin`) 列 |
 | `score-full` 記憶體 | 峰值約 10 GB | Mac 實測，用真實的 1% sample（1,648 萬列）。峰值出現在估 τ 時；之後每次只載入一個匯出檔（8 GiB heap，約 350 萬列）。若一次載入整個 shard，最大的 shard 約 3,500 萬列，估計峰值約 63 GB，接近 64 GiB 上限 |

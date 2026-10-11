@@ -52,7 +52,8 @@ uv run isel $C validate-manifest --run-dir work/selection/run=<id>
 
 # milestone 2 on Host2: J="docker compose -f deploy/compose.compute.yaml run --rm isel"
 $J pull-full --dry-run                          # catalog only: heap size, chunks, worst-case hours
-$J pull-full                                    # every crawled row, ctid chunks, guarded; resumable
+$J pull-full                                    # every crawled row, ctid chunks, 4 guarded sessions
+                                               # capped at full.max_heap_mb_s together; resumable
 $J score-full --model-dir /work/models/<M0>     # sample aggregates + frozen model; keeps score >= tau
 $J select-full                                  # exact top-K distinct URLs
 $J init-selectdb                                # once: tables and the metric's reader role
