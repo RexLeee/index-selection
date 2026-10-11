@@ -1,4 +1,4 @@
-"""The read path against a throwaway local `postgres:16` container.
+"""The read and selectdb paths against a throwaway local `postgres:16` container.
 
 Run with `uv run pytest -m integration`. Nothing here touches a course server:
 the container listens on 127.0.0.1 only and is removed when the module ends.
@@ -19,8 +19,17 @@ import pytest
 from conftest import replace
 
 from isel.golden import golden_table, pull_golden
-from isel.io import read_json
+from isel.io import atomic_write_json, read_json, write_parquet_atomic
 from isel.pg import ReadGuard, ReadOnlyViolation, open_crawlerdb, open_metricdb
+from isel.publish import (
+    ForbiddenTarget,
+    connect_selectdb,
+    init_selectdb,
+    load_selection,
+    rollback,
+    swap,
+    verify_live,
+)
 from isel.pull import (
     CRAWL_SCHEMA,
     FULL_SCHEMA,
@@ -211,3 +220,85 @@ def test_full_export_reads_every_crawled_row_once(cfg, tmp_path, dsn):
     assert exported.schema.equals(FULL_SCHEMA, check_metadata=False)
     meta = read_json(tmp_path / "export" / "_meta.json")
     assert "finished_at" in meta and "end_probe" in meta
+
+
+OPEN = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
+FROZEN = datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def selectdb(cfg, dsn, monkeypatch):
+    """A fresh database in the throwaway container standing in for our selectdb."""
+    name = f"selectdb_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f'CREATE DATABASE "{name}"')
+    server = dsn.rsplit("/", 1)[0]
+    password = uuid.uuid4().hex
+    monkeypatch.setenv(cfg.selectdb.admin_dsn_env, f"{server}/{name}")
+    monkeypatch.setenv(cfg.selectdb.reader_password_env, password)
+    host = server.split("@")[1]
+    monkeypatch.setenv(cfg.selectdb.reader_dsn_env, f"postgresql://select:{password}@{host}/{name}")
+    return cfg
+
+
+def _selection(work, run_id, urls):
+    run = work / "full" / "selection" / f"run={run_id}"
+    write_parquet_atomic(pa.table({"url": urls, "score": [float(len(urls) - i)
+                                                          for i in range(len(urls))]}),
+                         run / "selected.parquet")
+    atomic_write_json(run / "_meta.json", {
+        "run_id": run_id, "k": len(urls), "rows": len(urls), "candidates": len(urls),
+        "boundary_score": 1.0, "tau": 0.0, "model_dir": "/work/models/m0",
+        "snapshot_at": "2026-10-09T05:39:22+00:00", "target_batch": 20,
+        "model_meta": {"best_iteration": 7}, "config_sha256": "c", "code_version": "test"})
+    return run
+
+
+def _count(conn, table="selected_urls_current"):
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {table}")
+        return cur.fetchone()[0]
+
+
+def test_publish_swap_freeze_rollback_and_the_metric_query(selectdb, tmp_path):
+    cfg = selectdb
+    first_urls = ["https://site1.com/p1", "https://a.example/x?q=1,2", 'https://b.example/"q"']
+    admin = connect_selectdb(cfg, cfg.selectdb.admin_dsn_env, read_only=False)
+    try:
+        init_selectdb(cfg, admin)
+        first = load_selection(cfg, admin, _selection(tmp_path, "r1", first_urls), tmp_path)
+        assert _count(admin) == 0                       # loaded, not visible yet
+        assert swap(cfg, admin, first["db_run_id"], now=lambda: OPEN)["swapped"]
+        assert _count(admin) == 3
+        second = load_selection(cfg, admin, _selection(
+            tmp_path, "r2", ["https://site2.com/p2", "https://site1.com/p1"]), tmp_path)
+        frozen = swap(cfg, admin, second["db_run_id"], now=lambda: FROZEN)
+        assert frozen == {"swapped": False, "reason": "swap freeze window", "retry": True}
+        assert swap(cfg, admin, second["db_run_id"], now=lambda: OPEN)["swapped"]
+        assert _count(admin) == 2
+        assert rollback(cfg, admin)["live_run"] == first["db_run_id"]
+        assert _count(admin) == 3
+    finally:
+        admin.close()
+    write_parquet_atomic(golden_table([
+        (20, OPEN, 1, "q", 1, ["head"], 1, "https://site1.com/p1"),
+        (20, OPEN, 1, "q", 1, ["head"], 2, "https://a.example/x?q=1,2"),
+        (20, OPEN, 2, "r", 1, ["head"], 1, "https://nowhere.example/")]),
+        tmp_path / "golden" / "golden.parquet")
+    result = verify_live(cfg, tmp_path, 20)
+    head = result["tags"]["head"]
+    assert head["golden_urls"] == 3 and head["indexed"] == 2
+    assert head["indexed_exact_rate"] == pytest.approx(2 / 3)
+    assert [r["run_label"] for r in result["live_runs"]] == ["r1"]
+    reader = connect_selectdb(cfg, cfg.selectdb.reader_dsn_env, read_only=True)
+    try:
+        with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+            reader.execute("DELETE FROM selected_urls_current")
+    finally:
+        reader.close()
+
+
+def test_writes_refuse_a_database_with_crawler_tables(selectdb, dsn, monkeypatch):
+    monkeypatch.setenv(selectdb.selectdb.admin_dsn_env, dsn)   # holds url_state_current_000
+    with pytest.raises(ForbiddenTarget, match="crawler or metric tables"):
+        connect_selectdb(selectdb, selectdb.selectdb.admin_dsn_env, read_only=False)

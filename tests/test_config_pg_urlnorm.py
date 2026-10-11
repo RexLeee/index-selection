@@ -51,6 +51,9 @@ def test_base_config_loads(base_cfg):
     ("[guard]\nmonth_window = ['20:00', '00:00']\n", "wrap"),
     ("[guard]\nmonth_window = ['00:00', '25:00']\n", "HH:MM"),
     ("[full]\nchunk_blocks = 1000000\n", "readable at guard.min_mb_s"),
+    ("[selectdb]\nadmin_dsn_env = 'ISEL_CRAWLERDB_DSN'\n", "must differ"),
+    ("[selectdb]\nforbidden_ports = []\n", "forbidden_ports"),
+    ("[schedule]\nswap_freeze_window = ['20:00', '11:30']\n", "swap_freeze_window"),
     # num_threads = 0 lets OpenMP start one thread per host CPU, past the container quota.
     ("[model.params]\nnum_threads = 0\n", "num_threads must be an integer > 0"),
     ("[model.params]\nnum_threads = 2.5\n", "num_threads must be an integer > 0"),
