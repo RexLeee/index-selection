@@ -5,7 +5,13 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from conftest import FakeConn
 
-from isel.pg import ReadGuard, ReadOnlySession, next_allowed_start, next_forbidden_window
+from isel.pg import (
+    ByteRate,
+    ReadGuard,
+    ReadOnlySession,
+    next_allowed_start,
+    next_forbidden_window,
+)
 
 
 def t(text: str) -> datetime:
@@ -111,7 +117,9 @@ def test_session_runs_statements_only_inside_read_windows(base_cfg):
     assert main == [t("2026-10-08 06:10") + timedelta(seconds=2)]
     probes = [text for text, _ in conn.executed if "pg_stat_activity" in text]
     assert len(probes) == base_cfg.guard.probes
-    assert all("pg_backend_pid()" in text for text in probes)
+    # Our other connections share the application name; their reads are not load.
+    assert all("application_name <> current_setting('application_name')" in text
+               for text in probes)
 
 
 def test_window_is_checked_again_after_the_load_probe(base_cfg):
@@ -136,3 +144,16 @@ def test_guard_reuses_a_fresh_load_reading(base_cfg):
     guard.wait(60)
     guard.wait(60)
     assert len(calls) == g.probes
+
+
+def test_byte_rate_spaces_reads_without_saving_idle_credit():
+    clock = FakeClock(t("2026-10-08 05:20"))
+    rate = ByteRate(100.0, clock=lambda: clock.mono, sleep=clock.sleep)
+    starts = []
+    for n_bytes, idle_s in [(100, 0), (100, 0), (50, 0), (100, 10), (100, 0)]:
+        clock.sleep(idle_s)
+        rate.wait(n_bytes)
+        starts.append(clock.mono)
+    # 100 B/s: back-to-back reservations wait for the previous slot; ten idle
+    # seconds earn no burst, so the read after them waits again.
+    assert [s - starts[0] for s in starts] == [0.0, 1.0, 2.0, 12.0, 13.0]

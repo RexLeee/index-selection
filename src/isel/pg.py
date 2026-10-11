@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import statistics
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
@@ -51,8 +52,11 @@ _COPY_TAIL = re.compile(r"\s*TO\s+STDOUT\s*(?:(?:WITH\s*)?\([\w\s,'=]*\))?\s*", 
 # Read windows repeat at most monthly, so a search this long finds one if any exists.
 _WINDOW_HORIZON = timedelta(days=32)
 
+# Our parallel export sessions share one application_name; their own IO waits are
+# not load, while other backends slowed by our reads are.
 _IO_WAITERS_SQL = ("SELECT count(*) FROM pg_stat_activity WHERE state = 'active' "
-                   "AND wait_event_type = 'IO' AND pid <> pg_backend_pid()")
+                   "AND wait_event_type = 'IO' "
+                   "AND application_name <> current_setting('application_name')")
 
 
 class ReadOnlyViolation(RuntimeError):
@@ -265,6 +269,32 @@ class Pacer:
         self._last = now
 
 
+class ByteRate:
+    """Spaces reads so that all sessions together read at most `bytes_per_s` on average.
+
+    Each call reserves the next free slot of `n_bytes / bytes_per_s` seconds and
+    sleeps until it starts. Idle time earns no credit, so a pause never ends in a burst.
+    """
+
+    def __init__(self, bytes_per_s: float, clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
+        if bytes_per_s <= 0:
+            raise ValueError(f"bytes_per_s must be > 0, got {bytes_per_s!r}")
+        self._rate = bytes_per_s
+        self._clock = clock
+        self._sleep = sleep
+        self._next: float | None = None
+        self._lock = threading.Lock()
+
+    def wait(self, n_bytes: float) -> None:
+        with self._lock:
+            now = self._clock()
+            start = now if self._next is None else max(now, self._next)
+            self._next = start + n_bytes / self._rate
+        if start > now:
+            self._sleep(start - now)
+
+
 def _forbidden_windows(start: datetime, end: datetime,
                        g: GuardCfg) -> list[tuple[datetime, datetime]]:
     """Every forbidden [from, to) interval that can overlap [start, end]."""
@@ -391,7 +421,7 @@ class ReadOnlySession:
             self.guard.wait(self.timeout_s or 0)
 
     def io_waiters(self) -> int:
-        """Active backends other than this one that are waiting on IO (not guarded)."""
+        """Active backends of other applications waiting on IO (not guarded)."""
         assert_read_only_sql(_IO_WAITERS_SQL)
         with self.conn.cursor() as cur:
             cur.execute(_IO_WAITERS_SQL)

@@ -13,10 +13,12 @@ from __future__ import annotations
 
 import logging
 import math
+import queue
 import shutil
+import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,7 +32,7 @@ from psycopg import errors
 from isel.config import Config
 from isel.features import UNLOADED_COLUMNS
 from isel.io import AtomicParquetWriter, atomic_write_json, read_json, write_parquet_atomic
-from isel.pg import ReadOnlySession
+from isel.pg import ByteRate, ReadOnlySession
 from isel.urlnorm import ShardRouter
 
 BOOL, INT2, INT4, INT8, TEXT, FLOAT8, TSTZ = 16, 21, 23, 20, 25, 701, 1184
@@ -394,7 +396,7 @@ def _check_disk(cfg: Config, path: Path) -> None:
 
 
 def _export_file(cfg: Config, session: ReadOnlySession, final: Path, shard: int,
-                 lo: int, hi: int) -> int:
+                 lo: int, hi: int, rate: ByteRate) -> int:
     """Streams blocks [lo, hi) of one shard into `final`, one COPY per chunk.
 
     A worker thread parses and writes each chunk while the next COPY streams;
@@ -407,6 +409,7 @@ def _export_file(cfg: Config, session: ReadOnlySession, final: Path, shard: int,
         for c_lo in range(lo, hi, span):
             c_hi = min(c_lo + span, hi)
             session.set_statement_timeout(_timeout_for_bytes(cfg, (c_hi - c_lo) * PAGE_BYTES))
+            rate.wait((c_hi - c_lo) * PAGE_BYTES)
             data = session.copy_bytes(full_sql(cfg, shard, c_lo, c_hi))
             if pending is not None:
                 pending.result()
@@ -420,7 +423,8 @@ def _export_file(cfg: Config, session: ReadOnlySession, final: Path, shard: int,
 
 
 def _export_shard(cfg: Config, session: ReadOnlySession, out_dir: Path, shard: int,
-                  extents: list[list[int]], save: Any) -> int:
+                  extents: list[list[int]], grow: Callable[[int, int], None],
+                  rate: ByteRate) -> int:
     """Exports every extent of a shard as files of `chunks_per_file` chunks; skips done files.
 
     Pages appended while the export runs become one more extent, so rows that
@@ -438,28 +442,34 @@ def _export_shard(cfg: Config, session: ReadOnlySession, out_dir: Path, shard: i
                 rows += pq.ParquetFile(final).metadata.num_rows
                 continue
             _check_disk(cfg, out_dir)
-            rows += _export_file(cfg, session, final, shard, f_lo, f_hi)
+            rows += _export_file(cfg, session, final, shard, f_lo, f_hi, rate)
         i += 1
         if i == len(extents):
             grown = _relation_blocks(cfg, session, shard)
             if grown > extents[-1][1]:
-                extents.append([extents[-1][1], grown])
-                save()
+                grow(extents[-1][1], grown)
     return rows
 
 
-def pull_full(cfg: Config, session: ReadOnlySession, out_dir: Path,
-              shards: Iterable[int] | None = None, now: datetime | None = None) -> dict[str, Any]:
+def pull_full(cfg: Config, sessions: Sequence[ReadOnlySession], out_dir: Path,
+              shards: Iterable[int] | None = None, now: datetime | None = None,
+              rate: ByteRate | None = None) -> dict[str, Any]:
     """Exports every crawled row into `shard=NNN/part-<lo>-<hi>.parquet`, resumably.
 
-    The first visit of a shard records its heap size in `_meta.json` as a block
+    Each session takes whole shards from a shared queue and keeps its own read
+    guard; one `ByteRate` caps the heap bytes all of them read per second. The
+    first visit of a shard records its heap size in `_meta.json` as a block
     extent; a resumed run reuses it, so file ranges never move. A shard whose
     COPY hits its timeout or lock_timeout is recorded in `shards_failed` and
-    resumed by the next run at file granularity. `finished_at` is set once every
-    configured shard is done. The pool filter `last_fetch_ok < as_of` drops rows
-    fetched after the sample's S0, so a later export still scores consistently.
+    resumed by the next run at file granularity. Any other error stops every
+    session after its current shard and is raised. `finished_at` is set once
+    every configured shard is done. The pool filter `last_fetch_ok < as_of`
+    drops rows fetched after the sample's S0, so a later export still scores
+    consistently.
     """
     now = now or datetime.now(UTC)
+    first = sessions[0]
+    rate = rate or ByteRate(cfg.full.max_heap_mb_s * 1e6)
     out_dir.mkdir(parents=True, exist_ok=True)
     meta_path = out_dir / "_meta.json"
     meta = read_json(meta_path) or {}
@@ -469,48 +479,83 @@ def pull_full(cfg: Config, session: ReadOnlySession, out_dir: Path,
                            "full.chunks_per_file; finish it with the same config")
     if "started_at" not in meta:
         meta.update(layout, started_at=now.isoformat(),
-                    frozen_probe=probe_frozen(cfg, session, now))
+                    frozen_probe=probe_frozen(cfg, first, now))
     extents: dict[str, list[list[int]]] = meta.setdefault("extents", {})
     done = set(meta.get("shards_done", []))
-    failed: dict[str, str] = meta.get("shards_failed", {})
-    todo = [s for s in _shards(cfg, shards) if s not in done]
+    failed: dict[str, str] = meta.setdefault("shards_failed", {})
+    meta.setdefault("shards_done", sorted(done))
+    todo: queue.Queue[int] = queue.Queue()
+    for shard in _shards(cfg, shards):
+        if shard not in done:
+            todo.put(shard)
+    total = todo.qsize()
+    lock = threading.Lock()   # guards `meta` and its file
+    stop = threading.Event()
 
     def save() -> None:
-        atomic_write_json(meta_path, meta)
+        with lock:
+            atomic_write_json(meta_path, meta)
 
-    pa.set_cpu_count(cfg.full.parse_threads)
-    for i, shard in enumerate(todo, start=1):
+    def export(session: ReadOnlySession, shard: int) -> None:
         key = str(shard)
         if key not in extents:
-            extents[key] = [[0, _relation_blocks(cfg, session, shard)]]
+            blocks = _relation_blocks(cfg, session, shard)
+            with lock:
+                extents[key] = [[0, blocks]]
             save()
+
+        def grow(lo: int, hi: int) -> None:
+            with lock:
+                extents[key].append([lo, hi])
+            save()
+
         before, start = _io_counters(session), time.monotonic()
         try:
-            rows = _export_shard(cfg, session, out_dir, shard, extents[key], save)
+            rows = _export_shard(cfg, session, out_dir, shard, extents[key], grow, rate)
         except _RETRYABLE as exc:
-            failed[key] = type(exc).__name__
+            with lock:
+                failed[key] = type(exc).__name__
             log.warning("shard %03d failed (%s); it resumes on the next run",
                         shard, type(exc).__name__)
         else:
-            done.add(shard)
-            failed.pop(key, None)
-            meta.setdefault("rows", {})[key] = rows
             after = _io_counters(session)
             io = {"seconds": round(time.monotonic() - start),
                   **{k: after[k] - before[k] for k in after}}
-            meta.setdefault("io", {})[key] = io
-            log.info("shard %03d: %d crawled rows (%d/%d); cluster-wide during it: %s",
-                     shard, rows, i, len(todo), io)
-        meta["shards_done"] = sorted(done)
-        meta["shards_failed"] = failed
+            with lock:
+                done.add(shard)
+                failed.pop(key, None)
+                meta.setdefault("rows", {})[key] = rows
+                meta.setdefault("io", {})[key] = io
+                meta["shards_done"] = sorted(done)
+                finished = len(done)
+            log.info("shard %03d: %d crawled rows (%d done in total, %d queued this run); "
+                     "cluster-wide during it: %s", shard, rows, finished, total, io)
         save()
+
+    def work(session: ReadOnlySession) -> None:
+        try:
+            while not stop.is_set():
+                try:
+                    shard = todo.get_nowait()
+                except queue.Empty:
+                    return
+                export(session, shard)
+        except BaseException:
+            stop.set()
+            raise
+
+    pa.set_cpu_count(cfg.full.parse_threads)
+    with ThreadPoolExecutor(len(sessions), thread_name_prefix="pull-full") as pool:
+        futures = [pool.submit(work, session) for session in sessions]
+    for future in futures:
+        future.result()
     missing = sorted(set(_shards(cfg, None)) - done)
     if missing:
         meta.pop("finished_at", None)
     elif "finished_at" not in meta:
-        finished = datetime.now(UTC)
-        meta.update(finished_at=finished.isoformat(),
-                    end_probe=probe_frozen(cfg, session, finished))
+        finished_at = datetime.now(UTC)
+        meta.update(finished_at=finished_at.isoformat(),
+                    end_probe=probe_frozen(cfg, first, finished_at))
     save()
     return {"shards_done": len(done), "shards_missing": len(missing),
             "shards_failed": sorted(int(s) for s in failed),

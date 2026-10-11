@@ -112,9 +112,12 @@ def cmd_pull_full(cfg: Config, args: argparse.Namespace) -> Any:
 
     out = cfg.work_dir / "full" / "export"
     out.mkdir(parents=True, exist_ok=True)
-    session = open_crawlerdb(cfg)
+    sessions = []
     try:
+        for _ in range(1 if args.dry_run else cfg.full.connections):
+            sessions.append(open_crawlerdb(cfg))
         if args.dry_run:
+            session = sessions[0]
             estimate = estimate_full(cfg, session, _ids(args.shards))
             now = datetime.now(UTC)
             return {**estimate, "io_waiters_now": session.io_waiters(),
@@ -123,9 +126,10 @@ def cmd_pull_full(cfg: Config, args: argparse.Namespace) -> Any:
                                               for t in next_forbidden_window(now, cfg.guard)],
                     "next_chunk_start": next_allowed_start(
                         now, estimate["chunk_timeout_s"], cfg.guard).isoformat()}
-        return pull_full(cfg, session, out, _ids(args.shards))
+        return pull_full(cfg, sessions, out, _ids(args.shards))
     finally:
-        session.close()
+        for session in sessions:
+            session.close()
 
 
 def cmd_advance_snapshot(cfg: Config, args: argparse.Namespace) -> Any:

@@ -213,12 +213,13 @@ def _files(root):
 
 def test_full_export_reads_every_crawled_row_once(cfg, tmp_path, dsn):
     cfg = replace(cfg, "full", chunk_blocks=1, chunks_per_file=3, min_free_gb=0.0)
-    session = _session(cfg)
+    sessions = [_session(cfg), _session(cfg)]
     try:
-        assert estimate_full(cfg, session)["chunks"] > SHARDS
-        out = pull_full(cfg, session, tmp_path / "export", now=ALLOWED)
+        assert estimate_full(cfg, sessions[0])["chunks"] > SHARDS
+        out = pull_full(cfg, sessions, tmp_path / "export", now=ALLOWED)
     finally:
-        session.close()
+        for session in sessions:
+            session.close()
     exported = _files(tmp_path / "export")
     crawled = [u for n, u in enumerate(_urls()) if n % 10 != 0]
     assert out["shards_missing"] == 0 and out["rows"] == exported.num_rows == len(crawled)
@@ -234,7 +235,7 @@ def test_the_csv_full_export_equals_the_binary_sample(cfg, tmp_path):
     session = _session(cfg)
     try:
         pull_sample(cfg, session, tmp_path / "sample", now=ALLOWED)
-        pull_full(cfg, session, tmp_path / "export", now=ALLOWED)
+        pull_full(cfg, [session], tmp_path / "export", now=ALLOWED)
     finally:
         session.close()
     binary = pq.read_table(tmp_path / "sample").select(FULL_SCHEMA.names).cast(FULL_SCHEMA)
