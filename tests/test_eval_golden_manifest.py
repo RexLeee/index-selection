@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from datetime import UTC, datetime
 
 import duckdb
@@ -29,7 +32,7 @@ from isel.golden import (
     read_golden,
     summarize,
 )
-from isel.manifest import ManifestError, to_pg_bigint, validate_run, write_run
+from isel.manifest import ManifestError, _worker_env, to_pg_bigint, validate_run, write_run
 from isel.urlnorm import md5_number_lower
 
 
@@ -225,3 +228,12 @@ def test_the_canonicalize_pool_matches_the_inline_path(tmp_path, base_cfg):
     assert tables[0].column("canonical_url").equals(tables[1].column("canonical_url"))
     rows = tables[0].to_pylist()
     assert sum(r["url"] != r["canonical_url"] for r in rows) == len(range(0, len(urls), 7))
+
+
+def test_canonicalize_workers_start_with_one_blas_thread(monkeypatch):
+    # OpenBLAS starts a thread per CPU in every worker; 16 workers broke a 512-pid limit.
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    spawn = multiprocessing.get_context("spawn")
+    with _worker_env(), ProcessPoolExecutor(1, mp_context=spawn) as pool:
+        assert pool.submit(os.getenv, "OPENBLAS_NUM_THREADS").result() == "1"
+    assert "OPENBLAS_NUM_THREADS" not in os.environ

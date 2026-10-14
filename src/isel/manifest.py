@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import hashlib
 import multiprocessing
+import os
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from concurrent.futures import Future, ProcessPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +93,24 @@ def _respelled(urls: list[str]) -> list[tuple[str, str]]:
     return [(u, c) for u in urls if (c := canonicalize(u)) != u]
 
 
+@contextmanager
+def _worker_env() -> Iterator[None]:
+    """Starts worker processes with one OpenBLAS thread; restores the parent's env after.
+
+    A spawned worker imports numpy, and OpenBLAS starts up to 64 threads in it.
+    Sixteen such workers broke the container's 512-pid limit on Host2.
+    """
+    saved = os.environ.get("OPENBLAS_NUM_THREADS")
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    try:
+        yield
+    finally:
+        if saved is None:
+            del os.environ["OPENBLAS_NUM_THREADS"]
+        else:
+            os.environ["OPENBLAS_NUM_THREADS"] = saved
+
+
 def _canonical_pairs(cfg: Config, con: duckdb.DuckDBPyConnection, rows_sql: str) -> pa.Table:
     """Runs `canonicalize` over every URL, at most two batches per worker in flight."""
     m = cfg.manifest
@@ -104,7 +124,8 @@ def _canonical_pairs(cfg: Config, con: duckdb.DuckDBPyConnection, rows_sql: str)
     else:
         # spawn: the parent holds DuckDB threads, which fork would copy mid-flight.
         context = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(m.canonical_workers, mp_context=context) as pool:
+        with _worker_env(), ProcessPoolExecutor(m.canonical_workers,
+                                                mp_context=context) as pool:
             pending: deque[Future] = deque()
             for urls in batches:
                 pending.append(pool.submit(_respelled, urls))
