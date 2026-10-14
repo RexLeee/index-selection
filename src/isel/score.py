@@ -34,13 +34,13 @@ from isel.features import FeatureStore
 from isel.io import (
     atomic_write_json,
     code_version,
-    copy_atomic,
     open_duckdb,
     read_json,
     sql_str,
     utc_id,
     write_parquet_atomic,
 )
+from isel.manifest import RANK_ORDER, write_run
 from isel.model import TrainedModel
 
 SCORED_SCHEMA = pa.schema([("url", pa.string()), ("shard", pa.int16()), ("h", pa.uint64()),
@@ -208,11 +208,12 @@ def score_full(cfg: Config, work_dir: Path, model_dir: Path, k: int) -> dict[str
 
 
 def select_full(cfg: Config, work_dir: Path, k: int) -> dict[str, Any]:
-    """Writes the exact top-K distinct URLs to `full/selection/run=<id>/selected.parquet`.
+    """Writes the exact top-K distinct URLs as a manifest run under `full/selection/`.
 
-    Order: score desc, URL hash asc, URL asc, the same order as the backtest
-    boundary. A URL found in two shards keeps its best score. `_meta.json` is
-    written last.
+    Order: `RANK_ORDER`, the same order as the backtest boundary. A URL found
+    in two shards keeps its best score and that row's shard. The crawler's
+    `domain_id` comes from the export shard the row was scored in, so the
+    recrawl queue reaches the crawler process that owns the domain.
 
     Raises:
         NotEnoughCandidates: If fewer than K distinct URLs were kept.
@@ -227,24 +228,32 @@ def select_full(cfg: Config, work_dir: Path, k: int) -> dict[str, Any]:
     if k > meta["k"]:
         raise ValueError(f"tau was set for K = {meta['k']}; rerun score-full for K = {k}")
     con = open_duckdb(cfg, work_dir / "duckdb_tmp")
-    best = (f"SELECT url, max(score) AS score, min(h) AS h "
-            f"FROM read_parquet({sql_str(str(scored / 'shard=*.parquet'))}) GROUP BY url")
+    best = (f"SELECT url, score, shard, h "
+            f"FROM read_parquet({sql_str(str(scored / 'shard=*.parquet'))}) "
+            "QUALIFY row_number() OVER (PARTITION BY url ORDER BY score DESC, shard ASC) = 1")
     (candidates,) = con.execute(f"SELECT count(*) FROM ({best})").fetchone()
     if candidates < k:
         raise NotEnoughCandidates(f"only {candidates} URLs scored >= tau, need {k}; "
                                   "raise full.tau_margin and rerun score-full")
+    con.execute(f"CREATE TEMP TABLE top AS SELECT * FROM ({best}) "
+                f"ORDER BY {RANK_ORDER} LIMIT {int(k)}")
+    con.execute("CREATE TEMP TABLE top_routed (url VARCHAR, crawl_shard SMALLINT, "
+                "domain_id BIGINT, score DOUBLE)")
+    export = work_dir / "full" / "export"
+    for (shard,) in con.execute("SELECT DISTINCT shard FROM top ORDER BY 1").fetchall():
+        files = sql_str(str(export / f"shard={shard:03d}" / "part-*.parquet"))
+        con.execute(
+            "INSERT INTO top_routed SELECT t.url, t.shard, e.domain_id, t.score "
+            f"FROM (SELECT * FROM top WHERE shard = {int(shard)}) t LEFT JOIN "
+            f"(SELECT url, min(domain_id) AS domain_id FROM read_parquet({files}, "
+            "hive_partitioning = false) GROUP BY url) e USING (url)")
+    con.execute("DROP TABLE top")
     run_id = utc_id()
-    out = work_dir / "full" / "selection" / f"run={run_id}"
-    selected = out / "selected.parquet"
-    rows = copy_atomic(con, f"SELECT url, score FROM ({best}) "
-                            f"ORDER BY score DESC, h ASC, url ASC LIMIT {int(k)}", selected)
-    (boundary,) = con.execute(
-        f"SELECT min(score) FROM read_parquet({sql_str(str(selected))})").fetchone()
-    result = {"run_id": run_id, "k": k, "rows": rows, "candidates": candidates,
-              "boundary_score": boundary, "tau": meta["tau"], "model_dir": meta["model_dir"],
-              "snapshot_at": meta["snapshot_at"], "target_batch": meta["target_batch"],
-              "model_meta": meta["model_meta"],
-              "config_sha256": cfg.sha256(), "code_version": code_version(),
-              "selected_at": datetime.now(UTC).isoformat()}
-    atomic_write_json(out / "_meta.json", result)
-    return result
+    return write_run(
+        cfg, con, "SELECT url, crawl_shard, domain_id, score, NULL::VARCHAR[] AS reason "
+                  "FROM top_routed",
+        work_dir / "full" / "selection", run_id,
+        {"scope": "full", "k": k, "candidates": candidates, "tau": meta["tau"],
+         "model_dir": meta["model_dir"], "snapshot_at": meta["snapshot_at"],
+         "target_batch": meta["target_batch"], "model_meta": meta["model_meta"],
+         "code_version": code_version(), "selected_at": datetime.now(UTC).isoformat()})

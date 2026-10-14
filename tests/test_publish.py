@@ -4,7 +4,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from isel.publish import ForbiddenTarget, connect_selectdb, swap_allowed
+from isel.publish import swap_allowed
+from isel.selectdb import ForbiddenTarget, connect
 
 
 @pytest.mark.parametrize("now, allowed", [
@@ -28,4 +29,4 @@ def test_swaps_wait_while_the_metric_reads_the_list(base_cfg, now, allowed):
 def test_writes_never_connect_to_forbidden_ports(base_cfg, monkeypatch, dsn):
     monkeypatch.setenv(base_cfg.selectdb.admin_dsn_env, dsn)
     with pytest.raises(ForbiddenTarget, match="forbidden port"):
-        connect_selectdb(base_cfg, base_cfg.selectdb.admin_dsn_env, read_only=False)
+        connect(base_cfg, base_cfg.selectdb.admin_dsn_env, read_only=False)

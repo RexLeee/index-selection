@@ -31,9 +31,8 @@ import pyarrow as pa
 from isel.config import Config
 from isel.golden import OFFICIAL, golden_files
 from isel.io import read_json, sql_str
-from isel.urlnorm import DomainKeyer
+from isel.urlnorm import HOST_RE, DomainKeyer
 
-HOST_RE = r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/?#]*@)?([^:/?#]+)"
 PATH_RE = r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*([^?#]*)"
 # DuckDB threads add a group's rows in no fixed order. DOUBLE sums then differ in
 # the last bits from run to run, while DECIMAL sums are exact (|x| < 1e20).

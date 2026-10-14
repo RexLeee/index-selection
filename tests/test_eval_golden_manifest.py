@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -20,7 +21,8 @@ from isel.golden import (
     read_golden,
     summarize,
 )
-from isel.manifest import ManifestError, validate_run, write_run
+from isel.manifest import ManifestError, to_pg_bigint, validate_run, write_run
+from isel.urlnorm import md5_number_lower
 
 
 def _frame(scores_h_sample_label_url):
@@ -135,26 +137,34 @@ def test_read_golden_adds_pseudo_batches_only_on_request(tmp_path):
         "available_at").to_pylist() == [t2]
 
 
-def _rows(urls, scores):
-    return pa.table({"url": urls, "canonical_url": urls, "domain_key": ["d"] * len(urls),
-                     "crawl_shard": pa.array([1] * len(urls), pa.int16()),
-                     "score": pa.array(scores, pa.float64()),
-                     "reason": pa.array([["x:+1"]] * len(urls), pa.list_(pa.string()))})
+def _write(cfg, urls, scores, sel, run_id):
+    con = duckdb.connect()
+    con.register("rows", pa.table({
+        "url": urls, "crawl_shard": pa.array([1] * len(urls), pa.int16()),
+        "domain_id": pa.array([7] * len(urls), pa.int64()),
+        "score": pa.array(scores, pa.float64()),
+        "reason": pa.array([["x:+1"]] * len(urls), pa.list_(pa.string()))}))
+    return write_run(cfg, con, "SELECT * FROM rows", sel, run_id)
 
 
 def test_manifest_runs_deltas_and_validation(tmp_path, base_cfg):
     cfg = replace(base_cfg, "manifest", index_shards=4)
     sel = tmp_path / "selection"
-    first = write_run(cfg, _rows(["https://a/", "https://b/", "https://c/"], [3, 2, 1]), sel, "r1")
+    first = _write(cfg, ["https://a/", "https://b/", "https://c/"], [3, 2, 1], sel, "r1")
     assert first["parent_run_id"] is None and first["rows"] == 3
-    second = write_run(cfg, _rows(["https://b/", "https://d/"], [5, 4]), sel, "r2")
+    second = _write(cfg, ["https://b/", "https://d/"], [5, 4], sel, "r2")
     assert second["parent_run_id"] == "r1"
     run = sel / "run=r2"
     added = pq.read_table(run / "deltas" / "added.parquet").column("url").to_pylist()
     removed = pq.read_table(run / "deltas" / "removed.parquet").column("url").to_pylist()
     assert added == ["https://d/"] and sorted(removed) == ["https://a/", "https://c/"]
-    manifest = pq.read_table(run / "manifest")
-    assert sorted(manifest.column("rank").to_pylist()) == [1, 2]
+    manifest = pq.read_table(run / "manifest").sort_by("rank")
+    assert manifest.column("url").to_pylist() == ["https://b/", "https://d/"]
+    assert manifest.column("rank").to_pylist() == [1, 2]
+    assert manifest.column("host").to_pylist() == ["b", "d"]
+    assert manifest.column("domain_id").to_pylist() == [7, 7]
+    assert manifest.column("doc_id").to_pylist() == [md5_number_lower(u)
+                                                     for u in ["https://b/", "https://d/"]]
     assert len(list((run / "manifest").glob("index_shard=*.parquet"))) == 4
     assert validate_run(run)["rows"] == 2
     pq.write_table(manifest.slice(0, 1), run / "manifest" / "index_shard=00.parquet")
@@ -162,6 +172,39 @@ def test_manifest_runs_deltas_and_validation(tmp_path, base_cfg):
         validate_run(run)
 
 
-def test_manifest_rejects_duplicate_canonical(tmp_path, base_cfg):
+def test_manifest_rejects_duplicate_urls(tmp_path, base_cfg):
     with pytest.raises(ManifestError, match="duplicate"):
-        write_run(base_cfg, _rows(["https://a/", "https://a/"], [1, 2]), tmp_path, "r1")
+        _write(base_cfg, ["https://a/", "https://a/"], [1, 2], tmp_path, "r1")
+
+
+def test_spellings_of_one_page_share_a_doc_id(tmp_path, base_cfg):
+    # The crawler stored both spellings; canonicalize resolves the dot segment.
+    meta = _write(base_cfg, ["https://a.example/x/./y", "https://a.example/x/y"], [2, 1],
+                  tmp_path, "r1")
+    manifest = pq.read_table(tmp_path / "run=r1" / "manifest")
+    assert meta["rows"] == 2 and meta["docs"] == 1
+    assert set(manifest.column("canonical_url").to_pylist()) == {"https://a.example/x/y"}
+    added = pq.read_table(tmp_path / "run=r1" / "deltas" / "added.parquet")
+    assert added.column("url").to_pylist() == ["https://a.example/x/./y"]   # best-ranked spelling
+
+
+def test_doc_ids_map_to_signed_bigint_and_back():
+    ids = pa.array([0, 2**63 - 1, 2**63, 2**64 - 1], pa.uint64())
+    signed = to_pg_bigint(ids)
+    assert signed.to_pylist() == [0, 2**63 - 1, -(2**63), -1]
+    assert pa.compute.cast(signed, pa.uint64(), safe=False).equals(ids)
+
+
+def test_the_canonicalize_pool_matches_the_inline_path(tmp_path, base_cfg):
+    urls = [f"https://a{i}.example/x/./p{i}" if i % 7 == 0 else f"https://a{i}.example/p{i}"
+            for i in range(3000)]
+    metas = []
+    for workers in (1, 2):
+        cfg = replace(base_cfg, "manifest", canonical_workers=workers, canonical_batch_rows=500)
+        metas.append(_write(cfg, urls, list(range(len(urls))), tmp_path / str(workers), "r1"))
+    assert metas[0]["docs"] == metas[1]["docs"] == len(urls)
+    tables = [pq.read_table(tmp_path / str(w) / "run=r1" / "manifest").sort_by("rank")
+              for w in (1, 2)]
+    assert tables[0].column("canonical_url").equals(tables[1].column("canonical_url"))
+    rows = tables[0].to_pylist()
+    assert sum(r["url"] != r["canonical_url"] for r in rows) == len(range(0, len(urls), 7))

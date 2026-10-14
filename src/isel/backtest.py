@@ -24,7 +24,7 @@ from isel.evaluate import (
 )
 from isel.features import FeatureStore, resolve_set
 from isel.golden import PSEUDO, read_golden
-from isel.io import atomic_write_json, code_version, open_duckdb, utc_id
+from isel.io import atomic_write_json, code_version, open_duckdb, sql_str, utc_id
 from isel.manifest import write_run
 from isel.model import (
     FORWARD_ONLY,
@@ -286,7 +286,8 @@ def select_sample(cfg: Config, work_dir: Path, model_dir: Path, k: int) -> dict[
     """Selects the sample's share of a K-list and writes it as a manifest run.
 
     The rows are the sample rows whose rank is within round(K·p); this exercises
-    the manifest contract at sample scale without touching any database.
+    the manifest contract at sample scale without touching any database. A URL
+    sampled in two shards keeps its best-scored row.
     """
     store = open_store(cfg, work_dir, next_batch=True)
     model = frozen_model(cfg, store, model_dir)
@@ -299,29 +300,24 @@ def select_sample(cfg: Config, work_dir: Path, model_dir: Path, k: int) -> dict[
     order = np.lexsort((h, -scores))
     keep = np.sort(order[:max(1, round(k * store.rate))])
     chosen = frame.take(pa.array(keep))
-    rows = pa.table({
+    store.con.register("chosen_rows", pa.table({
         "url": chosen.column("url"),
-        "canonical_url": chosen.column("url"),
-        "domain_key": chosen.column("dkey"),
         "crawl_shard": chosen.column("shard"),
         "score": pa.array(scores[keep]),
         "reason": pa.array(_reasons(model, chosen, cfg.manifest.reason_top_n),
                            pa.list_(pa.string())),
-    })
-    rows = _dedupe(rows)
-    return write_run(cfg, rows, work_dir / "selection", utc_id(),
-                     {"scope": "sample", "k": k, "sample_rate": store.rate,
-                      "snapshot_at": store.snapshot_at, "model_dir": str(model_dir)})
-
-
-def _dedupe(rows: pa.Table) -> pa.Table:
-    """Keeps the best-scored row per canonical URL (cross-shard duplicates)."""
-    order = pc.sort_indices(rows, sort_keys=[("score", "descending")])
-    rows = rows.take(order)
-    seen: set[str] = set()
-    keep = []
-    for i, url in enumerate(rows.column("canonical_url").to_pylist()):
-        if url not in seen:
-            seen.add(url)
-            keep.append(i)
-    return rows.take(pa.array(keep, pa.int64()))
+    }))
+    sample = sql_str(str(work_dir / "sample" / "shard=*.parquet"))
+    rows_sql = (
+        "SELECT c.url, c.crawl_shard, s.domain_id, c.score, c.reason FROM chosen_rows c "
+        f"LEFT JOIN (SELECT url, shard, min(domain_id) AS domain_id FROM read_parquet({sample}, "
+        "hive_partitioning = false) GROUP BY url, shard) s "
+        "ON s.url = c.url AND s.shard = c.crawl_shard "
+        "QUALIFY row_number() OVER (PARTITION BY c.url ORDER BY c.score DESC, "
+        "c.crawl_shard ASC) = 1")
+    try:
+        return write_run(cfg, store.con, rows_sql, work_dir / "selection", utc_id(),
+                         {"scope": "sample", "k": k, "sample_rate": store.rate,
+                          "snapshot_at": store.snapshot_at, "model_dir": str(model_dir)})
+    finally:
+        store.con.unregister("chosen_rows")

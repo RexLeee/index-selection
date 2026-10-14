@@ -145,7 +145,7 @@ def cmd_pseudo_batch(cfg: Config, args: argparse.Namespace) -> Any:
 
 def cmd_validate_routing(cfg: Config, args: argparse.Namespace) -> Any:
     """Row-weighted share of sample rows whose shard the router predicts."""
-    from isel.features import HOST_RE
+    from isel.urlnorm import HOST_RE
 
     router = _router(cfg)
     con = open_duckdb(cfg, cfg.work_dir / "duckdb_tmp")
@@ -273,25 +273,30 @@ def cmd_score_full(cfg: Config, args: argparse.Namespace) -> Any:
 def cmd_select_full(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.score import select_full
 
-    return select_full(cfg, cfg.work_dir, args.k or cfg.eval.k_headline)
+    meta = select_full(cfg, cfg.work_dir, args.k or cfg.eval.k_headline)
+    return {k: v for k, v in meta.items() if k != "files"}
 
 
 def _with_admin(cfg: Config, action: Any) -> Any:
     """Runs `action(conn)` on an admin connection to our selectdb."""
-    from isel.publish import connect_selectdb
+    from isel.selectdb import connect
 
-    conn = connect_selectdb(cfg, cfg.selectdb.admin_dsn_env, read_only=False)
+    conn = connect(cfg, cfg.selectdb.admin_dsn_env, read_only=False)
     try:
         return action(conn)
     finally:
         conn.close()
 
 
-def cmd_init_selectdb(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.publish import init_selectdb
+def cmd_migrate_selectdb(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.selectdb import init_role, migrate, render_sql
 
-    _with_admin(cfg, lambda conn: init_selectdb(cfg, conn))
-    return {"initialized": True, "reader_role": cfg.selectdb.reader_role}
+    if args.sql:
+        render_sql(args.stamp_baseline, sys.stdout)
+        return None
+    result = _with_admin(cfg, lambda conn: migrate(conn, args.stamp_baseline))
+    _with_admin(cfg, lambda conn: init_role(cfg, conn))
+    return {**result, "reader_role": cfg.selectdb.reader_role}
 
 
 def cmd_publish(cfg: Config, args: argparse.Namespace) -> Any:
@@ -317,6 +322,42 @@ def cmd_verify_live(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.publish import verify_live
 
     return verify_live(cfg, cfg.work_dir, args.batch)
+
+
+def _recrawl(cfg: Config, action: Any, read_only: bool = False) -> Any:
+    """Runs `action(conn)` as admin on a selectdb at the newest schema revision.
+
+    The reader role cannot see `recrawl`, so read-only work uses the admin role
+    in a read-only session.
+    """
+    from isel.selectdb import assert_ready, connect
+
+    conn = connect(cfg, cfg.selectdb.admin_dsn_env, read_only=read_only)
+    try:
+        assert_ready(cfg, conn)
+        return action(conn)
+    finally:
+        conn.close()
+
+
+def cmd_recrawl_sync(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import sync
+
+    return _recrawl(cfg, lambda conn: sync(cfg, conn))
+
+
+def cmd_recrawl_plan(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import capacity_report, run_planner
+
+    if args.dry_run:
+        return _recrawl(cfg, lambda conn: capacity_report(cfg, conn), read_only=True)
+    return _recrawl(cfg, lambda conn: run_planner(cfg, conn, args.once))
+
+
+def cmd_recrawl_archive(cfg: Config, args: argparse.Namespace) -> Any:
+    from isel.recrawl import run_archiver
+
+    return _recrawl(cfg, lambda conn: run_archiver(cfg, conn, args.once))
 
 
 def cmd_validate_manifest(cfg: Config, args: argparse.Namespace) -> Any:
@@ -386,7 +427,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--k", type=int)
     p = sub.add_parser("select-full", help="write the exact top-K list")
     p.add_argument("--k", type=int)
-    sub.add_parser("init-selectdb", help="create tables and the metric's reader role")
+    p = sub.add_parser("migrate-selectdb",
+                       help="bring selectdb to the newest schema revision; set the reader role")
+    p.add_argument("--sql", action="store_true", help="print the DDL instead of running it")
+    p.add_argument("--stamp-baseline", action="store_true",
+                   help="record revision 0001 on a selectdb made before Alembic, then upgrade")
     p = sub.add_parser("publish", help="load a select-full run into a new selectdb table")
     p.add_argument("--run-dir", required=True)
     p = sub.add_parser("swap", help="make a loaded run live")
@@ -394,6 +439,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("rollback", help="make the previous list live again")
     p = sub.add_parser("verify-live", help="indexed rate of a batch under the live list")
     p.add_argument("--batch", type=int, required=True)
+    sub.add_parser("recrawl-sync", help="load the live run into the recrawl frontier")
+    p = sub.add_parser("recrawl-plan", help="write crawler queue files for due docs (loop)")
+    p.add_argument("--once", action="store_true", help="run one cycle and exit")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the per-host capacity report; write nothing")
+    p = sub.add_parser("recrawl-archive", help="apply crawler fetch logs; store WARCs (loop)")
+    p.add_argument("--once", action="store_true", help="run one cycle and exit")
     p = sub.add_parser("validate-manifest")
     p.add_argument("--run-dir", required=True)
     return parser
@@ -420,11 +472,14 @@ COMMANDS = {
     "select-sample": cmd_select_sample,
     "score-full": cmd_score_full,
     "select-full": cmd_select_full,
-    "init-selectdb": cmd_init_selectdb,
+    "migrate-selectdb": cmd_migrate_selectdb,
     "publish": cmd_publish,
     "swap": cmd_swap,
     "rollback": cmd_rollback,
     "verify-live": cmd_verify_live,
+    "recrawl-sync": cmd_recrawl_sync,
+    "recrawl-plan": cmd_recrawl_plan,
+    "recrawl-archive": cmd_recrawl_archive,
     "validate-manifest": cmd_validate_manifest,
 }
 

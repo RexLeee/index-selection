@@ -74,7 +74,15 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 | `selection/run=<id>/` | manifest 和 delta | `select-sample` |
 | `full/export/shard=NNN/part-<lo>-<hi>.parquet`、`_meta.json` | 全部已爬列，依 heap block 範圍分檔；`_meta.json` 記錄每個 shard 的 block 範圍、`frozen_probe`、`end_probe`，以及每個 shard 期間的全叢集 WAL 和寫入量（`io`） | `pull-full` |
 | `full/scored/shard=NNN.parquet`、`_meta.json` | 分數 ≥ τ 的列（url、shard、h、score）；`_meta.json` 記錄模型、K、τ、`kept_check` 和失敗原因（`failed`） | `score-full` |
-| `full/selection/run=<id>/selected.parquet`、`_meta.json` | 精確的 top-K（url、score）；`_meta.json` 最後寫 | `select-full` |
+| `full/selection/run=<id>/` | 精確的 top-K，格式同 §7 的 manifest（`scope = "full"`）；`_MANIFEST.json` 最後寫 | `select-full` |
+
+recrawl 的檔案不在 `/work`，路徑由 `[recrawl]` 設定（Host2 的值見 `config/container.toml`）：
+
+| 路徑 | 內容 | 寫入者 |
+|---|---|---|
+| `/data/ipc/recrawl_queue/crawler_NN/domain_<host_id>.json` | 給 crawler 的 queue 檔，一個 hostname 一個 | `recrawl-plan` |
+| `/data/ipc/recrawl_result/crawler_NN/recrawl-NN-<ts>Z-<seq>.{warc.gz,jsonl}` | crawler 的 WARC 和 fetch log | crawler（`docs/CRAWLER_RECRAWL_PROPOSAL.md` C6） |
+| `/data/isel_warc/YYYYMMDD/crawler_NN/` | 永久保存的 WARC 和 gzip 的 fetch log | `recrawl-archive` |
 
 所有檔案都先寫成 `.tmp`，fsync 後才 rename（`io.py`）。
 
@@ -283,32 +291,42 @@ selection/run=<id>/
 
 | 欄位 | 意思 |
 |---|---|
-| `doc_id` | canonical URL 的 MD5 低 64 位元；跨 run 穩定，永不重用 |
+| `doc_id` | canonical URL 的 MD5 低 64 位元（uint64）；跨 run 穩定，永不重用。selectdb 存成 signed BIGINT（`manifest.to_pg_bigint`，二補數重新解讀） |
 | `url` | 要交給 metric 的拼法（目前是 crawler 的拼法） |
-| `canonical_url`、`domain_key` | 正規化 URL 和 shard key |
-| `crawl_shard` | crawler 的 0–255 shard，給抓取時做禮貌性限速 |
+| `canonical_url` | crawler 的正規化拼法（`w3lib.canonicalize_url`）。同一頁的不同拼法共用 `doc_id` |
+| `host`、`domain_id` | canonical URL 的 host；crawler `domain_state` 的 id（eTLD+1 或拆分的 host），來自 export |
+| `crawl_shard` | crawler 的 0–255 shard，取自該列被打分的 export shard。recrawl 依它找到負責的 crawler process |
 | `index_shard` | `doc_id mod index_shards`，給 indexer 分工 |
-| `score`、`rank`、`reason` | 模型分數、名次、前幾名特徵貢獻（LightGBM SHAP） |
+| `score`、`rank`、`reason` | 模型分數、名次（`manifest.RANK_ORDER`：score desc、URL 雜湊 asc、URL asc）、前幾名特徵貢獻（LightGBM SHAP；全量清單為 NULL） |
 | `content_hash`、`simhash`、`lang`、`text_len` | 預留給 Phase B 的內容回饋，目前是 NULL |
 | `run_id`、`schema_version` | 來源和版本 |
 
-`validate-manifest` 會檢查每個檔案的 sha256 和列數。
+- `select-sample` 寫到 `selection/`，`select-full` 寫到 `full/selection/`，兩者都經過 `manifest.write_run`。
+- 每列是一個 URL；`url` 不可重複。`_MANIFEST.json` 的 `docs` 是不重複的 `doc_id` 數。全量清單約有 2,300 列和另一個拼法共用 `doc_id`（多是 `./`、`../`）。
+- deltas 以 `doc_id` 為單位，每個 doc 取名次最高的拼法。
+- `canonicalize` 在 process pool 裡跑（`manifest.canonical_workers`），只傳回有改變的拼法。
+- `validate-manifest` 會檢查每個檔案的 sha256 和列數。`publish` 也會先跑一次。
 
-### 7.1 selectdb 契約（`publish.py`）
+### 7.1 selectdb 契約（`schema.py`、`publish.py`）
 
-Metric 讀這張表，所以 schema 和 V1 相同（WebSearchEngine `IndexSelection/selectdb_common.py`）：
+schema 只定義在 `src/isel/schema.py`（SQLAlchemy Core）。改動用 `src/isel/migrations/versions/` 的 Alembic revision 上線。`migrate-selectdb` 在一個交易內套用 revision，再用 `alembic check` 比對 DB 和 `schema.py`；不一致就整筆回滾。autogenerate 看不出 CHECK 內容和 partial index 條件，這兩類由整合測試直接檢查。
 
-| 表 | 欄位 |
-|---|---|
-| `selected_urls_current` | `url` PK、`score`、`first_seen`（NULL）、`run_id` FK、`selected_at` |
-| `model_runs` | V1 的欄位，加上 `status`（loading、validated、live、retired、abandoned、rolled_back）、`activated_at`、`config_sha256`、`code_version` |
+| schema | 表 | 欄位和約束 |
+|---|---|---|
+| `public` | `selected_urls_current` | `url` PK、`score`、`first_seen`（NULL）、`run_id` FK（`ON DELETE RESTRICT`）、`selected_at`。欄位和 V1 相同 |
+| `public` | `model_runs` | V1 的欄位，加上 `status`（CHECK：loading、validated、live、retired、abandoned、rolled_back；最多一個 live）、`activated_at`、`config_sha256`、`code_version` |
+| `recrawl` | `host`、`doc`、`batch_seq` | recrawl 的 frontier：一個 hostname 一個 back queue，一個 doc 一列，見 `docs/RECRAWL_DESIGN.md` §4.4。`select` 角色沒有這個 schema 的 USAGE |
+
+- `run_id`、`selected_at`、`first_seen` 每列都相同。這是刻意的反正規化，因為 V1 的讀者在每列讀這些欄位。
+- 清單表的約束一律叫 `<table>_pkey`、`<table>_run_id_fkey`。`swap` 和 `rollback` 改表名時一起改約束名。
+- live 的 `:5445` 在 Alembic 之前就建好了。第一次要用 `migrate-selectdb --stamp-baseline`：先記錄 revision 0001，再升級。
 
 - **Metric 怎麼讀：** `SELECT url FROM public.selected_urls_current WHERE url = ANY(:urls)`，每次 1 萬個 URL，用寫死的 `select` 帳號。golden 原始字串出現在表中就算 indexed（`WebSearchEngine` main 的 `b0bea75`）。
-- **載入：** `publish` 在一個交易內建 `selected_urls_r<id>`、`COPY FREEZE`、加 PK 和 FK、`ANALYZE`，再檢查列數等於 K。`wal_level=minimal` 下，同一交易內建立並填滿的表不寫 WAL。這時讀者還看不到新表。
+- **載入：** `publish` 先驗證 manifest 的 checksum，再在一個交易內用 `LIKE selected_urls_current` 建 `selected_urls_r<id>`、`COPY FREEZE`、加 PK 和 FK、`ANALYZE`，並檢查列數等於 K。DB 不在最新 revision 時，`publish` 拒絕執行。`wal_level=minimal` 下，同一交易內建立並填滿的表不寫 WAL。這時讀者還看不到新表。
 - **切換：** `swap` 在 `lock_timeout` 5 秒內把 current 改名成 prev，再把新表改名成 current。讀者最多等幾毫秒，不會看到一半的清單。
 - **凍結時段：** 1、16 日 11:30–20:00 UTC 拒絕 swap。Metric 在 12:00 建 random set、18:00 建 head set，建完立刻量。
 - **回滾：** `rollback` 對調 current 和 prev。新的 load 或 rollback 會丟掉所有已載入但沒 swap 的表。
-- **讀者帳號：** `init-selectdb` 建 `select` 角色，密碼和 Metric 寫死的相同，只有 SELECT 權限。
+- **讀者帳號：** `migrate-selectdb` 建 `select` 角色，密碼和 Metric 寫死的相同，只有 `public` 的 SELECT 權限。
 - **自我檢查：** `verify-live --batch <b>` 用 `select` 帳號送同一條 SQL。exact 比率等於 Metric 的 `indexed_rate`（找到的不重複原始 URL ÷ 不重複原始 URL），另外報 canonical 比率和以 query 為單位的 bootstrap CI。
 - ⚠️ 未合併的 WebSearchEngine PR #5 會改成「原始或 canonical 拼法都算，而且要已爬」。到時 `indexed_canonical_rate` 比較接近官方數字。
 
@@ -327,7 +345,7 @@ Metric 讀這張表，所以 schema 和 V1 相同（WebSearchEngine `IndexSelect
 ### 8.2 元件
 
 ```
-manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_key)
+manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_id)
                             │  priority = rank; only added + stale URLs
                             ▼
                       fetcher (reuse crawler, keep body) ──► WARC.gz (staging, TTL)
@@ -353,6 +371,8 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 
 ### 8.4 recrawl 預算
 
+> 2026-10-12 的調研取代本節的估算。完整設計和每 host 0.2 qps 的容量分析見 [`RECRAWL_DESIGN.md`](RECRAWL_DESIGN.md)。
+
 - 每兩週全量重抓 1.28 億頁，等於每天 9.1M 頁，佔 crawler 產能（每天 26–29M）約 34%。
 - 所以只抓 delta（`added`）和過期的頁。
 - 正式產出時加遲滯：連續 2 期低於門檻才移除，控制每期的變動量。
@@ -372,7 +392,7 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 | S0 的意義 | S0 是 `pull-full` 的開始時間。export 開始時記下 `frozen_probe`（server 啟動時間加 `url_state_current_*` 累計寫入列數），結束時記下 `end_probe`。sample 和正例都從這份 export 導出，所以三者是同一次讀取 |
 | 資料不完整 | `FeatureStore` 拒絕這些狀況：sample 沒有 `finished_at`、sample 的 `method` 不是 `hash`、正例的來源 export 和 sample 不同、任何 batch 缺 `positives/batch=<id>.parquet`、同一個 batch id 同時有官方和偽 golden 列 |
 | 憑證外洩 | DSN 只放環境變數，或放在 `<NAME>_FILE` 指向的 secret 檔（容器用這種）；所有 JSON 輸出經過 `assert_no_secrets` |
-| 寫入 selectdb | 只有 `publish.py` 會寫 DB。連線前，DSN 的 port 若在 `selectdb.forbidden_ports`（5432、5433、5444）就拒絕；連上後，資料庫若有 `url_state_current_000` 或 `metric_url` 也拒絕。`verify-live` 用 `default_transaction_read_only=on` 的讀者連線 |
+| 寫入 selectdb | 所有寫入都經過 `selectdb.connect`。連線前，DSN 的 port 若在 `selectdb.forbidden_ports`（5432、5433、5444）就拒絕；連上後，資料庫若有 `url_state_current_000` 或 `metric_url` 也拒絕。Alembic 用同一條連線。`verify-live` 用 `default_transaction_read_only=on` 的讀者連線 |
 | 全量讀取 | `pull-full` 每塊一條 `COPY`，只讀 `chunk_blocks` 個 heap block（TID range scan）。每塊 512 MiB，逾時取下限 120 秒，所以每個禁讀時段前只保留 2 分鐘。逾時依區塊大小計算，照樣經過 SQL gate、`ReadGuard` 和限速。heap 大小用 `pg_relation_size` 量，不用過期的 `relpages`；匯出途中新增的頁面會補成新的範圍。輸出用 `FORMAT CSV`：pyarrow 在 C++ 解析，另一條執行緒寫 Parquet，下一塊同時在傳。CSV 的文字由 `crawlerdb.session` 的 `datestyle`、`extra_float_digits`、`client_encoding` 固定，設定檢查會擋住其他值。每個 shard 前後讀 `pg_stat_wal` 和 `pg_stat_io`，差值寫進 `_meta.json` 的 `io`。這是全叢集的數字，要和沒在讀的時段比較 |
 | 多條連線 | 助教同意後（2026-10-11），`pull-full` 開 `full.connections` 條連線（預設 4），各自從共用佇列取整個 shard，`_meta.json` 的讀寫加鎖。每條連線有自己的 `ReadGuard`。IO 探測排除同一個 `application_name` 的連線，所以只數別人的 IO 等待：評分程式被我們拖慢時才會暫停。所有連線共用一個 `ByteRate`，每塊開讀前預約 heap 位元組，合計不超過 `full.max_heap_mb_s`（預設 2,000 MB/s），閒置不累積額度。依據：Host1 有 144 個執行緒，平常 CPU 只用 5.5–7.5%；Metric 整點掃描讀 7–8 GB/s 時 await 仍低於 1 ms，2 GB/s 約是它的 1/4。任一連線發生非重試型錯誤，其他連線做完手上的 shard 就停，錯誤往外拋 |
 | 讀取對 DB 的影響 | 2026-10-11 的 catalog：Metric 每小時用 16 條連線對 256 個表各跑一次 `count(*)`（`CrawlerStatusMeasure.py`），每個表約每小時被 seq scan 1.75 次。hint bit 和 on-access pruning 都已由它做掉；`data_checksums`、`wal_log_hints` 都關，補 hint bit 也不寫 WAL。所以全量讀取幾乎不增加寫入。TID range scan 不用 buffer ring（PG16 `tableam.h`），會流過 `shared_buffers`；小於 `shared_buffers`/4（32 GB）的表用 seq scan 也一樣，而每小時的掃描本來就在輪替快取。`last_fetch_ok` 沒有索引，約 97% 的頁至少有一列已爬，所以 bitmap scan 不划算 |
@@ -478,6 +498,7 @@ Mac 經 VPN 只有約 4 MB/s，全量匯出只能在伺服器上跑。
 | 設定 | 理由 |
 |---|---|
 | `profiles: [job]`，用 `run --rm` | 一個指令一個容器，跑完就刪；`up` 不會啟動它；不設 restart、不開 port |
+| 例外：`recrawl-plan`、`recrawl-archive`（`profiles: [recrawl]`） | 它們要持續餵 crawler 和收結果，所以是常駐 service，`restart: unless-stopped`。每個只能跑一個實例，靠 advisory lock 保證。`/data` 整個掛一次，搬 WARC 用 rename；分開掛會出現 EXDEV（跨掛載點的 rename 錯誤）。限制 2 CPU、4 GB |
 | `init: true` | Ctrl-C 和 `docker stop` 能傳到 isel；所有指令都可續跑 |
 | `read_only: true`、`tmpfs: /tmp` | 只有 `/work` 可寫 |
 | secret 檔 + `<NAME>_FILE` | DSN 不出現在 `docker inspect`、env 或 log（V1 的 cron 檔就外洩過 DSN） |
@@ -498,7 +519,7 @@ Mac 經 VPN 只有約 4 MB/s，全量匯出只能在伺服器上跑。
 | `metricdb_dsn` | metricdb DSN（`172.16.191.1:5433`） |
 | `selectdb_admin_dsn` | `idxsel_admin` 連 `172.16.191.1:5445/selectdb` |
 | `selectdb_reader_dsn` | `select` 連 `172.16.191.1:5445/selectdb` |
-| `selectdb_reader_password` | Metric 寫死的 `select` 密碼（只有 `init-selectdb` 用） |
+| `selectdb_reader_password` | Metric 寫死的 `select` 密碼（只有 `migrate-selectdb` 用） |
 
 ### 12.5 部署和執行（每一步都要使用者核准）
 
@@ -529,14 +550,24 @@ $J backtest --feature-sets full,no_inlinks,no_domain,no_history \
 $J train                                    # M0; freeze before 2026-10-15 06:00 UTC
 $J score-full --model-dir /work/models/<M0>  # stops if sample rows score differently or the
                                              # kept share leaves the sample's estimate
-$J select-full
-$J init-selectdb                             # idempotent
+$J select-full                               # manifest run with doc_id, host, domain_id, rank
+$J migrate-selectdb --sql [--stamp-baseline] # review the DDL first
+$J migrate-selectdb [--stamp-baseline]       # once per new revision; the first run on the
+                                             # pre-Alembic :5445 needs --stamp-baseline
 $J publish --run-dir /work/full/selection/run=<id>
 $J swap --db-run-id <n>
 $J verify-live --batch 19                    # sanity: in-sample batch
 # after batch 20 exists (2026-10-16 20:00 UTC): pull-golden, rsync work/golden, then
 $J derive-positives --batches 20
 $J verify-live --batch 20
+# recrawl (docs/RECRAWL_DESIGN.md §7), each step a Hard Stop
+$J recrawl-sync                              # after each swap; refused in the freeze window.
+                                            # New docs are due from now: run it shortly
+                                            # before the first recrawl-plan (pacing deadline)
+$J recrawl-plan --dry-run                    # per-host capacity report; writes nothing
+# only after the crawler reads recrawl files (docs/CRAWLER_RECRAWL_PROPOSAL.md §6)
+$D --profile recrawl up -d recrawl-plan recrawl-archive
+$D --profile recrawl stop recrawl-plan       # stops new queue files at once
 ```
 
 - 長指令用 `nohup`，或在 `tmux` 裡跑；中斷後重跑同一個指令就會續跑。

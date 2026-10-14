@@ -1,17 +1,14 @@
 """Load, swap and roll back the selection in OUR selectdb; read it as the metric does.
 
-This is the only module that writes to a database. It refuses a target whose
-port is in `selectdb.forbidden_ports` (crawlerdb, metricdb, V1 selectdb) or
-that holds crawler or metric tables.
+Connections come from `isel.selectdb.connect`, the only way to write a
+database. The tables follow `isel.schema`; a load refuses a database that
+`migrate-selectdb` has not brought to the newest revision.
 
-The schema matches V1 (WebSearchEngine `IndexSelection/selectdb_common.py`)
-and the official metric's query
-`SELECT url FROM public.selected_urls_current WHERE url = ANY(:urls)`.
-
-- Load (transaction 1): create `selected_urls_r<id>`, COPY FREEZE, add the
-  primary key, ANALYZE and check the row count in one transaction. With
-  `wal_level=minimal`, a table created and filled in one transaction skips WAL.
-- Swap (transaction 2): rename tables under a short `lock_timeout`, so readers
+- Load (transaction 1): create `selected_urls_r<id>` LIKE the live table, COPY
+  FREEZE, add the primary and foreign keys, ANALYZE and check the row count.
+  With `wal_level=minimal`, a table created and filled in one transaction skips WAL.
+- Swap (transaction 2): rename tables, and their `<table>_pkey` and
+  `<table>_run_id_fkey` constraints, under a short `lock_timeout`, so readers
   never see a half-loaded list and wait milliseconds at most.
 - A new load or a rollback drops every loaded-but-unswapped run, so a pending
   swap cannot undo a rollback.
@@ -28,47 +25,19 @@ from typing import Any
 
 import psycopg
 from psycopg import sql
-from psycopg.conninfo import conninfo_to_dict
 
 from isel.config import Config, ScheduleCfg, hhmm_minutes
 from isel.evaluate import bootstrap, golden_by_tag, rates
 from isel.golden import read_golden
-from isel.io import assert_no_secrets, open_duckdb, read_json, sql_str
-from isel.pg import require_env
+from isel.io import assert_no_secrets, open_duckdb, sql_str
+from isel.manifest import validate_run
+from isel.schema import LIST_TABLE
+from isel.selectdb import assert_ready, connect
 
-CURRENT = "selected_urls_current"
+CURRENT = LIST_TABLE
 PREV = "selected_urls_prev"
+SWAP_TMP = "selected_urls_swap_tmp"
 RUN_TABLE_RE = r"^selected_urls_r[0-9]+$"
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS public.model_runs (
-    id BIGSERIAL PRIMARY KEY,
-    run_label TEXT NOT NULL UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    cutoff_datetime TIMESTAMPTZ,
-    model_path TEXT,
-    train_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
-    eval_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
-    selection_metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
-    source_paths JSONB NOT NULL DEFAULT '{}'::jsonb,
-    status TEXT NOT NULL DEFAULT 'loading',
-    activated_at TIMESTAMPTZ,
-    config_sha256 TEXT,
-    code_version TEXT
-);
-CREATE TABLE IF NOT EXISTS public.selected_urls_current (
-    url TEXT PRIMARY KEY,
-    score DOUBLE PRECISION NOT NULL,
-    first_seen TIMESTAMPTZ,
-    run_id BIGINT NOT NULL REFERENCES public.model_runs(id) ON DELETE CASCADE,
-    selected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-"""
-# A database with any of these is crawlerdb or metricdb, whatever its port.
-_FOREIGN_TABLES = ("public.url_state_current_000", "public.metric_url")
-
-
-class ForbiddenTarget(RuntimeError):
-    """Raised when a write connection would reach a database other than our selectdb."""
 
 
 def swap_allowed(now: datetime, cfg: ScheduleCfg) -> bool:
@@ -80,66 +49,18 @@ def swap_allowed(now: datetime, cfg: ScheduleCfg) -> bool:
     return not start <= now.hour * 60 + now.minute < end
 
 
-def connect_selectdb(cfg: Config, dsn_env: str, read_only: bool) -> psycopg.Connection:
-    """Opens our selectdb after checking the target is not a forbidden database.
-
-    Raises:
-        ForbiddenTarget: If the port is forbidden or the database holds
-            crawler or metric tables.
-    """
-    s = cfg.selectdb
-    dsn = require_env(dsn_env)
-    if int(conninfo_to_dict(dsn).get("port") or 5432) in s.forbidden_ports:
-        raise ForbiddenTarget(f"{dsn_env} points at a forbidden port")
-    conn = psycopg.connect(dsn, autocommit=True, application_name=f"{cfg.run.app_name}_select",
-                           connect_timeout=s.connect_timeout_s,
-                           options="-c default_transaction_read_only=on" if read_only else "")
-    try:
-        if conn.info.port in s.forbidden_ports:
-            raise ForbiddenTarget(f"{dsn_env} reached a forbidden port")
-        with conn.cursor() as cur:
-            cur.execute("SELECT " + " OR ".join(
-                f"to_regclass('{t}') IS NOT NULL" for t in _FOREIGN_TABLES))
-            if cur.fetchone()[0]:
-                raise ForbiddenTarget(f"{dsn_env} reaches a database with crawler or metric tables")
-    except BaseException:
-        conn.close()
-        raise
-    return conn
-
-
-def init_selectdb(cfg: Config, admin: psycopg.Connection) -> None:
-    """One-time setup: tables plus the read-only role the metric connects as. Idempotent."""
-    role = cfg.selectdb.reader_role
-    password = require_env(cfg.selectdb.reader_password_env)
-    with admin.transaction(), admin.cursor() as cur:
-        cur.execute(SCHEMA_SQL)
-        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
-        verb = "ALTER" if cur.fetchone() else "CREATE"
-        cur.execute(sql.SQL("{} ROLE {} LOGIN PASSWORD {}").format(
-            sql.SQL(verb), sql.Identifier(role), sql.Literal(password)))
-        cur.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(
-            sql.Identifier(admin.info.dbname), sql.Identifier(role)))
-        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO {}").format(sql.Identifier(role)))
-        cur.execute(sql.SQL("GRANT SELECT ON ALL TABLES IN SCHEMA public TO {}").format(
-            sql.Identifier(role)))
-        cur.execute(sql.SQL(
-            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {}").format(
-            sql.Identifier(role)))
-
-
-def _ensure_schema(cfg: Config, admin: psycopg.Connection) -> None:
-    with admin.transaction(), admin.cursor() as cur:
-        cur.execute(SCHEMA_SQL)
-        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (cfg.selectdb.reader_role,))
-        if cur.fetchone() is None:
-            raise RuntimeError(f"role {cfg.selectdb.reader_role!r} is missing; "
-                               "run `isel init-selectdb` once")
-
-
 def _table_exists(cur: psycopg.Cursor, name: str) -> bool:
     cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"public.{name}",))
     return bool(cur.fetchone()[0])
+
+
+def _rename(cur: psycopg.Cursor, old: str, new: str) -> None:
+    """Renames a list table and the two constraints named after it."""
+    cur.execute(sql.SQL("ALTER TABLE public.{} RENAME TO {}").format(
+        sql.Identifier(old), sql.Identifier(new)))
+    for suffix in ("_pkey", "_run_id_fkey"):
+        cur.execute(sql.SQL("ALTER TABLE public.{} RENAME CONSTRAINT {} TO {}").format(
+            sql.Identifier(new), sql.Identifier(old + suffix), sql.Identifier(new + suffix)))
 
 
 def _drop_unswapped(admin: psycopg.Connection) -> list[int]:
@@ -177,7 +98,7 @@ def _model_runs_row(run: dict[str, Any]) -> dict[str, Any]:
         "run_label": run["run_id"], "cutoff_datetime": run["snapshot_at"],
         "model_path": run["model_dir"], "train_metrics": run["model_meta"],
         "selection_metrics": {k: run[k] for k in
-                              ("k", "rows", "candidates", "boundary_score", "tau",
+                              ("k", "rows", "docs", "candidates", "boundary_score", "tau",
                                "target_batch")},
         "source_paths": {"selection_run": run["run_id"]},
         "config_sha256": run["config_sha256"], "code_version": run["code_version"],
@@ -200,25 +121,30 @@ def _load_validated(cfg: Config, admin: psycopg.Connection, csv_path: Path,
              json.dumps(row["selection_metrics"], default=str),
              json.dumps(row["source_paths"]), row["config_sha256"], row["code_version"]))
         (run_id,) = cur.fetchone()
-        table = sql.Identifier(f"selected_urls_r{run_id}")
-        cur.execute(sql.SQL(
-            "CREATE TABLE public.{} (url TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, "
-            "first_seen TIMESTAMPTZ, run_id BIGINT NOT NULL DEFAULT {}, "
-            "selected_at TIMESTAMPTZ NOT NULL DEFAULT now())").format(table, sql.Literal(run_id)))
+        name = f"selected_urls_r{run_id}"
+        table = sql.Identifier(name)
+        # The live table is the column definition; its keys are added after the COPY.
+        cur.execute(sql.SQL("CREATE TABLE public.{} (LIKE public.{} INCLUDING DEFAULTS "
+                            "INCLUDING CONSTRAINTS)").format(table, sql.Identifier(CURRENT)))
+        # run_id is known only now; a default fills it during the COPY and is then dropped.
+        cur.execute(sql.SQL("ALTER TABLE public.{} ALTER COLUMN run_id SET DEFAULT {}").format(
+            table, sql.Literal(run_id)))
         # FREEZE is allowed because the table was created in this transaction. Rows are
         # written frozen and all-visible, so readers never dirty pages with hint bits.
         with cur.copy(sql.SQL("COPY public.{} (url, score) FROM STDIN (FORMAT csv, FREEZE)")
                       .format(table)) as copy, csv_path.open("rb") as fh:
             while block := fh.read(s.copy_block_bytes):
                 copy.write(block)
+        cur.execute(sql.SQL("ALTER TABLE public.{} ALTER COLUMN run_id DROP DEFAULT").format(
+            table))
         cur.execute(sql.SQL("SET LOCAL maintenance_work_mem = {}").format(
             sql.Literal(s.maintenance_work_mem)))
         cur.execute(sql.SQL("ALTER TABLE public.{} ADD CONSTRAINT {} PRIMARY KEY (url)").format(
-            table, sql.Identifier(f"selected_urls_r{run_id}_pkey")))
+            table, sql.Identifier(f"{name}_pkey")))
         cur.execute(sql.SQL(
             "ALTER TABLE public.{} ADD CONSTRAINT {} FOREIGN KEY (run_id) "
-            "REFERENCES public.model_runs(id) ON DELETE CASCADE").format(
-            table, sql.Identifier(f"selected_urls_r{run_id}_run_fk")))
+            "REFERENCES public.model_runs(id) ON DELETE RESTRICT").format(
+            table, sql.Identifier(f"{name}_run_id_fkey")))
         cur.execute(sql.SQL("ANALYZE public.{}").format(table))
         cur.execute(sql.SQL("SELECT count(*) FROM public.{}").format(table))
         (rows,) = cur.fetchone()
@@ -230,18 +156,19 @@ def _load_validated(cfg: Config, admin: psycopg.Connection, csv_path: Path,
 
 def load_selection(cfg: Config, admin: psycopg.Connection, run_dir: Path,
                    work_dir: Path) -> dict[str, Any]:
-    """Loads a `select-full` run into a new, not yet visible table.
+    """Loads a `select-full` manifest run into a new, not yet visible table.
 
-    The table is validated (row count == K, unique URLs through the primary key)
-    before commit. Nothing becomes visible to readers until `swap`.
+    The manifest's checksums are verified first. The table is validated (row
+    count == K, unique URLs through the primary key) before commit. Nothing
+    becomes visible to readers until `swap`.
     """
-    run = read_json(run_dir / "_meta.json")
-    if run is None:
-        raise FileNotFoundError(f"{run_dir}/_meta.json is missing; run select-full")
+    run = validate_run(run_dir)
+    if run.get("scope") != "full":
+        raise RuntimeError(f"{run_dir} is a {run.get('scope')} run; publish a select-full run")
     if run["rows"] != run["k"]:
         raise RuntimeError(f"the run holds {run['rows']} rows, not K = {run['k']}")
     row = _model_runs_row(run)
-    _ensure_schema(cfg, admin)
+    assert_ready(cfg, admin)
     dropped = _drop_unswapped(admin)
     _ensure_space(cfg, admin, run["k"])
     csv_path = work_dir / "duckdb_tmp" / "load.csv"
@@ -249,7 +176,7 @@ def load_selection(cfg: Config, admin: psycopg.Connection, run_dir: Path,
     started = time.monotonic()
     try:
         con.execute(f"COPY (SELECT url, score FROM read_parquet("
-                    f"{sql_str(str(run_dir / 'selected.parquet'))})) "
+                    f"{sql_str(str(run_dir / 'manifest' / '*.parquet'))})) "
                     f"TO {sql_str(str(csv_path))} (FORMAT csv, HEADER false)")
         db_run_id = _load_validated(cfg, admin, csv_path, row, run["k"])
     finally:
@@ -281,21 +208,17 @@ def swap(cfg: Config, admin: psycopg.Connection, run_id: int,
                 cur.execute(sql.SQL("SET LOCAL lock_timeout = {}").format(
                     sql.Literal(s.swap_lock_timeout)))
                 started = time.monotonic()
-                if _table_exists(cur, CURRENT):
-                    cur.execute(sql.SQL("LOCK TABLE public.{} IN ACCESS EXCLUSIVE MODE").format(
-                        sql.Identifier(CURRENT)))
+                cur.execute(sql.SQL("LOCK TABLE public.{} IN ACCESS EXCLUSIVE MODE").format(
+                    sql.Identifier(CURRENT)))
                 lock_ms = round((time.monotonic() - started) * 1000, 1)
                 cur.execute(sql.SQL("DROP TABLE IF EXISTS public.{}").format(sql.Identifier(PREV)))
-                cur.execute(sql.SQL("ALTER TABLE IF EXISTS public.{} RENAME TO {}").format(
-                    sql.Identifier(CURRENT), sql.Identifier(PREV)))
-                cur.execute(sql.SQL("ALTER TABLE public.{} RENAME TO {}").format(
-                    sql.Identifier(f"selected_urls_r{run_id}"), sql.Identifier(CURRENT)))
+                _rename(cur, CURRENT, PREV)
+                _rename(cur, f"selected_urls_r{run_id}", CURRENT)
                 cur.execute("UPDATE public.model_runs SET status = 'retired' WHERE status = 'live'")
                 cur.execute("UPDATE public.model_runs SET status = 'live', activated_at = now() "
                             "WHERE id = %s", (run_id,))
                 if not s.keep_prev:
-                    cur.execute(sql.SQL("DROP TABLE IF EXISTS public.{}").format(
-                        sql.Identifier(PREV)))
+                    cur.execute(sql.SQL("DROP TABLE public.{}").format(sql.Identifier(PREV)))
         except psycopg.errors.LockNotAvailable:
             if attempt < s.swap_retry_attempts:
                 sleep(s.swap_retry_backoff_s)
@@ -306,7 +229,6 @@ def swap(cfg: Config, admin: psycopg.Connection, run_id: int,
 
 def rollback(cfg: Config, admin: psycopg.Connection) -> dict[str, Any]:
     """Swaps `selected_urls_current` and `selected_urls_prev` back."""
-    tmp = "selected_urls_swap_tmp"
     with admin.transaction(), admin.cursor() as cur:
         if not (_table_exists(cur, CURRENT) and _table_exists(cur, PREV)):
             raise RuntimeError("rollback needs both current and prev tables")
@@ -316,9 +238,8 @@ def rollback(cfg: Config, admin: psycopg.Connection) -> dict[str, Any]:
             sql.Identifier(CURRENT), sql.Identifier(PREV)))
         cur.execute(sql.SQL("SELECT run_id FROM public.{} LIMIT 1").format(sql.Identifier(PREV)))
         prev_row = cur.fetchone()
-        for a, b in ((CURRENT, tmp), (PREV, CURRENT), (tmp, PREV)):
-            cur.execute(sql.SQL("ALTER TABLE public.{} RENAME TO {}").format(
-                sql.Identifier(a), sql.Identifier(b)))
+        for a, b in ((CURRENT, SWAP_TMP), (PREV, CURRENT), (SWAP_TMP, PREV)):
+            _rename(cur, a, b)
         cur.execute("UPDATE public.model_runs SET status = 'rolled_back' WHERE status = 'live'")
         if prev_row:
             cur.execute("UPDATE public.model_runs SET status = 'live', activated_at = now() "
@@ -339,7 +260,7 @@ def verify_live(cfg: Config, work_dir: Path, batch: int) -> dict[str, Any]:
     if not golden:
         raise RuntimeError(f"batch {batch} has no golden rows; run pull-golden first")
     e, chunk = cfg.eval, cfg.selectdb.verify_chunk
-    conn = connect_selectdb(cfg, cfg.selectdb.reader_dsn_env, read_only=True)
+    conn = connect(cfg, cfg.selectdb.reader_dsn_env, read_only=True)
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id, run_label, activated_at FROM public.model_runs "

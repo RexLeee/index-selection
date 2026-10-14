@@ -1,36 +1,49 @@
-"""Selection manifest: the contract between index selection and the future indexer.
+"""Selection manifest: the contract between index selection and its consumers.
 
-Layout of one run (`selection/run=<id>/`):
+Layout of one run (`<selection_dir>/run=<id>/`):
 
-* `manifest/index_shard=NN.parquet`: one row per selected URL, `MANIFEST_SCHEMA`.
+* `manifest/index_shard=NN.parquet`: one row per selected URL, `MANIFEST_SCHEMA`,
+  ordered by rank.
 * `deltas/added.parquet`, `deltas/removed.parquet`: doc ids against the parent run.
-* `_MANIFEST.json`: schema version, parent run, row counts and sha256 per file;
-  written last, so a run without it is incomplete.
+* `_MANIFEST.json`: schema version, parent run, row counts and sha256 per file,
+  plus the caller's run facts; written last, so a run without it is incomplete.
 
-`doc_id` is the low 64 bits of MD5 of the canonical URL. It stays the same
-for a page across runs, so the fetcher and indexer can diff runs by id.
+`url` is the spelling the metric matches. `doc_id` is the low 64 bits of MD5
+of the canonical URL, so it stays the same for a page across runs and several
+spellings of one page share it; the recrawl frontier fetches each doc_id once.
+`host`, `domain_id` and `crawl_shard` route a page to the crawler process that
+owns its domain.
+
+Rows go through DuckDB so a 128M-row run never sits in Python lists. Only
+`canonicalize` runs in Python, in a process pool, and only the spellings it
+changes come back.
 """
 
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
+from collections import deque
 from collections.abc import Mapping
+from concurrent.futures import Future, ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from isel.config import Config
-from isel.io import atomic_write_json, read_json, write_parquet_atomic
-from isel.urlnorm import md5_number_lower
+from isel.io import atomic_write_json, copy_atomic, read_json, sql_str
+from isel.urlnorm import HOST_RE, canonicalize
 
 MANIFEST_SCHEMA = pa.schema([
     ("doc_id", pa.uint64()),
     ("url", pa.string()),
     ("canonical_url", pa.string()),
-    ("domain_key", pa.string()),
+    ("host", pa.string()),
+    ("domain_id", pa.int64()),
     ("crawl_shard", pa.int16()),
     ("index_shard", pa.int16()),
     ("score", pa.float64()),
@@ -45,6 +58,9 @@ MANIFEST_SCHEMA = pa.schema([
 ])
 DELTA_SCHEMA = pa.schema([("doc_id", pa.uint64()), ("url", pa.string()),
                           ("canonical_url", pa.string())])
+# The one ranking order: score, then the URL hash `h = md5_number_lower(url)`, then the URL.
+RANK_ORDER = "score DESC, h ASC, url ASC"
+ROW_COLUMNS = ("url", "crawl_shard", "domain_id", "score", "reason")
 
 
 class ManifestError(ValueError):
@@ -59,90 +75,149 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def to_pg_bigint(doc_ids: pa.Array | pa.ChunkedArray) -> pa.Array | pa.ChunkedArray:
+    """Reinterprets uint64 doc ids as the two's-complement BIGINT that selectdb stores."""
+    return pc.cast(doc_ids, pa.int64(), safe=False)
+
+
 def latest_run(selection_dir: Path) -> Path | None:
     """The newest complete run (one with `_MANIFEST.json`)."""
     runs = sorted(p for p in selection_dir.glob("run=*") if (p / "_MANIFEST.json").exists())
     return runs[-1] if runs else None
 
 
-def build_table(cfg: Config, rows: pa.Table, run_id: str) -> pa.Table:
-    """Adds ids, shards and rank to the selected rows, ordered by score then doc_id.
+def _respelled(urls: list[str]) -> list[tuple[str, str]]:
+    """(url, canonical_url) for the URLs that `canonicalize` changes."""
+    return [(u, c) for u in urls if (c := canonicalize(u)) != u]
 
-    `rows` holds url, canonical_url, domain_key, crawl_shard, score and reason.
+
+def _canonical_pairs(cfg: Config, con: duckdb.DuckDBPyConnection, rows_sql: str) -> pa.Table:
+    """Runs `canonicalize` over every URL, at most two batches per worker in flight."""
+    m = cfg.manifest
+    reader = con.execute(f"SELECT url FROM ({rows_sql})").to_arrow_reader(
+        m.canonical_batch_rows)
+    batches = (b.column(0).to_pylist() for b in reader)
+    pairs: list[tuple[str, str]] = []
+    if m.canonical_workers == 1:
+        for urls in batches:
+            pairs += _respelled(urls)
+    else:
+        # spawn: the parent holds DuckDB threads, which fork would copy mid-flight.
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(m.canonical_workers, mp_context=context) as pool:
+            pending: deque[Future] = deque()
+            for urls in batches:
+                pending.append(pool.submit(_respelled, urls))
+                if len(pending) >= 2 * m.canonical_workers:
+                    pairs += pending.popleft().result()
+            while pending:
+                pairs += pending.popleft().result()
+    return pa.table({"url": pa.array([p[0] for p in pairs], pa.string()),
+                     "canonical_url": pa.array([p[1] for p in pairs], pa.string())})
+
+
+def _build(cfg: Config, con: duckdb.DuckDBPyConnection, rows_sql: str, run_id: str) -> int:
+    """Fills the temp table `manifest_rows` and checks it; returns its row count."""
+    con.register("canon_pairs", _canonical_pairs(cfg, con, rows_sql))
+    try:
+        con.execute(f"""
+CREATE OR REPLACE TEMP TABLE manifest_rows AS
+WITH r AS (
+  SELECT s.url, coalesce(p.canonical_url, s.url) AS canonical_url, s.crawl_shard,
+         s.domain_id, s.score, s.reason, md5_number_lower(s.url) AS h
+  FROM ({rows_sql}) s LEFT JOIN canon_pairs p ON p.url = s.url
+)
+SELECT md5_number_lower(canonical_url) AS doc_id, url, canonical_url,
+       lower(regexp_extract(canonical_url, {sql_str(HOST_RE)}, 1)) AS host,
+       domain_id::BIGINT AS domain_id, crawl_shard::SMALLINT AS crawl_shard,
+       (md5_number_lower(canonical_url) % {int(cfg.manifest.index_shards)})::SMALLINT
+           AS index_shard,
+       score::DOUBLE AS score, row_number() OVER (ORDER BY {RANK_ORDER}) AS rank,
+       reason::VARCHAR[] AS reason, NULL::VARCHAR AS content_hash, NULL::UBIGINT AS simhash,
+       NULL::VARCHAR AS lang, NULL::INTEGER AS text_len, {sql_str(run_id)} AS run_id,
+       {int(cfg.manifest.schema_version)}::INTEGER AS schema_version
+FROM r""")
+    finally:
+        con.unregister("canon_pairs")
+    names = [row[0] for row in con.execute("DESCRIBE manifest_rows").fetchall()]
+    if names != MANIFEST_SCHEMA.names:
+        raise ManifestError(f"manifest columns {names} differ from MANIFEST_SCHEMA")
+    rows, urls, missing = con.execute(
+        "SELECT count(*), count(DISTINCT url), count(*) FILTER (WHERE domain_id IS NULL "
+        "OR crawl_shard IS NULL OR host = '') FROM manifest_rows").fetchone()
+    if urls != rows:
+        raise ManifestError(f"{rows - urls} duplicate URLs in the selection")
+    if missing:
+        raise ManifestError(f"{missing} rows lack a domain_id, crawl_shard or host")
+    (collisions,) = con.execute(
+        "SELECT count(*) FROM (SELECT doc_id FROM manifest_rows GROUP BY doc_id "
+        "HAVING count(DISTINCT canonical_url) > 1)").fetchone()
+    if collisions:
+        raise ManifestError(f"{collisions} doc_ids are shared by different canonical URLs")
+    return int(rows)
+
+
+def _delta(side: str, other: str) -> str:
+    """Docs of `side` missing from `other`, one spelling per doc (the best ranked)."""
+    return (f"SELECT doc_id, arg_min(url, rank) AS url, arg_min(canonical_url, rank) "
+            f"AS canonical_url FROM {side} WHERE doc_id NOT IN (SELECT doc_id FROM {other}) "
+            "GROUP BY doc_id ORDER BY doc_id")
+
+
+def write_run(cfg: Config, con: duckdb.DuckDBPyConnection, rows_sql: str, selection_dir: Path,
+              run_id: str, extra_meta: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Writes one run plus deltas against the newest complete run; returns its meta.
+
+    Args:
+        cfg: Config; `manifest` sets the shards, the version and the canonicalize pool.
+        con: DuckDB connection that can evaluate `rows_sql`.
+        rows_sql: A query with `ROW_COLUMNS`, one row per selected URL. The
+            writer ranks the rows by `RANK_ORDER`.
+        selection_dir: Directory holding this scope's runs.
+        run_id: The new run's id.
+        extra_meta: Run facts copied into `_MANIFEST.json`.
+
+    Raises:
+        ManifestError: If the run exists, URLs repeat, a row lacks routing
+            columns, or two canonical URLs share a doc_id.
     """
-    canonical = rows.column("canonical_url").to_pylist()
-    doc_ids = [md5_number_lower(c) for c in canonical]
-    seen: dict[int, str] = {}
-    for d, c in zip(doc_ids, canonical, strict=True):
-        if seen.setdefault(d, c) != c:
-            raise ManifestError(f"doc_id collision between {seen[d]!r} and {c!r}")
-    if len(seen) != len(doc_ids):
-        raise ManifestError("duplicate canonical URLs in the selection")
-    n = rows.num_rows
-    table = pa.table({
-        "doc_id": pa.array(doc_ids, pa.uint64()),
-        "url": rows.column("url"),
-        "canonical_url": rows.column("canonical_url"),
-        "domain_key": rows.column("domain_key"),
-        "crawl_shard": pc.cast(rows.column("crawl_shard"), pa.int16()),
-        "index_shard": pa.array([d % cfg.manifest.index_shards for d in doc_ids], pa.int16()),
-        "score": pc.cast(rows.column("score"), pa.float64()),
-        "rank": pa.array([0] * n, pa.int64()),
-        "reason": rows.column("reason"),
-        "content_hash": pa.nulls(n, pa.string()),
-        "simhash": pa.nulls(n, pa.uint64()),
-        "lang": pa.nulls(n, pa.string()),
-        "text_len": pa.nulls(n, pa.int32()),
-        "run_id": pa.array([run_id] * n, pa.string()),
-        "schema_version": pa.array([cfg.manifest.schema_version] * n, pa.int32()),
-    }, schema=MANIFEST_SCHEMA)
-    order = pc.sort_indices(table, sort_keys=[("score", "descending"), ("doc_id", "ascending")])
-    table = table.take(order)
-    return table.set_column(table.schema.get_field_index("rank"), "rank",
-                            pa.array(range(1, n + 1), pa.int64()))
-
-
-def write_run(cfg: Config, rows: pa.Table, selection_dir: Path, run_id: str,
-              extra_meta: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Writes one run plus deltas against the newest complete run; returns its meta."""
     parent = latest_run(selection_dir)
     out = selection_dir / f"run={run_id}"
     if out.exists():
         raise ManifestError(f"{out} already exists")
-    table = build_table(cfg, rows, run_id)
+    rows = _build(cfg, con, rows_sql, run_id)
     files: dict[str, dict[str, Any]] = {}
 
-    def put(rel: str, part: pa.Table) -> None:
+    def put(rel: str, query: str) -> None:
         path = out / rel
-        write_parquet_atomic(part, path)
-        files[rel] = {"rows": part.num_rows, "sha256": _sha256(path)}
+        files[rel] = {"rows": copy_atomic(con, query, path), "sha256": _sha256(path)}
 
-    shard_col = table.column("index_shard")
     for shard in range(cfg.manifest.index_shards):
         put(f"manifest/index_shard={shard:02d}.parquet",
-            table.filter(pc.equal(shard_col, shard)))
-    current = table.select(["doc_id", "url", "canonical_url"])
-    if parent is not None:
-        old = pq.read_table(parent / "manifest",
-                            columns=["doc_id", "url", "canonical_url"]).cast(DELTA_SCHEMA)
-        added = current.filter(pc.invert(pc.is_in(current.column("doc_id"),
-                                                  value_set=old.column("doc_id"))))
-        removed = old.filter(pc.invert(pc.is_in(old.column("doc_id"),
-                                                value_set=current.column("doc_id"))))
+            f"SELECT * FROM manifest_rows WHERE index_shard = {shard} ORDER BY rank")
+    if parent is None:
+        con.execute("CREATE OR REPLACE TEMP VIEW parent_rows AS SELECT * FROM manifest_rows "
+                    "WHERE false")
     else:
-        added, removed = current, DELTA_SCHEMA.empty_table()
-    put("deltas/added.parquet", added.cast(DELTA_SCHEMA))
-    put("deltas/removed.parquet", removed.cast(DELTA_SCHEMA))
+        con.execute("CREATE OR REPLACE TEMP VIEW parent_rows AS SELECT * FROM read_parquet("
+                    f"{sql_str(str(parent / 'manifest' / '*.parquet'))})")
+    put("deltas/added.parquet", _delta("manifest_rows", "parent_rows"))
+    put("deltas/removed.parquet", _delta("parent_rows", "manifest_rows"))
+    (boundary,) = con.execute("SELECT min(score) FROM manifest_rows").fetchone()
     meta = {
         "schema_version": cfg.manifest.schema_version,
         "run_id": run_id,
         "parent_run_id": None if parent is None else parent.name.removeprefix("run="),
-        "rows": table.num_rows,
+        "rows": rows,
+        "docs": con.execute("SELECT count(DISTINCT doc_id) FROM manifest_rows").fetchone()[0],
+        "boundary_score": boundary,
         "index_shards": cfg.manifest.index_shards,
         "config_sha256": cfg.sha256(),
         "files": files,
         **(extra_meta or {}),
     }
+    con.execute("DROP VIEW parent_rows")
+    con.execute("DROP TABLE manifest_rows")
     atomic_write_json(out / "_MANIFEST.json", meta)
     return meta
 

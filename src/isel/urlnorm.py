@@ -16,6 +16,9 @@ from urllib.parse import urlsplit
 import tldextract
 from w3lib.url import canonicalize_url
 
+# DuckDB twin of `host_of`: group 1 is the host of an absolute URL.
+HOST_RE = r"^[A-Za-z][A-Za-z0-9+.-]*://(?:[^@/?#]*@)?([^:/?#]+)"
+
 
 def canonicalize(url: str) -> str:
     """Returns the crawler's spelling of `url`, or `url` itself if it cannot parse."""

@@ -13,6 +13,7 @@ from isel.features import FeatureStore
 from isel.io import atomic_write_json, read_json, write_parquet_atomic
 from isel.pull import FULL_SCHEMA
 from isel.score import SCORED_SCHEMA, NotEnoughCandidates, score_full, select_full
+from isel.urlnorm import md5_number_lower
 
 
 @pytest.fixture(scope="module")
@@ -72,9 +73,13 @@ def test_the_score_floor_keeps_every_row_of_the_exact_top_k(tmp_path, world):
     rows = pq.read_table(everything / "full" / "scored").to_pylist()
     expected = [r["url"] for r in sorted(rows, key=lambda r: (-r["score"], r["h"], r["url"]))][:k]
     run = select_full(cfg_cut, cut, k)
-    selected = pq.read_table(cut / "full" / "selection" / f"run={run['run_id']}"
-                             / "selected.parquet")
+    selected = _manifest(cut, run)
     assert selected.column("url").to_pylist() == expected
+    export = pq.read_table(cut / "full" / "export", columns=["url", "domain_id", "shard"],
+                           partitioning=None)
+    routing = {r["url"]: (r["domain_id"], r["shard"]) for r in export.to_pylist()}
+    assert all(routing[r["url"]] == (r["domain_id"], r["crawl_shard"])
+               for r in selected.to_pylist())
 
 
 def test_score_full_resumes_and_refuses_another_k(work, world):
@@ -149,10 +154,19 @@ def test_score_full_needs_a_finished_export(work):
         score_full(cfg, work, model_dir, 1000)
 
 
+def _manifest(work, run):
+    return pq.read_table(work / "full" / "selection" / f"run={run['run_id']}"
+                         / "manifest").sort_by("rank")
+
+
 def _write_scored(work, k, shards):
     for shard, rows in shards.items():
         write_parquet_atomic(pa.Table.from_pylist(rows, schema=SCORED_SCHEMA),
                              work / "full" / "scored" / f"shard={shard:03d}.parquet")
+        # The export as select-full reads it: url and the crawler's domain_id.
+        write_parquet_atomic(pa.table({"url": [r["url"] for r in rows],
+                                       "domain_id": [100 + shard] * len(rows)}),
+                             work / "full" / "export" / f"shard={shard:03d}" / "part-0-1.parquet")
     atomic_write_json(work / "full" / "scored" / "_meta.json", {
         "finished_at": "2026-10-14T00:00:00+00:00", "k": k, "tau": 0.0, "model_dir": "m",
         "snapshot_at": SNAPSHOT.isoformat(), "target_batch": 20, "model_meta": {},
@@ -163,21 +177,35 @@ def test_select_full_is_the_exact_top_k_with_ties_and_duplicates(tmp_path):
     def row(url, shard, h, score):
         return {"url": url, "shard": shard, "h": h, "score": score}
 
+    def url(name, h):
+        # select-full ranks ties by md5_number_lower(url); pick names whose hashes order as h.
+        return f"https://{name}.example/{h}"
+
+    hashes = {"a": 5, "b": 2, "c": 9, "d": 1, "e": 3, "f": 4}
+    names = {n: url(n, h) for n, h in hashes.items()}
     shards = {
-        0: [row("a", 0, 5, 3.0), row("b", 0, 2, 2.0), row("c", 0, 9, 2.0), row("d", 0, 1, 1.0)],
-        1: [row("a", 1, 5, 1.5), row("e", 1, 3, 2.0), row("f", 1, 4, 0.5)],
+        0: [row(names["a"], 0, 0, 3.0), row(names["b"], 0, 0, 2.0), row(names["c"], 0, 0, 2.0),
+            row(names["d"], 0, 0, 1.0)],
+        1: [row(names["a"], 1, 0, 1.5), row(names["e"], 1, 0, 2.0), row(names["f"], 1, 0, 0.5)],
     }
+    for rows in shards.values():
+        for r in rows:
+            r["h"] = md5_number_lower(r["url"])
     _write_scored(tmp_path, 5, shards)
     run = select_full(small_cfg(tmp_path), tmp_path, 4)
-    selected = pq.read_table(tmp_path / "full" / "selection" / f"run={run['run_id']}"
-                             / "selected.parquet")
-    # a keeps its best score; b, e and c tie at 2.0 and order by hash.
-    assert selected.column("url").to_pylist() == ["a", "b", "e", "c"]
-    assert run["boundary_score"] == 2.0 and run["candidates"] == 6
+    selected = _manifest(tmp_path, run)
+    tied = sorted(["b", "c", "e"], key=lambda n: md5_number_lower(names[n]))
+    # a keeps its best score and that row's shard; b, c and e tie at 2.0 and order by hash.
+    assert selected.column("url").to_pylist() == [names[n] for n in ["a", *tied]]
+    assert selected.column("crawl_shard").to_pylist()[0] == 0
+    assert selected.column("domain_id").to_pylist() == [100, *[100 + (n == "e") for n in tied]]
+    assert selected.column("rank").to_pylist() == [1, 2, 3, 4]
+    assert run["boundary_score"] == 2.0 and run["candidates"] == 6 and run["scope"] == "full"
 
 
 def test_select_full_refuses_too_few_candidates_or_a_larger_k(tmp_path):
-    _write_scored(tmp_path, 5, {0: [{"url": "a", "shard": 0, "h": 1, "score": 1.0}]})
+    _write_scored(tmp_path, 5, {0: [{"url": "https://a.example/", "shard": 0, "h": 1,
+                                     "score": 1.0}]})
     cfg = small_cfg(tmp_path)
     with pytest.raises(NotEnoughCandidates):
         select_full(cfg, tmp_path, 2)
