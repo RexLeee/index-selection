@@ -41,33 +41,6 @@ services:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
 
-  # Recrawl loops (docs/RECRAWL_DESIGN.md §4). Started only after the crawler takes
-  # recrawl files (docs/CRAWLER_RECRAWL_PROPOSAL.md):
-  #   docker compose ... --profile recrawl up -d recrawl-plan recrawl-archive
-  # /data is one filesystem mounted once, so the archive renames WARCs instead of copying.
-  # The crawler's recrawl dirs are root:1015 mode 2775, so this user may rename and delete.
-  recrawl-plan:
-    extends: {service: isel}
-    profiles: [recrawl]
-    command: ["recrawl-plan"]
-    restart: unless-stopped
-    volumes:
-      - /data:/data
-    mem_limit: 4g
-    memswap_limit: 4g
-    cpus: 2
-
-  recrawl-archive:
-    extends: {service: isel}
-    profiles: [recrawl]
-    command: ["recrawl-archive"]
-    restart: unless-stopped
-    volumes:
-      - /data:/data
-    mem_limit: 4g
-    memswap_limit: 4g
-    cpus: 2
-
 secrets:
   crawlerdb_dsn:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/crawlerdb_dsn

@@ -269,33 +269,3 @@ verify_chunk = 10000                     # URLs per lookup, as in the official m
 [schedule]                               # the metric reads the list right after creating a batch
 swap_freeze_days = [1, 16]
 swap_freeze_window = ["11:30", "20:00"]  # random set at 12:00, head set at 18:00 UTC
-
-[recrawl]                                # recrawl frontier in selectdb `recrawl`; docs/RECRAWL_DESIGN.md
-queue_root = "work/recrawl/queue"        # crawler_NN/domain_<host_id>.json, read by the crawler
-result_root = "work/recrawl/result"      # crawler_NN/<base>.{warc.gz,jsonl}, written by the crawler
-warc_root = "work/recrawl/warc"          # permanent WARC + gzipped fetch logs, YYYYMMDD/crawler_NN/
-crawler_processes = 16                   # one queue dir per crawler process; shard // (256 / 16)
-batch_size = 100                         # URLs per queue file, as the offerer's per_domain_url_cap
-max_files_per_dir = 384                  # 3x the crawler's recrawl watermark (128 hosts)
-plan_max_files_per_txn = 1000            # queue files written per plan cycle
-plan_interval_s = 30.0
-dispatch_timeout_s = 7200                # after the crawler takes a file: 100 URLs at up to 60 s
-sweep_rows = 100000                      # fetched docs made due again per plan cycle
-stale_days = 30                          # uniform revisit interval
-retry_base_s = 600                       # failed doc: retry_base_s * 2^attempts
-retry_max_s = 86400
-max_attempts = 5                         # then wait stale_days instead of retry_max_s
-robots_retry_days = 30                   # a robots.txt disallow is asked again after this
-host_pause_max_s = 86400                 # cap on a 429/503 Retry-After pause
-archive_interval_s = 60.0
-min_free_gb = 4500                       # no new queue files below this free space on the
-                                         # queue filesystem; keeps the crawler's IPC peak (~4 TB)
-sync_chunk_rows = 1000000                # docs per recrawl-sync transaction
-# Pacing: each queue file asks the crawler for the share of its host's requests that
-# finishes the host's due docs within pace_days of the oldest one (proposal C9).
-pace_days = 14.0
-pace_cycle_s = 6.7                       # seconds per request on a host: max(gap, latency)
-share_min = 0.25                         # a 100-URL file then ends within dispatch_timeout_s
-share_max = 0.75                         # the normal lane keeps at least 25 % of a busy host
-min_gap_s = 5.0                          # 0.2 qps per hostname; capacity report only
-report_days = [1, 7, 14, 28]             # capacity report horizons

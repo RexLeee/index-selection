@@ -10,7 +10,7 @@ Layout of one run (`<selection_dir>/run=<id>/`):
 
 `url` is the spelling the metric matches. `doc_id` is the low 64 bits of MD5
 of the canonical URL, so it stays the same for a page across runs and several
-spellings of one page share it; the recrawl frontier fetches each doc_id once.
+spellings of one page share it.
 `host`, `domain_id` and `crawl_shard` route a page to the crawler process that
 owns its domain.
 

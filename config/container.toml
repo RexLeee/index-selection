@@ -13,8 +13,3 @@ canonical_workers = 16                   # 128M URLs at ~7 us each: ~1 min
 threads = 32
 memory_limit = "96GB"
 max_temp_directory_size = "100GB"
-
-[recrawl]                                # /data is one filesystem, mounted once, so renames work
-queue_root = "/data/ipc/recrawl_queue"
-result_root = "/data/ipc/recrawl_result"
-warc_root = "/data/isel_warc"

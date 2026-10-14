@@ -6,14 +6,12 @@ the container listens on 127.0.0.1 only and is removed when the module ends.
 
 from __future__ import annotations
 
-import json
 import os
 import socket
 import subprocess
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import duckdb
 import psycopg
@@ -30,15 +28,6 @@ from isel.manifest import write_run
 from isel.pg import ReadGuard, ReadOnlyViolation, open_crawlerdb, open_metricdb
 from isel.publish import load_selection, rollback, swap, verify_live
 from isel.pull import CRAWL_COLUMNS, FULL_SCHEMA, estimate_full, pull_dims, pull_full
-from isel.recrawl import (
-    archive_cycle,
-    capacity_report,
-    host_id,
-    pace_count_cap,
-    pg_doc_id,
-    plan_cycle,
-    sync,
-)
 from isel.selectdb import (
     ForbiddenTarget,
     NeedsBaselineStamp,
@@ -309,8 +298,8 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
     with pytest.raises(NeedsBaselineStamp):
         migrate(_admin(cfg))
     first = migrate(_admin(cfg), stamp_baseline=True)
-    assert first == {"revision_before": None, "revision": "0003", "stamped_baseline": True}
-    assert migrate(_admin(cfg))["revision_before"] == "0003"     # a rerun changes nothing
+    assert first == {"revision_before": None, "revision": "0002", "stamped_baseline": True}
+    assert migrate(_admin(cfg))["revision_before"] == "0002"     # a rerun changes nothing
     with pytest.raises(RuntimeError, match="only fits a pre-Alembic"):
         migrate(_admin(cfg), stamp_baseline=True)
     admin = _admin(cfg)
@@ -334,7 +323,7 @@ def test_migrate_adopts_the_pre_alembic_selectdb(selectdb):
 
 def test_migrate_builds_an_empty_selectdb_and_downgrades(selectdb):
     cfg = selectdb
-    assert _setup(cfg)["revision"] == "0003"
+    assert _setup(cfg)["revision"] == "0002"
     dsn = os.environ[cfg.selectdb.admin_dsn_env]
     engine = sa.create_engine(dsn.replace("postgresql://", "postgresql+psycopg://"))
     acfg = _alembic_config()
@@ -342,20 +331,19 @@ def test_migrate_builds_an_empty_selectdb_and_downgrades(selectdb):
         acfg.attributes["connection"] = conn
         command.downgrade(acfg, "base")
         assert sa.inspect(conn).get_table_names() == ["alembic_version"]
-        assert "recrawl" not in sa.inspect(conn).get_schema_names()
         command.upgrade(acfg, "head")
         command.check(acfg)
     engine.dispose()
 
 
-def test_the_reader_role_cannot_see_the_recrawl_schema(selectdb):
+def test_the_reader_role_can_only_read(selectdb):
     cfg = selectdb
     _setup(cfg)
-    reader = connect(cfg, cfg.selectdb.reader_dsn_env, read_only=True)
+    reader = connect(cfg, cfg.selectdb.reader_dsn_env, read_only=False)
     try:
         assert reader.execute("SELECT count(*) FROM selected_urls_current").fetchone() == (0,)
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
-            reader.execute("SELECT count(*) FROM recrawl.doc")
+            reader.execute("INSERT INTO model_runs (run_label) VALUES ('x')")
     finally:
         reader.close()
 
@@ -445,170 +433,3 @@ def test_writes_refuse_a_database_with_crawler_tables(selectdb, dsn, monkeypatch
     monkeypatch.setenv(selectdb.selectdb.admin_dsn_env, dsn)   # holds url_state_current_000
     with pytest.raises(ForbiddenTarget, match="crawler or metric tables"):
         connect(selectdb, selectdb.selectdb.admin_dsn_env, read_only=False)
-
-
-# ---------------------------------------------------------------- recrawl
-
-A1, A2, A3, B1 = ("https://a.example/1", "https://a.example/2", "https://a.example/3",
-                  "https://b.example/1")
-T0 = OPEN
-LOG = "recrawl-00-20261015T120000Z-1"
-
-
-def _recrawl_cfg(cfg, tmp_path):
-    root = tmp_path / "recrawl"
-    return replace(cfg, "recrawl", queue_root=str(root / "queue"),
-                   result_root=str(root / "result"), warc_root=str(root / "warc"),
-                   crawler_processes=2, batch_size=2, min_free_gb=0)
-
-
-def _go_live(cfg, admin, work, run_id, urls, shards):
-    loaded = load_selection(cfg, admin, _selection(cfg, work, run_id, urls, shards), work)
-    assert swap(cfg, admin, loaded["db_run_id"], now=lambda: OPEN)["swapped"]
-
-
-def _queue_file(cfg, process, url):
-    host = url.split("/")[2]
-    return Path(cfg.recrawl.queue_root) / f"crawler_{process:02d}" / f"domain_{host_id(host):06d}.json"
-
-
-def _doc(admin, url, *cols):
-    return admin.execute(f"SELECT {', '.join(cols)} FROM recrawl.doc WHERE doc_id = %s",
-                         (pg_doc_id(url),)).fetchone()
-
-
-def _fetch_log(cfg, process, records, warc=b"WARC/1.1"):
-    d = Path(cfg.recrawl.result_root) / f"crawler_{process:02d}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / f"{LOG}.warc.gz").write_bytes(warc)
-    (d / f"{LOG}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in records))
-    return d
-
-
-def _result(url, batch, at, **kw):
-    rec = {"batch_id": batch, "doc_id": pg_doc_id(url), "source_url": url, "final_url": url,
-           "http_status": 200, "content_type": "text/html", "etag": '"e1"',
-           "last_modified": None, "dispatched_at": at.isoformat(), "fetched_at": at.isoformat(),
-           "fail_reason": None, "retry_after_s": None, "warc_file": f"{LOG}.warc.gz",
-           "warc_offset": 0, "warc_length": 8, "payload_sha1": "ab"}
-    rec.update(kw)
-    return rec
-
-
-def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path):
-    cfg = _recrawl_cfg(selectdb, tmp_path)
-    _setup(cfg)
-    admin = _admin(cfg)
-    try:
-        # A2 twice: the second spelling canonicalizes onto the same doc.
-        urls = [A1, A2, "https://a.example/x/../2", A3, B1]
-        _go_live(cfg, admin, tmp_path, "r1", urls, [0, 0, 0, 0, 3])
-        synced = sync(cfg, admin, now=lambda: OPEN)
-        assert (synced["docs"], synced["dropped"], synced["hosts_due"]) == (4, 0, 2)
-        assert capacity_report(cfg, admin)["docs"] == 4
-
-        first = plan_cycle(cfg, admin, T0)
-        assert (first["files"], first["docs"]) == (2, 3)
-        a_file, b_file = _queue_file(cfg, 0, A1), _queue_file(cfg, 1, B1)
-        a = json.loads(a_file.read_text())
-        assert a["urls"] == [A1, A2] and a["doc_ids"] == [pg_doc_id(A1), pg_doc_id(A2)]
-        assert a["domain_id"] == host_id("a.example") and b_file.exists()
-        assert a["recrawl_share"] == cfg.recrawl.share_min    # 3 docs need little of 14 days
-        assert _doc(admin, A3, "due_at") == (OPEN,)           # the deadline counts from sync
-        assert not list(Path(cfg.recrawl.queue_root).rglob("*.tmp"))
-        assert plan_cycle(cfg, admin, T0)["files"] == 0      # one file per host on disk
-
-        a_file.unlink()                                       # the crawler takes it
-        second = plan_cycle(cfg, admin, T0 + timedelta(seconds=30))
-        assert (second["taken"], second["files"]) == (1, 1)
-        assert json.loads(a_file.read_text())["urls"] == [A3]
-        assert _doc(admin, A1, "state", "dispatched_at") == ("dispatched", T0 + timedelta(
-            seconds=30))
-
-        done = T0 + timedelta(minutes=1)
-        records = [_result(A1, a["batch_id"], done),
-                   _result(A2, a["batch_id"], done, http_status=503, content_type=None,
-                           warc_file=None, retry_after_s=600.0)]
-        source = _fetch_log(cfg, 0, records)
-        assert archive_cycle(cfg, admin, done) == {"logs": 1, "records": 2, "applied": 2}
-        stored = f"20261015/crawler_00/{LOG}.warc.gz"
-        assert _doc(admin, A1, "state", "warc_file", "due_at") == (
-            "fetched", stored, done + timedelta(days=cfg.recrawl.stale_days))
-        assert _doc(admin, A2, "state", "attempts", "fail_reason") == ("failed", 1, "http_503")
-        (paused,) = admin.execute("SELECT next_at FROM recrawl.host WHERE host_id = %s",
-                                  (host_id("a.example"),)).fetchone()
-        assert paused == done + timedelta(seconds=600)
-        warc = Path(cfg.recrawl.warc_root) / "20261015" / "crawler_00"
-        assert (warc / f"{LOG}.warc.gz").read_bytes() == b"WARC/1.1"
-        assert (warc / f"{LOG}.jsonl.gz").exists() and not list(source.iterdir())
-
-        # The same log again changes nothing: the 2xx is not newer, the 503 is stale.
-        _fetch_log(cfg, 0, records)
-        assert archive_cycle(cfg, admin, done)["applied"] == 0
-
-        # B's file was taken but never answered: the doc goes out again without an attempt.
-        b_file.unlink()
-        taken = T0 + timedelta(hours=1)
-        plan_cycle(cfg, admin, taken)
-        late = taken + timedelta(seconds=cfg.recrawl.dispatch_timeout_s + 1)
-        assert plan_cycle(cfg, admin, late)["timed_out"] == 1
-        assert _doc(admin, B1, "state", "attempts", "dispatched_at") == ("dispatched", 0, None)
-        assert json.loads(b_file.read_text())["urls"] == [B1]
-
-        # A fetched doc comes due again after stale_days and is planned first by rank.
-        a_file.unlink()
-        stale = done + timedelta(days=cfg.recrawl.stale_days, seconds=1)
-        revisit = plan_cycle(cfg, admin, stale)
-        assert revisit["swept"] == 1
-        assert json.loads(a_file.read_text())["urls"] == [A1, A2]
-    finally:
-        admin.close()
-
-
-def test_recrawl_sync_takes_docs_off_the_list_and_plan_skips_them(selectdb, tmp_path):
-    cfg = _recrawl_cfg(selectdb, tmp_path)
-    _setup(cfg)
-    admin = _admin(cfg)
-    try:
-        _go_live(cfg, admin, tmp_path, "r1", [A1, B1], [0, 3])
-        sync(cfg, admin, now=lambda: OPEN)
-        _go_live(cfg, admin, tmp_path, "r2", [A1], [0])
-        assert sync(cfg, admin, now=lambda: OPEN)["dropped"] == 1
-        assert _doc(admin, B1, "rank", "state") == (None, "pending")
-        assert plan_cycle(cfg, admin, T0)["files"] == 1
-        assert not _queue_file(cfg, 1, B1).exists()
-        with pytest.raises(RuntimeError, match="freeze window"):
-            sync(cfg, admin, now=lambda: FROZEN)
-    finally:
-        admin.close()
-
-
-def test_recrawl_plan_asks_a_host_behind_its_deadline_for_share_max(selectdb, tmp_path):
-    # The deadline passed 9 s after sync; the backlog count stops at the cap of 2.
-    cfg = replace(_recrawl_cfg(selectdb, tmp_path), "recrawl", pace_days=1e-4,
-                  plan_interval_s=10.0)
-    assert pace_count_cap(cfg) == 2
-    _setup(cfg)
-    admin = _admin(cfg)
-    try:
-        _go_live(cfg, admin, tmp_path, "r1", [A1, A2, A3], [0, 0, 0])
-        sync(cfg, admin, now=lambda: OPEN)
-        plan_cycle(cfg, admin, T0 + timedelta(hours=1))
-        a = json.loads(_queue_file(cfg, 0, A1).read_text())
-        assert (a["urls"], a["recrawl_share"]) == ([A1, A2], cfg.recrawl.share_max)
-    finally:
-        admin.close()
-
-
-def test_recrawl_plan_writes_nothing_when_the_disk_is_short(selectdb, tmp_path):
-    cfg = _recrawl_cfg(selectdb, tmp_path)
-    cfg = replace(cfg, "recrawl", min_free_gb=10**9)
-    _setup(cfg)
-    admin = _admin(cfg)
-    try:
-        _go_live(cfg, admin, tmp_path, "r1", [A1], [0])
-        sync(cfg, admin, now=lambda: OPEN)
-        assert plan_cycle(cfg, admin, T0)["disk_full"]
-        assert _doc(admin, A1, "state") == ("pending",)
-    finally:
-        admin.close()

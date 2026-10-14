@@ -3,8 +3,8 @@
 從約 16.6 億個已爬 URL 中，每兩週選出 1.28 億個放進搜尋索引。目標是最大化下一批 golden URL 的 indexed rate。
 
 - 調研（現況、論文、方法選型、未來架構）：[`docs/RESEARCH.md`](docs/RESEARCH.md)
-- 設計（時間點、特徵、模型、評估、manifest、recrawl 介面）：[`docs/DESIGN.md`](docs/DESIGN.md)
-- recrawl：[`docs/RECRAWL_DESIGN.md`](docs/RECRAWL_DESIGN.md)；給 crawler 組的提案：[`docs/CRAWLER_RECRAWL_PROPOSAL.md`](docs/CRAWLER_RECRAWL_PROPOSAL.md)
+- 設計（時間點、特徵、模型、評估、manifest、selectdb、部署）：[`docs/DESIGN.md`](docs/DESIGN.md)
+- recrawl：設計、給 crawler 組的提案和程式都在 `feat/recrawl` 分支，還沒上線
 - 實驗紀錄（真實資料的讀取、回測結果和判定）：[`docs/experiments/`](docs/experiments/)
 
 ## 方法一句話
@@ -61,10 +61,6 @@ $J publish --run-dir /work/full/selection/run=<id>   # new table, validated, not
 $J swap --db-run-id <n>                         # refused on the 1st/16th 11:30-20:00 UTC
 $J rollback
 $J verify-live --batch 20                       # the metric's own SQL as its reader role
-$J recrawl-sync                                 # live run -> recrawl.{host,doc}
-$J recrawl-plan --dry-run                       # per-host capacity report
-# loops, after the crawler takes recrawl files (docs/CRAWLER_RECRAWL_PROPOSAL.md):
-# docker compose -f deploy/compose.compute.yaml --profile recrawl up -d recrawl-plan recrawl-archive
 ```
 
 SERP 指令需要自己的 `ISEL_SERPAPI_KEY`、`ISEL_SERPER_KEY`，不能用課程的 `SERPAPI_KEY`。完整步驟、讀取時段限制和偽 golden 的校準門檻見 `docs/DESIGN.md` §5.1、§9–§10。容器和部署見 §12。
@@ -91,6 +87,5 @@ SERP 指令需要自己的 `ISEL_SERPAPI_KEY`、`ISEL_SERPER_KEY`，不能用課
 | `selectdb.py` | 唯一的寫入連線（禁止 port 與外部表檢查）、Alembic migration、讀者角色 |
 | `migrations/` | Alembic 的 `env.py` 和 revision |
 | `publish.py` | selectdb 清單的載入、swap、rollback，以及照 Metric 的方式讀清單 |
-| `manifest.py` | selection 的輸出契約（doc_id、host、domain_id、crawl_shard、rank），給 publish、recrawl 和未來的 indexer |
-| `recrawl.py` | recrawl frontier：sync 載入 live run、plan 寫 crawler 的 queue 檔、archive 套用 fetch log 並保存 WARC |
+| `manifest.py` | selection 的輸出契約（doc_id、host、domain_id、crawl_shard、rank），給 publish 和未來的 recrawl、indexer |
 | `cli.py` | 子指令 |
