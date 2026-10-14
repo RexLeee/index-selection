@@ -471,18 +471,22 @@ def _validate(cfg: Config) -> None:
          "manifest.canonical_workers and manifest.canonical_batch_rows must be > 0")
     need(cfg.duckdb.threads > 0, "duckdb.threads must be > 0")
     _validate_full(cfg, need)
+    _validate_selectdb(cfg, need)
 
 
 def _validate_full(cfg: Config, need: Any) -> None:
-    f, s, g = cfg.full, cfg.selectdb, cfg.guard
+    f, g = cfg.full, cfg.guard
     need(f.chunk_blocks > 0 and f.chunks_per_file > 0,
          "full.chunk_blocks and full.chunks_per_file must be > 0")
     # A chunk read at the worst-case speed must still finish inside its timeout.
     need(f.chunk_blocks * 8192 <= g.min_mb_s * 1_000_000 * g.timeout_cap_s,
          "full.chunk_blocks must be readable at guard.min_mb_s within guard.timeout_cap_s")
-    need(f.min_free_gb >= 0 and f.tau_margin >= 0,
-         "full.min_free_gb and full.tau_margin must be >= 0")
+    need(f.min_free_gb >= 0, "full.min_free_gb must be >= 0")
     need(f.parse_threads > 0, "full.parse_threads must be > 0")
+    need(f.connections > 0 and f.max_heap_mb_s > 0,
+         "full.connections and full.max_heap_mb_s must be > 0")
+    need(all(cfg.crawlerdb.session.get(k) == v for k, v in CSV_SESSION.items()),
+         f"crawlerdb.session must set {CSV_SESSION} for the CSV text the full export parses")
     need(0 < f.sample_percent <= 100
          and abs(f.sample_percent * 1e4 - round(f.sample_percent * 1e4)) < 1e-9,
          "full.sample_percent must be in (0, 100] with at most 4 decimals")
@@ -491,11 +495,12 @@ def _validate_full(cfg: Config, need: Any) -> None:
     need(0 < f.agg_share < 1, "full.agg_share must be in (0, 1)")
     need(bool(f.agg_salt) and f.agg_salt not in (f.sample_salt, cfg.dataset.neg_salt),
          "full.agg_salt must be set and differ from full.sample_salt and dataset.neg_salt")
+    need(f.tau_margin >= 0, "full.tau_margin must be >= 0")
     need(f.kept_share_max_z >= 0, "full.kept_share_max_z must be >= 0")
-    need(f.connections > 0 and f.max_heap_mb_s > 0,
-         "full.connections and full.max_heap_mb_s must be > 0")
-    need(all(cfg.crawlerdb.session.get(k) == v for k, v in CSV_SESSION.items()),
-         f"crawlerdb.session must set {CSV_SESSION} for the CSV text the full export parses")
+
+
+def _validate_selectdb(cfg: Config, need: Any) -> None:
+    s = cfg.selectdb
     need(len({s.admin_dsn_env, s.reader_dsn_env, cfg.crawlerdb.dsn_env,
               cfg.metricdb.dsn_env}) == 4,
          "selectdb DSN env vars must differ from each other and from the read-only DBs")

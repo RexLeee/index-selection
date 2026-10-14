@@ -15,8 +15,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from isel.config import KNOWN_BASELINES, SERP_PROVIDERS, Config, ConfigError, load_config
-from isel.features import FeatureStore
+from isel.config import SERP_PROVIDERS, Config, ConfigError, load_config
 from isel.io import atomic_write_json, open_duckdb, read_json, sql_str
 
 
@@ -37,6 +36,8 @@ def _names(text: str | None, default: list[str]) -> list[str]:
 
 def _baselines(text: str | None, cfg: Config) -> list[str]:
     """Baseline names from `--baselines` (default `eval.baselines`); unknown names exit."""
+    from isel.config import KNOWN_BASELINES
+
     names = _names(text, cfg.eval.baselines)
     unknown = sorted(set(names) - set(KNOWN_BASELINES))
     if unknown:
@@ -176,7 +177,9 @@ def cmd_build_dataset(cfg: Config, args: argparse.Namespace) -> Any:
     canonical spelling; the official metric compares the raw spelling, so it can
     never count them as indexed.
     """
-    store = FeatureStore(cfg, open_duckdb(cfg, cfg.work_dir / "duckdb_tmp"), cfg.work_dir)
+    from isel.features import open_store
+
+    store = open_store(cfg, cfg.work_dir)
     summary = {}
     for b in store.batches:
         (positives, head, rand, canonical_only) = store.con.execute(
@@ -334,8 +337,9 @@ def cmd_validate_manifest(cfg: Config, args: argparse.Namespace) -> Any:
 def cmd_check_config(cfg: Config, args: argparse.Namespace) -> Any:
     from isel.features import resolve_set
 
-    return {"config_sha256": cfg.sha256(),
-            "feature_sets": {n: len(resolve_set(cfg, n)) for n in cfg.features.sets}}
+    out: dict[str, Any] = {"config_sha256": cfg.sha256()}
+    out["feature_sets"] = {n: len(resolve_set(cfg, n)) for n in cfg.features.sets}
+    return out
 
 
 def build_parser() -> argparse.ArgumentParser:

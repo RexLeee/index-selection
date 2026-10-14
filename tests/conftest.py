@@ -28,7 +28,8 @@ def small_cfg(work_dir: Path) -> Config:
                   bootstrap_samples=50)
     cfg = replace(cfg, "duckdb", threads=2, memory_limit="2GB",
                   max_temp_directory_size="2GB")
-    return replace(cfg, "manifest", index_shards=4)
+    cfg = replace(cfg, "manifest", index_shards=4)
+    return cfg
 
 
 @pytest.fixture

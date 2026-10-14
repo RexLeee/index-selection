@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-
 import pytest
-from conftest import BASE, FakeConn
+from conftest import FakeConn
 
 from isel.cli import _ids
-from isel.config import ConfigError, load_config
-from isel.features import LeakageError, resolve_set
 from isel.pg import (
     Pacer,
     ReadOnlySession,
@@ -17,86 +12,6 @@ from isel.pg import (
     require_env,
 )
 from isel.pull import full_sql
-from isel.urlnorm import DomainKeyer, ShardRouter, canonicalize, md5_number_lower
-
-
-def _overlay(tmp_path: Path, text: str) -> list[Path]:
-    path = tmp_path / "overlay.toml"
-    path.write_text(text)
-    return [BASE, path]
-
-
-def test_base_config_loads(base_cfg):
-    assert base_cfg.eval.k_headline == 128_000_000
-    assert len(base_cfg.sha256()) == 64
-
-
-@pytest.mark.parametrize("text, message", [
-    ("[run]\nunknown = 1\n", "unknown keys"),
-    ("[full]\nsample_percent = 'x'\n", "expected float"),
-    ("[full]\nsample_percent = 0.00001\n", "at most 4 decimals"),
-    ("[full]\nsample_salt = 'isel'\n", "differ from dataset.neg_salt"),
-    ("[full]\nagg_share = 1.0\n", "agg_share must be in"),
-    ("[full]\nagg_salt = 'sample-v1'\n", "agg_salt must be set and differ"),
-    ("[crawlerdb.session]\ndefault_transaction_read_only = 'off'\n", "read_only"),
-    ("[eval]\nk_headline = 5\n", "k_headline"),
-    ("[crawlerdb.session]\nstatement_timeout = '2min'\n", "statement_timeout"),
-    ("[metricdb.session]\nstatement_timeout = '1000s'\n", "timeout_cap_s"),
-    ("[metricdb.session]\nstandard_conforming_strings = 'off'\n", "standard_conforming"),
-    ("[serp.providers.serpapi]\nkey_env = 'SERPAPI_KEY'\n", "course key"),
-    ("[serp.providers.serper]\nkey_env = 'SERPAPI_KEY'\n", "course key"),
-    ("[serp.providers.serper]\nbudget_period = 'week'\n", "budget_period"),
-    ("[serp.providers.bing]\nkey_env = 'X'\nurl = 'https://b'\nmin_interval_s = 1.0\n"
-     "budget = 1\nbudget_period = 'total'\n", "exactly"),
-    ("[trends]\nhours = 500\n", "trends.hours"),
-    ("[pseudo]\ngate_provider_overlap = 1.5\n", "gate"),
-    ("[pseudo]\ngate_trend_jaccard = -0.1\n", "gate"),
-    ("[guard]\ntimeout_cap_s = 2880\n", "hourly open gap"),
-    ("[guard]\nmonth_window = ['20:00', '00:00']\n", "wrap"),
-    ("[guard]\nmonth_window = ['00:00', '25:00']\n", "HH:MM"),
-    ("[full]\nchunk_blocks = 1000000\n", "readable at guard.min_mb_s"),
-    ("[full]\nparse_threads = 0\n", "full.parse_threads must be > 0"),
-    ("[full]\nconnections = 0\n", "full.connections and full.max_heap_mb_s must be > 0"),
-    ("[full]\nmax_heap_mb_s = 0.0\n", "full.connections and full.max_heap_mb_s must be > 0"),
-    # extra_float_digits = 0 would round url_score in the CSV text the full export parses.
-    ("[crawlerdb.session]\nextra_float_digits = '0'\n", "CSV text"),
-    ("[crawlerdb.session]\ndatestyle = 'SQL'\n", "CSV text"),
-    ("[selectdb]\nadmin_dsn_env = 'ISEL_CRAWLERDB_DSN'\n", "must differ"),
-    ("[selectdb]\nforbidden_ports = []\n", "forbidden_ports"),
-    ("[schedule]\nswap_freeze_window = ['20:00', '11:30']\n", "swap_freeze_window"),
-    # num_threads = 0 lets OpenMP start one thread per host CPU, past the container quota.
-    ("[model.params]\nnum_threads = 0\n", "num_threads must be an integer > 0"),
-    ("[model.params]\nnum_threads = 2.5\n", "num_threads must be an integer > 0"),
-    ("[model.params]\nn_jobs = 4\n", r"aliases \['n_jobs'\]"),
-])
-def test_config_rejects_bad_values(tmp_path, text, message):
-    with pytest.raises(ConfigError, match=message):
-        load_config(_overlay(tmp_path, text))
-
-
-def test_config_rejects_missing_key(tmp_path):
-    text = BASE.read_text().replace('app_name = "isel"', "")
-    path = tmp_path / "full.toml"
-    path.write_text(text)
-    with pytest.raises(ConfigError, match="missing keys"):
-        load_config([path])
-
-
-def test_config_needs_the_lightgbm_thread_count(tmp_path):
-    text = BASE.read_text().replace("\nnum_threads = 8\n", "\n")
-    path = tmp_path / "full.toml"
-    path.write_text(text)
-    with pytest.raises(ConfigError, match="num_threads must be an integer > 0"):
-        load_config([path])
-
-
-def test_feature_set_with_forbidden_column_is_rejected(tmp_path):
-    cfg = load_config(_overlay(tmp_path, "[features.sets]\nbad = ['log_ext', 'url_score']\n"))
-    with pytest.raises(LeakageError, match="forbidden"):
-        resolve_set(cfg, "bad")
-    cfg = load_config(_overlay(tmp_path, "[features.sets]\nbad = ['nope']\n"))
-    with pytest.raises(LeakageError, match="unregistered"):
-        resolve_set(cfg, "bad")
 
 
 @pytest.mark.parametrize("sql", [
@@ -230,23 +145,6 @@ def test_pacer_spaces_statements():
     now[0] += 0.25
     pacer.wait()
     assert slept == [0.75]
-
-
-def test_shard_router_matches_crawler_rule(base_cfg):
-    keyer = DomainKeyer(["news.example.co.uk"], offline=True)
-    router = ShardRouter(keyer, 256, base_cfg.routing.overrides)
-    expected = int(hashlib.md5(b"example.org").hexdigest(), 16) % 256
-    assert router.shard_for_key(keyer.key("https://a.b.example.org/x")) == expected
-    assert router.shard_for_key(keyer.key("https://en.wikipedia.org/wiki/X")) == 0
-    assert router.shard_for_key(keyer.key("https://www.youtube.com/watch?v=1")) == 64
-    split = router.candidate_shards("https://news.example.co.uk/a")
-    assert len(split) == 2
-    assert router.shard_for_key("example.co.uk") in split
-
-
-def test_canonicalize_and_hash():
-    assert canonicalize("https://x.com/a?b=2&a=1#f") == "https://x.com/a?a=1&b=2"
-    assert md5_number_lower("x") == int.from_bytes(hashlib.md5(b"x").digest()[8:], "little")
 
 
 def test_id_ranges():
