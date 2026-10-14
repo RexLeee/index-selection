@@ -335,9 +335,9 @@ def cmd_validate_manifest(cfg: Config, args: argparse.Namespace) -> Any:
 
 
 def cmd_check_config(cfg: Config, args: argparse.Namespace) -> Any:
+    out: dict[str, Any] = {"config_sha256": cfg.sha256()}
     from isel.features import resolve_set
 
-    out: dict[str, Any] = {"config_sha256": cfg.sha256()}
     out["feature_sets"] = {n: len(resolve_set(cfg, n)) for n in cfg.features.sets}
     return out
 
