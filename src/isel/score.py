@@ -28,9 +28,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from isel.backtest import frozen_model, open_store
+from isel.backtest import frozen_model
 from isel.config import Config
-from isel.features import FeatureStore
+from isel.features import FeatureStore, open_store
 from isel.io import (
     atomic_write_json,
     code_version,

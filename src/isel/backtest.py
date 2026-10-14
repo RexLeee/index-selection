@@ -22,9 +22,9 @@ from isel.evaluate import (
     pooled,
     render_report,
 )
-from isel.features import FeatureStore, resolve_set
+from isel.features import FeatureStore, open_store, resolve_set
 from isel.golden import PSEUDO, read_golden
-from isel.io import atomic_write_json, code_version, open_duckdb, sql_str, utc_id
+from isel.io import atomic_write_json, code_version, sql_str, utc_id
 from isel.manifest import write_run
 from isel.model import (
     FORWARD_ONLY,
@@ -35,10 +35,6 @@ from isel.model import (
     fit_logreg,
     rule_score,
 )
-
-
-def open_store(cfg: Config, work_dir: Path, next_batch: bool = False) -> FeatureStore:
-    return FeatureStore(cfg, open_duckdb(cfg, work_dir / "duckdb_tmp"), work_dir, next_batch)
 
 
 def model_name(feature_set: str) -> str:

@@ -8,8 +8,8 @@ import pytest
 from conftest import replace, small_cfg
 from synth import SNAPSHOT, crawl_rows, make_world, write_export, write_work_dir
 
-from isel.backtest import open_store
 from isel.derive import derive_positives, derive_sample
+from isel.features import open_store
 from isel.golden import golden_table
 from isel.io import atomic_write_json, read_json, write_parquet_atomic
 from isel.urlnorm import canonicalize

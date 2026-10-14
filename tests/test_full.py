@@ -8,8 +8,8 @@ import pytest
 from conftest import replace, small_cfg
 from synth import SNAPSHOT, crawl_rows, make_world, write_export, write_work_dir
 
-from isel.backtest import open_store, select_sample, train_frozen
-from isel.features import FeatureStore
+from isel.backtest import select_sample, train_frozen
+from isel.features import FeatureStore, open_store
 from isel.io import atomic_write_json, read_json, write_parquet_atomic
 from isel.pull import FULL_SCHEMA
 from isel.score import SCORED_SCHEMA, NotEnoughCandidates, score_full, select_full
