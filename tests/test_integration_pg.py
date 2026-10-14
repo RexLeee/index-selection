@@ -420,6 +420,8 @@ def test_publish_swap_freeze_rollback_and_the_metric_query(selectdb, tmp_path):
     head = result["tags"]["head"]
     assert head["golden_urls"] == 3 and head["indexed"] == 2
     assert head["indexed_exact_rate"] == pytest.approx(2 / 3)
+    # The metric looks up only q=1%2C2, while the list holds the raw q=1,2.
+    assert head["indexed_metric_rate"] == pytest.approx(1 / 3)
     assert [r["run_label"] for r in result["live_runs"]] == ["r1"]
     reader = connect(cfg, cfg.selectdb.reader_dsn_env, read_only=True)
     try:

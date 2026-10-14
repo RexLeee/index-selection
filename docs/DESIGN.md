@@ -249,7 +249,7 @@ lift_x = ln(r_x / r_global)
 
 **指標：**
 
-- `indexed_exact_rate`：原始字串完全比對，等於官方 metric。官方用 SerpApi 原始 `link` 對 `selected_urls_current.url` 做完全比對，沒有任何正規化（`WebSearchEngine/Metric/Measure/CrawlerAllMetricMeasure.py:79-84, 207-209`）。
+- `indexed_exact_rate`：原始字串完全比對，等於 2026-10-09 以前的官方 metric（`b0bea75`）。回測的主數字維持用它，才能和已記錄的實驗比較。
 - `indexed_canonical_rate`：原始拼法或 canonical 拼法的字串有一個入選就算。它不涵蓋 http/https、`www` 這類等價拼法。
 - `crawled_exact_rate`、`crawled_canonical_rate`：as-of 時已爬的上限。
 - 三種 K：`k_values`、`fractions`（pool 的比例）、`gain_curve_k`。
@@ -312,14 +312,13 @@ schema 只定義在 `src/isel/schema.py`（SQLAlchemy Core）。改動用 `src/i
 - 清單表的約束一律叫 `<table>_pkey`、`<table>_run_id_fkey`。`swap` 和 `rollback` 改表名時一起改約束名。
 - live 的 `:5445` 在 Alembic 之前就建好了。第一次要用 `migrate-selectdb --stamp-baseline`：先記錄 revision 0001，再升級。
 
-- **Metric 怎麼讀：** `SELECT url FROM public.selected_urls_current WHERE url = ANY(:urls)`，每次 1 萬個 URL，用寫死的 `select` 帳號。golden 原始字串出現在表中就算 indexed（`WebSearchEngine` main 的 `b0bea75`）。
+- **Metric 怎麼讀：** `SELECT url FROM public.selected_urls_current WHERE url = ANY(:urls)`，每次 1 萬個 URL，用寫死的 `select` 帳號。從 `WebSearchEngine` main 的 `09c732e`（PR #7）起，它先對 golden URL 做 `canonicalize_url`，只查 canonical 拼法；canonical 相同的原始 URL 只算一次。
 - **載入：** `publish` 先驗證 manifest 的 checksum，再在一個交易內用 `LIKE selected_urls_current` 建 `selected_urls_r<id>`、`COPY FREEZE`、加 PK 和 FK、`ANALYZE`，並檢查列數等於 K。DB 不在最新 revision 時，`publish` 拒絕執行。`wal_level=minimal` 下，同一交易內建立並填滿的表不寫 WAL。這時讀者還看不到新表。
 - **切換：** `swap` 在 `lock_timeout` 5 秒內把 current 改名成 prev，再把新表改名成 current。讀者最多等幾毫秒，不會看到一半的清單。
 - **凍結時段：** 1、16 日 11:30–20:00 UTC 拒絕 swap。Metric 在 12:00 建 random set、18:00 建 head set，建完立刻量。
 - **回滾：** `rollback` 對調 current 和 prev。新的 load 或 rollback 會丟掉所有已載入但沒 swap 的表。
 - **讀者帳號：** `migrate-selectdb` 建 `select` 角色，密碼和 Metric 寫死的相同，只有 `public` 的 SELECT 權限。
-- **自我檢查：** `verify-live --batch <b>` 用 `select` 帳號送同一條 SQL。exact 比率等於 Metric 的 `indexed_rate`（找到的不重複原始 URL ÷ 不重複原始 URL），另外報 canonical 比率和以 query 為單位的 bootstrap CI。
-- ⚠️ 未合併的 WebSearchEngine PR #5 會改成「原始或 canonical 拼法都算，而且要已爬」。到時 `indexed_canonical_rate` 比較接近官方數字。
+- **自我檢查：** `verify-live --batch <b>` 用 `select` 帳號送同一條 SQL。`indexed_metric_rate` 等於 Metric 的 `indexed_rate`（找到的 canonical URL ÷ 不重複 canonical URL）。另外報回測用的 exact、canonical 比率和以 query 為單位的 bootstrap CI。
 
 ---
 

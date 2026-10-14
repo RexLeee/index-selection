@@ -131,6 +131,16 @@ def rates(golden: Golden, listed: set[str]) -> tuple[set[str], float, float]:
     return exact, len(exact) / len(urls), canonical / len(urls)
 
 
+
+def metric_rate(golden: Golden, listed: set[str]) -> float:
+    """The official `indexed_rate`: distinct canonical golden URLs found in the list.
+
+    WebSearchEngine `09c732e` canonicalizes each golden URL, looks only that key
+    up in `selected_urls_current` and counts raw URLs sharing a key once.
+    """
+    keys = set(golden.canonical.values())
+    return sum(k in listed for k in keys) / len(keys)
+
 def evaluate_batch(cfg: Config, frame: pa.Table, scores: Mapping[str, np.ndarray],
                    golden: Mapping[str, Golden], rate: float, reference: str
                    ) -> tuple[dict[str, Any], dict[str, dict[str, set[str]]]]:

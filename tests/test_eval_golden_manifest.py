@@ -11,7 +11,15 @@ import pytest
 from conftest import replace
 
 from isel.dataset import tag_weights
-from isel.evaluate import Golden, Ranker, _per_query, bootstrap, paired_bootstrap, rates
+from isel.evaluate import (
+    Golden,
+    Ranker,
+    _per_query,
+    bootstrap,
+    metric_rate,
+    paired_bootstrap,
+    rates,
+)
 from isel.golden import (
     OFFICIAL,
     PSEUDO,
@@ -84,6 +92,15 @@ def test_rates_count_exact_and_canonical():
                                                     "https://b/": "https://b/"})
     exact, r_exact, r_canon = rates(g, {"https://a/"})
     assert exact == set() and r_exact == 0.0 and r_canon == 0.5
+
+
+def test_metric_rate_counts_each_canonical_url_once_as_the_metric_does():
+    g = Golden({1: {"https://a/?y=2&x=1", "https://a/?x=1&y=2", "https://b/#f"}},
+               {"https://a/?y=2&x=1": "https://a/?x=1&y=2",
+                "https://a/?x=1&y=2": "https://a/?x=1&y=2",
+                "https://b/#f": "https://b/"})
+    assert metric_rate(g, {"https://a/?x=1&y=2"}) == 0.5
+    assert metric_rate(g, {"https://b/#f"}) == 0.0     # a listed raw spelling is not the key
 
 
 def test_tag_weights_balance_head_and_random():
