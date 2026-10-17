@@ -28,9 +28,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from isel.backtest import frozen_model, open_store
+from isel.backtest import frozen_model
 from isel.config import Config
-from isel.features import FeatureStore
+from isel.features import FeatureStore, open_store
 from isel.io import (
     atomic_write_json,
     code_version,
@@ -212,8 +212,8 @@ def select_full(cfg: Config, work_dir: Path, k: int) -> dict[str, Any]:
 
     Order: `RANK_ORDER`, the same order as the backtest boundary. A URL found
     in two shards keeps its best score and that row's shard. The crawler's
-    `domain_id` comes from the export shard the row was scored in, so the
-    recrawl queue reaches the crawler process that owns the domain.
+    `domain_id` comes from the export shard the row was scored in, so a
+    consumer can route the page to the crawler process that owns the domain.
 
     Raises:
         NotEnoughCandidates: If fewer than K distinct URLs were kept.

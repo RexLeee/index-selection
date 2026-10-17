@@ -27,7 +27,7 @@ import psycopg
 from psycopg import sql
 
 from isel.config import Config, ScheduleCfg, hhmm_minutes
-from isel.evaluate import bootstrap, golden_by_tag, rates
+from isel.evaluate import bootstrap, golden_by_tag, metric_rate, rates
 from isel.golden import read_golden
 from isel.io import assert_no_secrets, open_duckdb, sql_str
 from isel.manifest import validate_run
@@ -252,9 +252,9 @@ def verify_live(cfg: Config, work_dir: Path, batch: int) -> dict[str, Any]:
     """The indexed rate of `batch` under the live list, read as the official metric reads it.
 
     Connects as the metric's reader role and sends the metric's own query in
-    chunks of `selectdb.verify_chunk` URLs. The exact rate equals the metric's
-    `indexed_rate` (distinct raw URLs found / distinct raw URLs); the canonical
-    rate also accepts the canonical spelling.
+    chunks of `selectdb.verify_chunk` URLs. The metric rate equals the metric's
+    `indexed_rate` (canonical golden URLs found / canonical golden URLs); the
+    exact and canonical rates are the backtest's, for comparison.
     """
     golden = golden_by_tag(read_golden(work_dir).to_pylist(), batch, cfg.golden.tags)
     if not golden:
@@ -278,6 +278,7 @@ def verify_live(cfg: Config, work_dir: Path, batch: int) -> dict[str, Any]:
                 tags[tag] = {"golden_urls": len(g.urls), "indexed": len(exact),
                              "indexed_exact_rate": r_exact,
                              "indexed_canonical_rate": r_canonical,
+                             "indexed_metric_rate": metric_rate(g, listed),
                              "ci95": list(bootstrap(g.queries, exact, e.bootstrap_samples,
                                                     e.bootstrap_seed))}
     finally:

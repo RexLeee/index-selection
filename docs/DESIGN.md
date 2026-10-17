@@ -80,9 +80,10 @@ recrawl 的檔案不在 `/work`，路徑由 `[recrawl]` 設定（Host2 的值見
 
 | 路徑 | 內容 | 寫入者 |
 |---|---|---|
-| `/data/ipc/recrawl_queue/crawler_NN/domain_<host_id>.json` | 給 crawler 的 queue 檔，一個 hostname 一個 | `recrawl-plan` |
-| `/data/ipc/recrawl_result/crawler_NN/recrawl-NN-<ts>Z-<seq>.{warc.gz,jsonl}` | crawler 的 WARC 和 fetch log | crawler（`docs/CRAWLER_RECRAWL_PROPOSAL.md` C6） |
-| `/data/isel_warc/YYYYMMDD/crawler_NN/` | 永久保存的 WARC 和 gzip 的 fetch log | `recrawl-archive` |
+| `/data/ipc/recrawl_queue/crawler_NN/domain_<host_id>.json` | 給 crawler 的 queue 檔，一個 hostname 一個 | crawler 的 API（`recrawl-plan` 經 `POST recrawl-batches` 送出，`docs/CRAWLER_RECRAWL_PROPOSAL.md` C10）；isel 不寫 `/data/ipc` |
+| `/data/ipc/recrawl_result/crawler_NN/recrawl-NN-<ts>Z-<seq>.{warc.gz,jsonl}` | crawler 的 WARC 和 fetch log，保留 24 小時 | crawler（C6、C8）；`recrawl-archive` 只讀 |
+| `/data/isel/text/fetch_date=YYYYMMDD/crawler_NN/<base>.parquet` | 抽出的正文，永久保存，建 inverted index 的來源 | `recrawl-archive` |
+| `/data/isel/log/YYYYMMDD/crawler_NN/<base>.jsonl.gz` | gzip 的 fetch log，永久保存，重建 DB 的依據 | `recrawl-archive` |
 
 所有檔案都先寫成 `.tmp`，fsync 後才 rename（`io.py`）。
 
@@ -257,7 +258,7 @@ lift_x = ln(r_x / r_global)
 
 **指標：**
 
-- `indexed_exact_rate`：原始字串完全比對，等於官方 metric。官方用 SerpApi 原始 `link` 對 `selected_urls_current.url` 做完全比對，沒有任何正規化（`WebSearchEngine/Metric/Measure/CrawlerAllMetricMeasure.py:79-84, 207-209`）。
+- `indexed_exact_rate`：原始字串完全比對，等於 2026-10-09 以前的官方 metric（`b0bea75`）。回測的主數字維持用它，才能和已記錄的實驗比較。
 - `indexed_canonical_rate`：原始拼法或 canonical 拼法的字串有一個入選就算。它不涵蓋 http/https、`www` 這類等價拼法。
 - `crawled_exact_rate`、`crawled_canonical_rate`：as-of 時已爬的上限。
 - 三種 K：`k_values`、`fractions`（pool 的比例）、`gain_curve_k`。
@@ -315,20 +316,19 @@ schema 只定義在 `src/isel/schema.py`（SQLAlchemy Core）。改動用 `src/i
 |---|---|---|
 | `public` | `selected_urls_current` | `url` PK、`score`、`first_seen`（NULL）、`run_id` FK（`ON DELETE RESTRICT`）、`selected_at`。欄位和 V1 相同 |
 | `public` | `model_runs` | V1 的欄位，加上 `status`（CHECK：loading、validated、live、retired、abandoned、rolled_back；最多一個 live）、`activated_at`、`config_sha256`、`code_version` |
-| `recrawl` | `host`、`doc`、`batch_seq` | recrawl 的 frontier：一個 hostname 一個 back queue，一個 doc 一列，見 `docs/RECRAWL_DESIGN.md` §4.4。`select` 角色沒有這個 schema 的 USAGE |
+| `recrawl` | `host`、`doc`、`log`、`batch_seq` | recrawl 的 frontier：一個 hostname 一個 back queue，一個 doc 一列，`log` 記錄處理過的 fetch log。見 `docs/RECRAWL_DESIGN.md` §4.4。`select` 角色沒有這個 schema 的 USAGE |
 
 - `run_id`、`selected_at`、`first_seen` 每列都相同。這是刻意的反正規化，因為 V1 的讀者在每列讀這些欄位。
 - 清單表的約束一律叫 `<table>_pkey`、`<table>_run_id_fkey`。`swap` 和 `rollback` 改表名時一起改約束名。
 - live 的 `:5445` 在 Alembic 之前就建好了。第一次要用 `migrate-selectdb --stamp-baseline`：先記錄 revision 0001，再升級。
 
-- **Metric 怎麼讀：** `SELECT url FROM public.selected_urls_current WHERE url = ANY(:urls)`，每次 1 萬個 URL，用寫死的 `select` 帳號。golden 原始字串出現在表中就算 indexed（`WebSearchEngine` main 的 `b0bea75`）。
+- **Metric 怎麼讀：** `SELECT url FROM public.selected_urls_current WHERE url = ANY(:urls)`，每次 1 萬個 URL，用寫死的 `select` 帳號。從 `WebSearchEngine` main 的 `09c732e`（PR #7）起，它先對 golden URL 做 `canonicalize_url`，只查 canonical 拼法；canonical 相同的原始 URL 只算一次。
 - **載入：** `publish` 先驗證 manifest 的 checksum，再在一個交易內用 `LIKE selected_urls_current` 建 `selected_urls_r<id>`、`COPY FREEZE`、加 PK 和 FK、`ANALYZE`，並檢查列數等於 K。DB 不在最新 revision 時，`publish` 拒絕執行。`wal_level=minimal` 下，同一交易內建立並填滿的表不寫 WAL。這時讀者還看不到新表。
 - **切換：** `swap` 在 `lock_timeout` 5 秒內把 current 改名成 prev，再把新表改名成 current。讀者最多等幾毫秒，不會看到一半的清單。
 - **凍結時段：** 1、16 日 11:30–20:00 UTC 拒絕 swap。Metric 在 12:00 建 random set、18:00 建 head set，建完立刻量。
 - **回滾：** `rollback` 對調 current 和 prev。新的 load 或 rollback 會丟掉所有已載入但沒 swap 的表。
 - **讀者帳號：** `migrate-selectdb` 建 `select` 角色，密碼和 Metric 寫死的相同，只有 `public` 的 SELECT 權限。
-- **自我檢查：** `verify-live --batch <b>` 用 `select` 帳號送同一條 SQL。exact 比率等於 Metric 的 `indexed_rate`（找到的不重複原始 URL ÷ 不重複原始 URL），另外報 canonical 比率和以 query 為單位的 bootstrap CI。
-- ⚠️ 未合併的 WebSearchEngine PR #5 會改成「原始或 canonical 拼法都算，而且要已爬」。到時 `indexed_canonical_rate` 比較接近官方數字。
+- **自我檢查：** `verify-live --batch <b>` 用 `select` 帳號送同一條 SQL。`indexed_metric_rate` 等於 Metric 的 `indexed_rate`（找到的 canonical URL ÷ 不重複 canonical URL）。另外報回測用的 exact、canonical 比率和以 query 為單位的 bootstrap CI。
 
 ---
 
@@ -371,7 +371,7 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 
 ### 8.4 recrawl 預算
 
-> 2026-10-12 的調研取代本節的估算。完整設計和每 host 0.2 qps 的容量分析見 [`RECRAWL_DESIGN.md`](RECRAWL_DESIGN.md)。
+> 2026-10-12 的調研取代本節的估算。完整設計和每 host 0.2 qps 的容量分析見 [`RECRAWL_DESIGN.md`](RECRAWL_DESIGN.md)；crawler 端的改動見 [`CRAWLER_RECRAWL_PROPOSAL.md`](CRAWLER_RECRAWL_PROPOSAL.md)。程式已實作，還沒上線。
 
 - 每兩週全量重抓 1.28 億頁，等於每天 9.1M 頁，佔 crawler 產能（每天 26–29M）約 34%。
 - 所以只抓 delta（`added`）和過期的頁。
@@ -498,7 +498,7 @@ Mac 經 VPN 只有約 4 MB/s，全量匯出只能在伺服器上跑。
 | 設定 | 理由 |
 |---|---|
 | `profiles: [job]`，用 `run --rm` | 一個指令一個容器，跑完就刪；`up` 不會啟動它；不設 restart、不開 port |
-| 例外：`recrawl-plan`、`recrawl-archive`（`profiles: [recrawl]`） | 它們要持續餵 crawler 和收結果，所以是常駐 service，`restart: unless-stopped`。每個只能跑一個實例，靠 advisory lock 保證。`/data` 整個掛一次，搬 WARC 用 rename；分開掛會出現 EXDEV（跨掛載點的 rename 錯誤）。限制 2 CPU、4 GB |
+| 例外：`recrawl-plan`、`recrawl-archive`（`profiles: [recrawl]`） | 它們要持續送 batch 和收結果，所以是常駐 service，`restart: unless-stopped`。每個只能跑一個實例，靠 advisory lock 保證。`recrawl-plan` 用 `network_mode: host` 連 `127.0.0.1:4000` 的 gateway，限制 2 CPU、4 GB；`recrawl-archive` 有 `archive_workers` 個抽取 process，限制 8 CPU、8 GB。兩者都唯讀掛載 `/data/ipc/recrawl_result`，可寫掛載 `/data/isel` |
 | `init: true` | Ctrl-C 和 `docker stop` 能傳到 isel；所有指令都可續跑 |
 | `read_only: true`、`tmpfs: /tmp` | 只有 `/work` 可寫 |
 | secret 檔 + `<NAME>_FILE` | DSN 不出現在 `docker inspect`、env 或 log（V1 的 cron 檔就外洩過 DSN） |
@@ -565,9 +565,9 @@ $J recrawl-sync                              # after each swap; refused in the f
                                             # New docs are due from now: run it shortly
                                             # before the first recrawl-plan (pacing deadline)
 $J recrawl-plan --dry-run                    # per-host capacity report; writes nothing
-# only after the crawler reads recrawl files (docs/CRAWLER_RECRAWL_PROPOSAL.md §6)
+# only after the crawler serves recrawl-batches (docs/CRAWLER_RECRAWL_PROPOSAL.md C5, C6, C10)
 $D --profile recrawl up -d recrawl-plan recrawl-archive
-$D --profile recrawl stop recrawl-plan       # stops new queue files at once
+$D --profile recrawl stop recrawl-plan       # stops sending new batches at once
 ```
 
 - 長指令用 `nohup`，或在 `tmux` 裡跑；中斷後重跑同一個指令就會續跑。

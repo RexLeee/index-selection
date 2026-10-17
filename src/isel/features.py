@@ -30,7 +30,7 @@ import pyarrow as pa
 
 from isel.config import Config
 from isel.golden import OFFICIAL, golden_files
-from isel.io import read_json, sql_str
+from isel.io import open_duckdb, read_json, sql_str
 from isel.urlnorm import HOST_RE, DomainKeyer
 
 PATH_RE = r"^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*([^?#]*)"
@@ -571,3 +571,7 @@ WHERE c.is_sample AND c.last_fetch_ok < {_ts(b.as_of)}
         row = self.con.execute(
             f"SELECT g, hb FROM glob_stats WHERE batch_id = {batch_id}").fetchone()
         return bool(row) and row[0] > 0 and row[1] >= 1 and not math.isnan(row[0])
+
+
+def open_store(cfg: Config, work_dir: Path, next_batch: bool = False) -> FeatureStore:
+    return FeatureStore(cfg, open_duckdb(cfg, work_dir / "duckdb_tmp"), work_dir, next_batch)

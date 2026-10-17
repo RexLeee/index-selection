@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from datetime import UTC, datetime
 
 import duckdb
@@ -11,7 +14,15 @@ import pytest
 from conftest import replace
 
 from isel.dataset import tag_weights
-from isel.evaluate import Golden, Ranker, _per_query, bootstrap, paired_bootstrap, rates
+from isel.evaluate import (
+    Golden,
+    Ranker,
+    _per_query,
+    bootstrap,
+    metric_rate,
+    paired_bootstrap,
+    rates,
+)
 from isel.golden import (
     OFFICIAL,
     PSEUDO,
@@ -21,7 +32,7 @@ from isel.golden import (
     read_golden,
     summarize,
 )
-from isel.manifest import ManifestError, to_pg_bigint, validate_run, write_run
+from isel.manifest import ManifestError, _worker_env, to_pg_bigint, validate_run, write_run
 from isel.urlnorm import md5_number_lower
 
 
@@ -84,6 +95,15 @@ def test_rates_count_exact_and_canonical():
                                                     "https://b/": "https://b/"})
     exact, r_exact, r_canon = rates(g, {"https://a/"})
     assert exact == set() and r_exact == 0.0 and r_canon == 0.5
+
+
+def test_metric_rate_counts_each_canonical_url_once_as_the_metric_does():
+    g = Golden({1: {"https://a/?y=2&x=1", "https://a/?x=1&y=2", "https://b/#f"}},
+               {"https://a/?y=2&x=1": "https://a/?x=1&y=2",
+                "https://a/?x=1&y=2": "https://a/?x=1&y=2",
+                "https://b/#f": "https://b/"})
+    assert metric_rate(g, {"https://a/?x=1&y=2"}) == 0.5
+    assert metric_rate(g, {"https://b/#f"}) == 0.0     # a listed raw spelling is not the key
 
 
 def test_tag_weights_balance_head_and_random():
@@ -208,3 +228,12 @@ def test_the_canonicalize_pool_matches_the_inline_path(tmp_path, base_cfg):
     assert tables[0].column("canonical_url").equals(tables[1].column("canonical_url"))
     rows = tables[0].to_pylist()
     assert sum(r["url"] != r["canonical_url"] for r in rows) == len(range(0, len(urls), 7))
+
+
+def test_canonicalize_workers_start_with_one_blas_thread(monkeypatch):
+    # OpenBLAS starts a thread per CPU in every worker; 16 workers broke a 512-pid limit.
+    monkeypatch.delenv("OPENBLAS_NUM_THREADS", raising=False)
+    spawn = multiprocessing.get_context("spawn")
+    with _worker_env(), ProcessPoolExecutor(1, mp_context=spawn) as pool:
+        assert pool.submit(os.getenv, "OPENBLAS_NUM_THREADS").result() == "1"
+    assert "OPENBLAS_NUM_THREADS" not in os.environ

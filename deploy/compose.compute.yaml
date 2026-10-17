@@ -73,7 +73,7 @@ services:
       - /data/isel:/data/isel
     mem_limit: 8g
     memswap_limit: 8g
-    cpus: 8                             # text extraction: ~21M pages/day x 28 ms at the peak
+    cpus: 8                             # archive_workers; 6.5 ms per 590 KB page each
 
 secrets:
   crawlerdb_dsn:

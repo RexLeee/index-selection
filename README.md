@@ -3,8 +3,8 @@
 從約 16.6 億個已爬 URL 中，每兩週選出 1.28 億個放進搜尋索引。目標是最大化下一批 golden URL 的 indexed rate。
 
 - 調研（現況、論文、方法選型、未來架構）：[`docs/RESEARCH.md`](docs/RESEARCH.md)
-- 設計（時間點、特徵、模型、評估、manifest、recrawl 介面）：[`docs/DESIGN.md`](docs/DESIGN.md)
-- recrawl：[`docs/RECRAWL_DESIGN.md`](docs/RECRAWL_DESIGN.md)；給 crawler 組的提案：[`docs/CRAWLER_RECRAWL_PROPOSAL.md`](docs/CRAWLER_RECRAWL_PROPOSAL.md)
+- 設計（時間點、特徵、模型、評估、manifest、selectdb、部署）：[`docs/DESIGN.md`](docs/DESIGN.md)
+- recrawl：設計、給 crawler 組的提案和程式都在 `feat/recrawl` 分支，還沒上線
 - 實驗紀錄（真實資料的讀取、回測結果和判定）：[`docs/experiments/`](docs/experiments/)
 
 ## 方法一句話

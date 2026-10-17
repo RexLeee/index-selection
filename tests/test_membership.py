@@ -21,8 +21,7 @@ import pytest
 from conftest import small_cfg
 from synth import FIRST_BATCH, make_world, write_work_dir
 
-from isel.backtest import open_store
-from isel.features import FEATURES
+from isel.features import FEATURES, open_store
 from isel.io import write_parquet_atomic
 from isel.urlnorm import md5_number_lower
 

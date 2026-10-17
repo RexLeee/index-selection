@@ -351,12 +351,23 @@ def test_migrate_builds_an_empty_selectdb_and_downgrades(selectdb):
     engine.dispose()
 
 
+def test_the_reader_role_can_only_read(selectdb):
+    cfg = selectdb
+    _setup(cfg)
+    reader = connect(cfg, cfg.selectdb.reader_dsn_env, read_only=False)
+    try:
+        assert reader.execute("SELECT count(*) FROM selected_urls_current").fetchone() == (0,)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            reader.execute("INSERT INTO model_runs (run_label) VALUES ('x')")
+    finally:
+        reader.close()
+
+
 def test_the_reader_role_cannot_see_the_recrawl_schema(selectdb):
     cfg = selectdb
     _setup(cfg)
     reader = connect(cfg, cfg.selectdb.reader_dsn_env, read_only=True)
     try:
-        assert reader.execute("SELECT count(*) FROM selected_urls_current").fetchone() == (0,)
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             reader.execute("SELECT count(*) FROM recrawl.doc")
     finally:
@@ -435,6 +446,8 @@ def test_publish_swap_freeze_rollback_and_the_metric_query(selectdb, tmp_path):
     head = result["tags"]["head"]
     assert head["golden_urls"] == 3 and head["indexed"] == 2
     assert head["indexed_exact_rate"] == pytest.approx(2 / 3)
+    # The metric looks up only q=1%2C2, while the list holds the raw q=1,2.
+    assert head["indexed_metric_rate"] == pytest.approx(1 / 3)
     assert [r["run_label"] for r in result["live_runs"]] == ["r1"]
     reader = connect(cfg, cfg.selectdb.reader_dsn_env, read_only=True)
     try:
