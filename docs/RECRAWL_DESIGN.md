@@ -256,7 +256,8 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 2. 每 1M 列一個交易，upsert `host` 和 `doc`。
 3. 不在新清單的 doc 設成 `rank = NULL`。
 4. 重算 `best_rank`。
-5. swap 凍結時段內拒絕執行。
+5. 新增或改了 rank 的 doc，會喚醒它的 host（見 plan 的 `next_at` 規則）。
+6. swap 凍結時段內拒絕執行。
 
 **`recrawl-plan`**：常駐，每 30 秒一輪。HTTP 呼叫不在 lock 或交易內執行（outbox 順序）。
 
@@ -265,13 +266,27 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
    - 有 `batch_id` 但不在排隊清單的 host，代表 crawler 已取走。記下 `dispatched_at`，清掉 `host.batch_id`。
    - 取走超過 `dispatch_timeout_s` 仍沒有結果的 doc 退回 `pending`，`attempts` 不加。
    - `fetched` 而且到期的 doc 退回 `pending`。
-   - 背壓：`text_root` 所在的磁碟剩餘低於 `min_free_gb`，或 `recrawl_result` 總量超過 `result_cap_gb` 時，這一輪不派送。
-   - 依 `best_rank` 挑 host，每個 host 取最多 100 個到期 doc，標成 `dispatched`，設定 `host.batch_id`，commit。
+   - 上面兩種 doc 的 host，如果 `next_at` 晚於 `now + host_pause_max_s`，就清掉 `next_at`。throttle 暫停最多 `host_pause_max_s`，所以更晚的值一定是「只剩退避中的 doc」時設的，不能擋住現在到期的 doc。
+   - 背壓：以下任一情況，這一輪不派送：
+     - 上一輪 API 拒絕了整批請求，還在 `api_backoff_s` 內；
+     - `text_root` 所在的磁碟剩餘低於 `min_free_gb`；
+     - `recrawl_result` 總量超過 `result_cap_gb`。
+   - 每個 crawler process 的空位是 `queue_files_per_dir − 它還在排隊的 batch 數`。排隊數由 GET 的清單對照 `crawl_shard` 算出。每個 process 依 `best_rank` 挑最多「空位」個 host，合計最多 `plan_max_batches` 個。目錄滿時不認領，所以不會每輪收到 429 再退回 20 萬列，也不會讓前 1000 名卡住其他 process。
+   - 每個 host 取最多 100 個到期 doc，標成 `dispatched`，設定 `host.batch_id`，commit。
 3. 逐一 `POST recrawl-batches`。body 是 `{batch_id, crawler_id, host_id, recrawl_share, docs}`。`crawler_id` 和 `host_id` 由 isel 算好，API 不自己算路由。
-4. 交易 T2 處理明確被拒絕的 batch：
-   - 409、429、503、401、403：doc 退回 `pending`，清掉 `batch_id`。503、401、403 之後這一輪不再送。
-   - 400：`rejected` 中的 doc 設成 `gone`（`invalid_url`），其餘退回 `pending`。
-   - 結果不明（timeout、連線中斷、其他 5xx）：不處理。下一輪的 GET 會看到它還在排隊，或判定已被取走；真的遺失時由 `dispatch_timeout_s` 回收。這樣不會重送，也不會重抓。
+4. 依回應判定，交易 T2 退回被拒絕和沒送出的 batch（doc 回 `pending`，清掉 `batch_id`）：
+
+| 回應 | 判定 | 這一輪接下來 |
+|---|---|---|
+| 2xx | 已排隊 | 繼續 |
+| 409 | 退回：這個 host 還有一批在排隊 | 繼續 |
+| 429 | 退回：這個 process 滿了 | 同一個 `crawler_id` 的其他 batch 不送；其他 process 繼續 |
+| 400 且 `rejected` 非空 | 退回；`rejected` 中的 doc 設成 `gone`（`invalid_url`） | 繼續 |
+| 其他 4xx（含 `rejected` 為空的 400、401、403、404、413、415、422）、503 | 退回；stats 記 `api_error`；暫停 `api_backoff_s` | 停止，未送的退回 |
+| 其他 5xx、timeout、連線中斷 | 結果不明：保持認領 | 停止，未送的退回 |
+
+   - 結果不明的 batch 可能已經排隊。下一輪的 GET 會看到它還在排隊，或判定已被取走；真的遺失時由 `dispatch_timeout_s` 回收。這樣不會重送，也不會重抓。
+   - `dispatch_timeout_s` 是 8 小時：Crawl-delay 60 秒、份額 0.25 時，100 個 URL 要 24,000 秒。逾時太短會在 crawler 還在抓時重複派送。
 5. `recrawl_share` 由 `pace_share` 算出：
    - `backlog` 是這個 host 現在到期的 doc 數；`since` 是它們最早的 `due_at`；
    - `share = clamp(backlog × pace_cycle_s / max(since + pace_days − now, plan_interval_s), share_min, share_max)`；
@@ -280,16 +295,17 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
    - 新 doc 的 `due_at` 由 `recrawl-sync` 寫成 sync 的時間，所以第一期的期限從 sync 開始算。sync 要在啟動 planner 前不久才跑。
 6. `--dry-run` 輸出每 host 的容量報告，不呼叫 API。
 
-**`recrawl-archive`**：常駐，每 60 秒一輪。它對 `result_root` 只讀不寫。
+**`recrawl-archive`**：常駐，每 60 秒一輪。它對 `result_root` 只讀不寫。`archive_workers` 個 process 做每個 log 的檔案工作（解析、抽取、寫 Parquet、複製 log），主程序依序套用 DB。
 
 1. 只處理不在 `recrawl.log` 的 `.jsonl`。對應的 WARC 不存在時跳過，等下一輪。
-2. fetch log 不符合契約時，在 `recrawl.log` 記一列 `error`，然後繼續處理其他 log。
-3. 每一筆 2xx HTML：
+2. 每一行先檢查 key 和型別（C6 的 16 個欄位、時間要有 UTC offset、`http_status` 在 100–599）。有一行不符合，整個 log 就在 `recrawl.log` 記一列 `error`，然後繼續處理其他 log。這樣一行壞資料不會讓 archive 反覆 crash。
+3. 讀 log 或 WARC 時發生 OSError（權限、EIO、讀到一半被刪），這個 log 不記錄，下一輪重試，正文不會因此遺失。
+4. 每一筆 2xx HTML：
    - 依 `(warc_offset, warc_length)` 讀出 gzip member，確認它是 `WARC-Target-URI = final_url` 的 response record。位移錯誤時，FastWARC 會默默讀到相鄰或截斷的 record，所以這個檢查是必要的；
    - 用 Resiliparse 抽出 title、`<meta name=description>`、正文（main-content 模式，全是樣板時退回全文，最多 `max_body_chars` 字元）和語言；
-   - 解析失敗時，這一筆當成 `retry`（`extract_error`）。
-4. 每個 log 寫一個 zstd Parquet 到 `text_root`，並把 log 用 gzip 複製到 `log_root`。這些 log 是重建 DB 的依據。
-5. 最後在同一個交易裡套用結果，並寫入 `recrawl.log`。檔案先寫、DB 後寫，所以重跑同一個 log 不會有副作用。套用規則：
+   - 解析失敗時，這一筆當成 `retry`（`extract_error`）；log 有這一筆但沒有 WARC record 時，當成 `retry`（`no_warc_record`）。只有這一筆受影響。
+5. 每個 log 寫一個 zstd Parquet 到 `text_root`，並把 log 用 gzip 複製到 `log_root`。這些 log 是重建 DB 的依據。
+6. 最後在同一個交易裡套用結果，並寫入 `recrawl.log`。檔案先寫、DB 後寫，所以重跑同一個 log 不會有副作用。套用規則：
 
 | 結果 | 新狀態 | 下次 |
 |---|---|---|
@@ -306,7 +322,10 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 - `recrawl-plan` 用 `network_mode: host`，因為 gateway 只綁 `127.0.0.1:4000`。API token 用 secret 檔 `recrawl_api_token` 提供。
 - 兩者都唯讀掛載 `/data/ipc/recrawl_result`，可寫掛載 `/data/isel`。`up` 之前要先用 isel 使用者執行 `mkdir -p /data/isel`，否則 Docker 會用 root 建立它。
-- `recrawl-archive` 給 8 CPU：尖峰約每天 21M 頁 × 28 ms ≈ 7 核。
+- `recrawl-archive` 給 8 CPU，`archive_workers = 8`。2026-10-17 用 9 個真實網頁實測，平均 590 KB：
+  - 1 個 process 每頁 6.5 ms，每天約 13.2M 頁，低於尖峰的每天 21M 頁；
+  - 8 個 worker 每天約 45.6M 頁（10 核 Mac）。
+  - 積壓超過 24 小時，crawler 就會先刪 log（C8），結果會遺失，所以要多 process。
 
 ### 4.5 每一期的流程
 
@@ -314,7 +333,7 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 2. 之後每期只抓：新加入的頁、到期的頁、上一期沒抓完的頁。
 3. 重抓間隔一律是 `stale_days`。Cho & Garcia-Molina 證明在 Poisson 變動模型下，固定間隔的平均新鮮度優於依變動率加權。
 4. conditional GET（`If-None-Match` / `If-Modified-Since`）延後再做。它省下傳輸，但請求仍算進 QPS 額度。
-5. 從清單移除的頁，`rank` 設成 NULL，不再派送。已抓的 WARC 保留。
+5. 從清單移除的頁，`rank` 設成 NULL，不再派送。已抽出的正文保留。
 
 ### 4.6 大 host
 
@@ -388,7 +407,8 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 | 固定比例（例如 3:1） | 14 天的頁數和配速幾乎一樣（113.0M 對 112.8M），但損失集中在前幾天：尖峰 14.0% 對 8.5% |
 | 在閘門內跨 process 仲裁 | 兩條車道搶同一個 host 時，幾乎都在同一個 process，在 scheduler 仲裁就夠。跨 process 仲裁會讓 16 個 process 的 SQLite 寫入互相等待 |
 | offerer 跳過有 recrawl 的 domain | 單位是 eTLD+1，太粗；延遲約 60 秒；要改 offerer |
-| 份額下限 0.10 | 一個 100 URL 的檔最差約 1.9 小時，會碰到 2 小時逾時並重複派送；尖峰只比 0.25 少 1.2 個百分點 |
+| 份額下限 0.10 | 尖峰只比 0.25 少 1.2 個百分點；一個 100 URL 的檔在一般 host 上要約 1.9 小時，Crawl-delay 長的 host 更久，逾時要跟著拉長 |
+| C10 先正規化 URL 再驗證 | fetch log 要求 `doc_id == md5(source_url)`，改寫 URL 就對不上。PR #84 的 `validate_url` 會改寫 URL，`validators.url` 也會擋掉 w3lib 視為 canonical 的 `\|`、`[ ]`；兩邊的 w3lib 版本也不同（2.3.1 對 2.5.0） |
 | HTML 經 jsonl 傳給 isel，再由 isel 寫 WARC | 要 base64（多 33%），或只能傳失去原始編碼的 `response.text` |
 | 在 router 端對高分頁直接保存內容 | crawler 不會重抓已抓過的頁，所以抓不到已經在清單裡的 128M（`DESIGN.md` §8.4 的選項） |
 | 以 `removed` 狀態表示移出清單 | sync 和 archive 會寫同一欄；改用 `rank IS NULL` |
@@ -409,6 +429,8 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 **資料來源**
 
 - 正文 Parquet（`text_root`）是唯一的資料來源。欄位：`doc_id, batch_id, url, final_url, fetched_at, http_status, lang, title, description, body, text_len, payload_sha1`。
+- `doc_id` 是 uint64，和 manifest 相同，可以直接 join。`recrawl.doc` 裡的 `doc_id` 是同一個值的 signed BIGINT。
+- 只讀 `**/*.parquet`。crash 可能留下 `.parquet.tmp`，要略過。
 - 同一個 doc 可能出現在多個檔案裡，例如重抓或重跑。建索引時每個 `doc_id` 只取 `fetched_at` 最新的一列。
 - 只索引 live 清單上的 doc（`recrawl.doc.rank IS NOT NULL`），所以索引是 `selected_urls_current` 的子集，ranked ≤ indexed。
 

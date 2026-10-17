@@ -2,7 +2,7 @@
 
 - 對象：WebCrawler（crawler 組）
 - 提案人：index selection 組
-- 日期：2026-10-13；2026-10-16 更新（新增 C10，C8 改成保留時間）
+- 日期：2026-10-13；2026-10-16 更新（新增 C10，C8 改成保留時間）；2026-10-17 更新（C10 對齊 PR #84 `35c5677`：URL 原樣使用、400 格式、多 worker；C6 檔案權限）
 - 狀態：草稿，待 crawler 組討論
 
 本文所有路徑都相對於 `WebCrawler/`，版本是 `2e4f87c`，和 Host2 `/opt/WebCrawler` 一致。Scrapy 原始碼取自 Host2 的 `webcrawler-crawler` image，版本 2.16.0。
@@ -16,12 +16,12 @@
    - 這是課程的硬性規定（`../crawler/starter-project.md:8-10`）。
    - 修正的核心是一個跨 process 共用的 host 閘門。每次送出請求前，閘門確認這個 hostname 距離上一次請求至少 5 秒。
 2. **recrawl 車道（C5、C6）。**
-   - index selection 選出的 128M 個 URL，需要重抓原始 HTML，並以 WARC 永久保存。
+   - index selection 選出的 128M 個 URL，需要重抓原始 HTML。isel 從 WARC 抽出正文永久保存，WARC 只暫存 24 小時。
    - recrawl 只是正式 crawler 的第二個輸入目錄。它走同一個閘門，所以兩條車道加總後仍遵守 0.2 qps。
 3. **共用入口（C10）。**
    - WebCrawler PR #84 新增了 API gateway 和 `scheduler_ingest` 的 API 服務，提供 `crawl-requests`。
    - 我們請 crawler 組在同一個 API 服務上加第二種資源 `recrawl-batches`。isel 只透過它送出 recrawl 工作，不直接寫 `/data/ipc`。
-   - 兩種資源共用 gateway、URL 驗證（`libs/urls.py`）和 `/scheduler_ingest/v1/` 前綴，但語意不同，所以分開。
+   - 兩種資源共用 gateway、URL 檢查（從 `libs/urls.py` 拆出的 `check_url`）和 `/scheduler_ingest/v1/` 前綴，但語意不同，所以分開。
 4. **車道仲裁（C9）。**
    - 兩條車道大量搶同一批 host：一般爬取 93.8% 的請求打在 recrawl 清單內的 host（§5.1）。
    - 同一個 host 的額度用加權輪替分配。份額由 isel 依每個 host 的期限算出，寫在 queue 檔裡。一般車道至少保留 25%。
@@ -194,7 +194,7 @@ class HostGateDownloader(Downloader):
 - **recrawl 的結果和失敗不可以進 `JsonPipeline`。** ingestor 會依失敗原因暫停整個 domain_id，例如 429 暫停 1 h × 2^n（`containers/scheduler_ingest/ingestor/db_ops.py:42-54`）。recrawl 的失敗如果進去，會暫停一般車道的 domain。
 - **建議 `IPC_DOMAIN_LOW_WATERMARK` 改成 env 可覆寫。** 一般車道的 domain 檔要等 100 個 URL 都做完才釋放名額。C9 讓被搶的 host 變慢時，crawler 組可以調高這個值補回名額。
 - **`parse` 要用 try/finally 包住 `_finish_owned_request`。** 現在 `parse` 拋例外時（`spiders/spider.py:360-418`），這個 domain 會一直留在排除集合裡，直到 process 重啟。recrawl 車道的 callback 只做寫 WARC 和寫 log 兩件事。
-- **檔案仍是讀完就刪（at-most-once）。** isel 會處理遺失的結果：它在檔案被取走 2 小時後，把沒有結果的 URL 重新派送。
+- **檔案仍是讀完就刪（at-most-once）。** isel 會處理遺失的結果：它在檔案被取走 8 小時後（`dispatch_timeout_s`），把沒有結果的 URL 重新派送。8 小時涵蓋最慢的情況：Crawl-delay 60 秒、份額 0.25 時，100 個 URL 要 24,000 秒。
 
 ### C6：recrawl 的輸出
 
@@ -212,7 +212,8 @@ class HostGateDownloader(Downloader):
 3. 每個 WARC record flush 之後，才寫它對應的 log 行。
 4. 每個 queue 檔的每個 URL，最後都要寫一行 log，包括失敗、robots 禁止和閘門拒絕。
 5. 沒有任何成功回應的時段，也要產生 WARC，裡面只有 warcinfo record。isel 依 log 找 WARC，WARC 必須存在。
-6. 保留和刪除：
+6. 檔案權限要明確設定，不依賴 umask：檔案 0644、目錄 0755。isel 是 uid 1014，只有讀權限；用 `tempfile.mkstemp` 建的檔是 0600，isel 讀不到。isel 讀不到時不會丟資料，但這個 log 會一直卡在重試。
+7. 保留和刪除：
    - 一組檔案保留 24 小時後刪除。先刪 `.jsonl`，再刪 `.warc.gz`，所以看得到 log 就代表 WARC 還在。
    - isel 只讀這個目錄，不搬、不改、不刪。它用 selectdb 的 `recrawl.log` 記錄哪些 log 處理過。
    - `warc_offset` 必須指向最後一跳的 response record，而且該 record 的 `WARC-Target-URI` 等於 `final_url`。isel 會檢查這一點，不符合就當成解析失敗。
@@ -461,24 +462,40 @@ class LaneAwareRingPriorityQueue(RingDownloaderAwarePriorityQueue):
 | `crawler_id` | 0–15。isel 用 crawlerdb export 的 `shard // 16` 算出，和 offerer 的路由同一個來源。API 不自己算路由，所以不必讀 crawlerdb |
 | `host_id` | isel 算好，API 只拿來當檔名。這樣兩邊不必各自實作 MD5 的位元組順序 |
 | `docs` | 1–100 筆，所有 `urlsplit(url).hostname` 必須相同 |
-| URL | 每個都過 `libs/urls.py:validate_url`。驗證失敗，或正規化後和原字串不同，就列進 `rejected`。API 絕不改寫 URL，因為 fetch log 要求 `doc_id == md5(source_url)` |
+| URL | 原樣使用，不正規化，也不比對正規化後的結果。只檢查：http/https、有 hostname、沒有 userinfo、≤ 2,500 字元、是公開位址（IP literal 要 `is_global`；擋 `localhost` 和單一標籤的 hostname）。不合格就列進 `rejected` |
+
+**為什麼不用 `validate_url` 正規化**
+
+- fetch log 要求 `doc_id == md5(source_url)`，API 改寫 URL 就對不上。isel 送來的已經是 canonical URL。
+- PR #84 的 `validate_url` 會回傳正規化後的 URL，`crawl-requests` 也直接用它。
+- `validators.url` 會擋掉 w3lib 視為 canonical 的 `|`、`[ ]`。golden 的 138,446 個 canonical URL 中有 9 個會被擋。
+- `scheduler_ingest` 釘住 `w3lib==2.3.1`，isel 用 2.5.0。2.5.0 多做了 dot-segment 解析等規則，比對正規化結果會受版本影響。
+- 建議：把上面的檢查從 `validate_url` 拆成 `check_url()`，`crawl-requests` 和 C10 都呼叫它；`crawl-requests` 之後再正規化。
 
 伺服器的處理順序：
 
-1. 驗證 token 和 body。任何一筆 URL 不合格就整批拒絕，和 `crawl-requests` 一樣全有或全無。
+1. 驗證 token 和 body。任何一筆 URL 不合格就整批拒絕，和 `crawl-requests` 一樣全有或全無。body 本身不合格（缺欄位、`docs` 不是 1–100 筆、hostname 不只一個、`crawler_id` 不在 0–15）時，回 400 並讓 `rejected` 為空。
 2. 檢查 16 個目錄中是否已經有 `domain_{host_id}.json`。有就回 409。
 3. 檢查目標目錄的檔數是否已達 `max_files_per_dir`（建議 384）。達到就回 429。
 4. 檢查磁碟和 `recrawl_result` 的容量上限。超過就回 503。
-5. 寫入 §4.2 格式的 queue 檔：先寫一個名稱不符合 `^domain_\d+\.json$` 的 tmp 檔，緊接著 `os.link` 到正式檔名，再刪掉 tmp。`os.link` 遇到同名檔會失敗，所以 409 的判斷是原子的；tmp 在 link 前一刻才寫，queue consumer 依 mtime 排序時順序正確。
+5. 寫入 §4.2 格式的 queue 檔：先寫一個名稱不符合 `^domain_\d+\.json$` 的 tmp 檔，緊接著 `os.link` 到正式檔名，再刪掉 tmp。
+   - `os.link` 遇到同名檔會失敗，所以 409 的判斷是原子的。PR #84 已經有 4 個 Uvicorn worker；同一個 host 一定落在同一個目錄，兩個 worker 搶同一個 host 時會撞到同一個 link 目標，所以多 worker 下仍然安全。
+   - tmp 檔名要含 uuid 或 pid。thread id 在不同 process 之間會重複。
+   - tmp 在 link 前一刻才寫，queue consumer 依 mtime 排序時順序正確。
 
 | 回應 | 意義 | isel 的處理 |
 |---|---|---|
-| 201 `{"file": "crawler_07/domain_….json"}` | 已排隊 | 記為已送出 |
-| 400 `{"rejected": [{"doc_id": …, "reason": …}]}` | 沒有寫檔 | `rejected` 中的 doc 設成 `gone`，其餘下一輪重送 |
-| 401 / 403 | token 錯誤 | 這一輪停止送出 |
+| 201 `{"file": "crawler_07/domain_….json"}` | 已排隊 | 記為已送出（isel 接受任何 2xx） |
+| 400 `{"error": "…", "rejected": [{"doc_id": …, "reason": …}]}` | 沒有寫檔 | `rejected` 中的 doc 設成 `gone`，其餘下一輪重送 |
+| 400 `{"error": "…", "rejected": []}` | body 不合格，沒有寫檔 | 停止送出並暫停 5 分鐘；這是合約不一致，要人處理 |
+| 401 / 403 | token 錯誤 | 停止送出並暫停 5 分鐘 |
 | 409 | 這個 host 已經有一批在排隊 | 下一輪再試 |
-| 429 | 目錄已滿，附 `Retry-After` | 下一輪再試 |
-| 503 | 磁碟或容量上限 | 這一輪停止送出 |
+| 429 | 目錄已滿，附 `Retry-After` | 同一個 process 的 batch 這一輪不再送 |
+| 503 | 磁碟或容量上限 | 停止送出並暫停 5 分鐘 |
+| 其他 5xx、timeout | 不確定有沒有寫檔 | 保持認領，靠 GET 和逾時對帳；這一輪停止送出 |
+
+- 400 一律帶 `error` 和 `rejected` 兩個 key。`error` 和 PR #84 現有的錯誤格式一樣；`rejected` 讓 isel 分得出「部分 URL 不合格」和「整個請求不合格」。
+- isel 依 GET 的結果算出每個目錄的空位，只送放得下的 batch，所以正常情況不會收到 429。
 
 **`GET`**：回傳 `{"queued": [host_id, ...]}`，是 16 個目錄中所有還在排隊的 `host_id`。isel 每輪呼叫一次，用來判斷 crawler 已經取走哪些檔。也可以另附每個目錄的檔數。
 
@@ -493,7 +510,7 @@ class LaneAwareRingPriorityQueue(RingDownloaderAwarePriorityQueue):
 | 目錄 | 寫入者 | 讀取者 | 權限 |
 |---|---|---|---|
 | `/data/ipc/recrawl_queue/crawler_NN/` | C10 的 API（`scheduler_ingest` 容器，root） | crawler | root 預設即可；isel 不讀不寫 |
-| `/data/ipc/recrawl_result/crawler_NN/` | crawler（root） | isel archive（uid 1014），只讀 | 目錄 755、檔案 644 即可 |
+| `/data/ipc/recrawl_result/crawler_NN/` | crawler（root） | isel archive（uid 1014），只讀 | 目錄 0755、檔案 0644，要明確 chmod（C6 規則 6） |
 | `/data/isel/{text,log}/` | isel archive | 下游（索引） | isel 自己建立 |
 
 - 不再需要 root 一次性建立群組目錄。
@@ -578,7 +595,7 @@ C1 對一般車道的影響：每 host 從 16 個並發降到 1 個。維持現�
 2. **固定比例會把損失集中在前幾天。** 配速依每個 host 的期限只拿需要的份額。14 天的頁數和固定 3:1 幾乎一樣（112.8M 對 113.0M），尖峰損失從 14.0% 降到 8.5%。
 3. **水位是最大的槓桿。** K 從 1024 提高到 2048 後，第 3 天的進度幾乎加倍。
 4. **嚴格優先不採用。** 最大的 10 個 host 上一般爬取的需求是滿的，嚴格優先會讓一般爬取在這些 host 上停 14 天以上。
-5. **份額下限選 0.25，不選 0.10。** 一個 100 URL 的檔在最差情況下要 100 × 6.7 / 0.25 ≈ 45 分鐘，仍在 isel 的 2 小時逾時內。下限 0.10 時約 1.9 小時，會重複派送。
+5. **份額下限選 0.25，不選 0.10。** 一個 100 URL 的檔在一般 host 上要 100 × 6.7 / 0.25 ≈ 45 分鐘；下限 0.10 時約 1.9 小時。isel 的逾時是 8 小時，涵蓋 Crawl-delay 60 秒的最慢情況。
 
 ### 5.3 份額的算法（isel 端，已實作）
 
