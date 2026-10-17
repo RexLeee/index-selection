@@ -8,12 +8,16 @@ from datetime import UTC, datetime, timedelta
 import duckdb
 import pytest
 from conftest import BASE, replace
+from recrawl_fakes import ApiStub
 
 from isel.config import ConfigError, load_config
 from isel.recrawl import (
     FETCH_LOG_KEYS,
     LOG_NAME_RE,
+    ApiUnavailable,
+    CrawlerApi,
     RecrawlError,
+    Reply,
     classify,
     host_id,
     pace_count_cap,
@@ -162,4 +166,51 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
     path.write_text(BASE.read_text().replace("pace_cycle_s = 6.7", "pace_cycle_s = 1.0"))
     with pytest.raises(ConfigError, match="pace_cycle_s"):
         load_config([path])
+    path.write_text(BASE.read_text().replace('4000/scheduler_ingest"', '4000/scheduler_ingest/"'))
+    with pytest.raises(ConfigError, match="api_url"):
+        load_config([path])
+    path.write_text(BASE.read_text().replace('"work/recrawl/log"', '"work/recrawl/text"'))
+    with pytest.raises(ConfigError, match="must differ"):
+        load_config([path])
     assert replace(base_cfg, "recrawl", batch_size=1).recrawl.batch_size == 1
+
+
+def _batch(host_id=7, crawler_id=0, urls=(URL,), batch_id=1):
+    return {"batch_id": batch_id, "crawler_id": crawler_id, "host_id": host_id,
+            "recrawl_share": 0.25, "docs": [{"doc_id": pg_doc_id(u), "url": u} for u in urls]}
+
+
+@pytest.fixture
+def stub(tmp_path):
+    s = ApiStub(tmp_path / "queue", processes=2, max_files_per_dir=2)
+    yield s
+    s.close()
+
+
+def test_the_api_client_reads_every_c10_answer(stub):
+    api = CrawlerApi(stub.url, stub.token, timeout_s=2.0)
+    assert api.queued() == set()
+    assert api.submit(_batch()) == Reply(201)
+    queued = json.loads((stub.dir(0) / "domain_000007.json").read_text())
+    assert (queued["urls"], queued["domain_id"], queued["batch_id"]) == ([URL], 7, 1)
+    assert api.queued() == {7}
+    assert api.submit(_batch(crawler_id=1)) == Reply(409)          # queued in another dir
+    bad = "https://a.example/x?b=2&a=1"                           # not canonical
+    assert api.submit(_batch(8, urls=(URL, bad))) == Reply(400, (pg_doc_id(bad),))
+    assert api.submit(_batch(9)) == Reply(201)
+    assert api.submit(_batch(10)) == Reply(429)                    # crawler_00 is full
+    stub.forced = [503]
+    assert api.submit(_batch(11, crawler_id=1)) == Reply(503)
+    assert CrawlerApi(stub.url, "wrong", 2.0).submit(_batch(12, crawler_id=1)) == Reply(401)
+
+
+def test_the_api_client_never_mistakes_a_failed_query_for_an_empty_queue(stub):
+    with pytest.raises(ApiUnavailable):
+        CrawlerApi(stub.url, "wrong", 2.0).queued()
+    stub.fail_get = True
+    with pytest.raises(ApiUnavailable):
+        CrawlerApi(stub.url, stub.token, 2.0).queued()
+    gone = CrawlerApi("http://127.0.0.1:9", stub.token, 0.5)       # nothing listens
+    with pytest.raises(ApiUnavailable):
+        gone.queued()
+    assert gone.submit(_batch()) == Reply(None)

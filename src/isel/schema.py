@@ -10,7 +10,8 @@ V1 readers expect them there.
 `host` is one back queue per hostname, the unit of the 0.2 qps rule; `doc` is
 one row per page ever selected, keyed by `doc_id` as a signed BIGINT. A doc is
 on the live list while `rank` is set; `fetched` docs come due again through
-`doc_stale`.
+`doc_stale`. `log` lists the crawler fetch logs the archive has applied; the
+crawler deletes its own files, so this is the archive's only progress record.
 
 Only the live list table is defined here. `publish` creates each run's table
 with `LIKE public.selected_urls_current`, and `swap` renames tables and their
@@ -88,7 +89,7 @@ recrawl_host = sa.Table(
     sa.Column("crawl_shard", sa.SmallInteger, nullable=False),
     sa.Column("best_rank", sa.BigInteger),          # min rank of its due docs; NULL: none
     _tstz("next_at"),                               # no batch before this (backoff, pause)
-    sa.Column("batch_id", sa.BigInteger),           # its queue file on disk; NULL: none
+    sa.Column("batch_id", sa.BigInteger),           # its batch queued at the API; NULL: none
     sa.PrimaryKeyConstraint("host_id", name="host_pkey"),
     sa.UniqueConstraint("host", name="host_host_key"),
     sa.CheckConstraint("crawl_shard BETWEEN 0 AND 255", name="host_crawl_shard_check"),
@@ -110,7 +111,7 @@ recrawl_doc = sa.Table(
     _tstz("due_at", nullable=False, server_default=sa.func.now()),
     sa.Column("attempts", sa.SmallInteger, nullable=False, server_default=sa.text("0")),
     sa.Column("batch_id", sa.BigInteger),
-    _tstz("dispatched_at"),                         # when the crawler took the queue file
+    _tstz("dispatched_at"),                         # when the crawler took the batch
     _tstz("fetched_at"),
     sa.Column("http_status", sa.SmallInteger),
     sa.Column("content_type", sa.Text),
@@ -119,9 +120,9 @@ recrawl_doc = sa.Table(
     sa.Column("payload_sha1", sa.Text),
     sa.Column("etag", sa.Text),
     _tstz("last_modified"),
-    sa.Column("warc_file", sa.Text),                # relative to recrawl.warc_root
-    sa.Column("warc_offset", sa.BigInteger),
-    sa.Column("warc_length", sa.BigInteger),
+    sa.Column("text_file", sa.Text),                # relative to recrawl.text_root
+    sa.Column("text_len", sa.Integer),
+    sa.Column("lang", sa.Text),
     sa.PrimaryKeyConstraint("doc_id", name="doc_pkey"),
     sa.ForeignKeyConstraint(["host_id"], [f"{RECRAWL_SCHEMA}.host.host_id"],
                             name="doc_host_id_fkey"),
@@ -135,4 +136,14 @@ recrawl_doc = sa.Table(
              postgresql_where=sa.text("state = 'fetched' AND rank IS NOT NULL")),
     schema=RECRAWL_SCHEMA,
     postgresql_with={"fillfactor": 80},
+)
+
+recrawl_log = sa.Table(
+    "log", metadata,
+    sa.Column("name", sa.Text, nullable=False),     # recrawl-NN-<ts>Z-<seq>.jsonl
+    _tstz("processed_at", nullable=False, server_default=sa.func.now()),
+    sa.Column("records", sa.Integer, nullable=False),
+    sa.Column("error", sa.Text),                    # first malformed line, if any
+    sa.PrimaryKeyConstraint("name", name="log_pkey"),
+    schema=RECRAWL_SCHEMA,
 )

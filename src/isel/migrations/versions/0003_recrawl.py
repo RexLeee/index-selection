@@ -1,4 +1,4 @@
-"""The recrawl frontier: one back queue per hostname and one row per page.
+"""The recrawl frontier: one back queue per hostname, one row per page, applied fetch logs.
 
 The `select` role gets no USAGE on this schema, so the metric cannot see it.
 
@@ -59,9 +59,9 @@ def upgrade() -> None:
         sa.Column("payload_sha1", sa.Text),
         sa.Column("etag", sa.Text),
         sa.Column("last_modified", TSTZ),
-        sa.Column("warc_file", sa.Text),
-        sa.Column("warc_offset", sa.BigInteger),
-        sa.Column("warc_length", sa.BigInteger),
+        sa.Column("text_file", sa.Text),
+        sa.Column("text_len", sa.Integer),
+        sa.Column("lang", sa.Text),
         sa.PrimaryKeyConstraint("doc_id", name="doc_pkey"),
         sa.ForeignKeyConstraint(["host_id"], ["recrawl.host.host_id"], name="doc_host_id_fkey"),
         sa.ForeignKeyConstraint(["model_run_id"], ["public.model_runs.id"], ondelete="RESTRICT",
@@ -78,6 +78,15 @@ def upgrade() -> None:
                     postgresql_where=sa.text("state = 'dispatched'"))
     op.create_index("doc_stale", "doc", ["due_at"], schema="recrawl",
                     postgresql_where=sa.text("state = 'fetched' AND rank IS NOT NULL"))
+    op.create_table(
+        "log",
+        sa.Column("name", sa.Text, nullable=False),
+        sa.Column("processed_at", TSTZ, nullable=False, server_default=sa.func.now()),
+        sa.Column("records", sa.Integer, nullable=False),
+        sa.Column("error", sa.Text),
+        sa.PrimaryKeyConstraint("name", name="log_pkey"),
+        schema="recrawl",
+    )
 
 
 def downgrade() -> None:

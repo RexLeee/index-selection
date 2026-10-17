@@ -14,7 +14,7 @@ threads = 32
 memory_limit = "96GB"
 max_temp_directory_size = "100GB"
 
-[recrawl]                                # /data is one filesystem, mounted once, so renames work
-queue_root = "/data/ipc/recrawl_queue"
+[recrawl]                                # result_root is mounted read-only
 result_root = "/data/ipc/recrawl_result"
-warc_root = "/data/isel_warc"
+text_root = "/data/isel/text"
+log_root = "/data/isel/log"

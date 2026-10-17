@@ -271,13 +271,15 @@ swap_freeze_days = [1, 16]
 swap_freeze_window = ["11:30", "20:00"]  # random set at 12:00, head set at 18:00 UTC
 
 [recrawl]                                # recrawl frontier in selectdb `recrawl`; docs/RECRAWL_DESIGN.md
-queue_root = "work/recrawl/queue"        # crawler_NN/domain_<host_id>.json, read by the crawler
-result_root = "work/recrawl/result"      # crawler_NN/<base>.{warc.gz,jsonl}, written by the crawler
-warc_root = "work/recrawl/warc"          # permanent WARC + gzipped fetch logs, YYYYMMDD/crawler_NN/
+api_url = "http://127.0.0.1:4000/scheduler_ingest"   # crawler API (proposal C10), via the gateway
+api_token_env = "ISEL_RECRAWL_API_TOKEN" # bearer token for the recrawl-batches routes
+api_timeout_s = 10.0
+result_root = "work/recrawl/result"      # crawler_NN/<base>.{warc.gz,jsonl}; read-only for isel
+text_root = "work/recrawl/text"          # permanent extracted text, fetch_date=YYYYMMDD/crawler_NN/
+log_root = "work/recrawl/log"            # permanent gzipped fetch logs, YYYYMMDD/crawler_NN/
 crawler_processes = 16                   # one queue dir per crawler process; shard // (256 / 16)
-batch_size = 100                         # URLs per queue file, as the offerer's per_domain_url_cap
-max_files_per_dir = 384                  # 3x the crawler's recrawl watermark (128 hosts)
-plan_max_files_per_txn = 1000            # queue files written per plan cycle
+batch_size = 100                         # URLs per batch, as the offerer's per_domain_url_cap
+plan_max_files_per_txn = 1000            # batches sent per plan cycle
 plan_interval_s = 30.0
 dispatch_timeout_s = 7200                # after the crawler takes a file: 100 URLs at up to 60 s
 sweep_rows = 100000                      # fetched docs made due again per plan cycle
@@ -288,8 +290,10 @@ max_attempts = 5                         # then wait stale_days instead of retry
 robots_retry_days = 30                   # a robots.txt disallow is asked again after this
 host_pause_max_s = 86400                 # cap on a 429/503 Retry-After pause
 archive_interval_s = 60.0
-min_free_gb = 4500                       # no new queue files below this free space on the
-                                         # queue filesystem; keeps the crawler's IPC peak (~4 TB)
+min_free_gb = 800                        # no new batches below this free space under text_root;
+                                         # Host2 /data has ~2 TB free while the crawler runs
+result_cap_gb = 1000                     # no new batches while recrawl_result holds more than this
+max_body_chars = 200000                  # extracted body text kept per page
 sync_chunk_rows = 1000000                # docs per recrawl-sync transaction
 # Pacing: each queue file asks the crawler for the share of its host's requests that
 # finishes the host's due docs within pace_days of the oldest one (proposal C9).

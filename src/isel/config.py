@@ -223,12 +223,14 @@ class ScheduleCfg:
 
 @dataclass(frozen=True)
 class RecrawlCfg:
-    queue_root: str
+    api_url: str
+    api_token_env: str
+    api_timeout_s: float
     result_root: str
-    warc_root: str
+    text_root: str
+    log_root: str
     crawler_processes: int
     batch_size: int
-    max_files_per_dir: int
     plan_max_files_per_txn: int
     plan_interval_s: float
     dispatch_timeout_s: int
@@ -241,6 +243,8 @@ class RecrawlCfg:
     host_pause_max_s: int
     archive_interval_s: float
     min_free_gb: int
+    result_cap_gb: int
+    max_body_chars: int
     sync_chunk_rows: int
     pace_days: float
     pace_cycle_s: float
@@ -506,16 +510,18 @@ def _validate(cfg: Config) -> None:
 
 def _validate_recrawl(cfg: Config, need: Any) -> None:
     r = cfg.recrawl
-    need(len({r.queue_root, r.result_root, r.warc_root}) == 3,
-         "recrawl.queue_root, result_root and warc_root must differ")
+    need(r.api_url.startswith(("http://", "https://")) and not r.api_url.endswith("/"),
+         "recrawl.api_url must be an http(s) URL without a trailing slash")
+    need(len({r.result_root, r.text_root, r.log_root}) == 3,
+         "recrawl.result_root, text_root and log_root must differ")
     need(r.crawler_processes > 0 and cfg.crawlerdb.num_shards % r.crawler_processes == 0,
          "recrawl.crawler_processes must divide crawlerdb.num_shards")
-    need(min(r.batch_size, r.max_files_per_dir, r.plan_max_files_per_txn, r.dispatch_timeout_s,
-             r.sweep_rows, r.stale_days, r.retry_base_s, r.max_attempts, r.robots_retry_days,
-             r.host_pause_max_s, r.sync_chunk_rows) > 0,
+    need(min(r.batch_size, r.plan_max_files_per_txn, r.dispatch_timeout_s, r.sweep_rows,
+             r.stale_days, r.retry_base_s, r.max_attempts, r.robots_retry_days,
+             r.host_pause_max_s, r.sync_chunk_rows, r.result_cap_gb, r.max_body_chars) > 0,
          "recrawl sizes, counts and intervals must be > 0")
-    need(r.plan_interval_s > 0 and r.archive_interval_s > 0 and r.min_gap_s > 0,
-         "recrawl.plan_interval_s, archive_interval_s and min_gap_s must be > 0")
+    need(min(r.plan_interval_s, r.archive_interval_s, r.min_gap_s, r.api_timeout_s) > 0,
+         "recrawl.plan_interval_s, archive_interval_s, min_gap_s and api_timeout_s must be > 0")
     need(r.retry_base_s <= r.retry_max_s, "recrawl.retry_base_s must be <= retry_max_s")
     need(r.min_free_gb >= 0, "recrawl.min_free_gb must be >= 0")
     need(r.pace_days > 0, "recrawl.pace_days must be > 0")

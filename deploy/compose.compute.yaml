@@ -41,18 +41,24 @@ services:
       driver: json-file
       options: {max-size: "20m", max-file: "5"}
 
-  # Recrawl loops (docs/RECRAWL_DESIGN.md §4). Started only after the crawler takes
-  # recrawl files (docs/CRAWLER_RECRAWL_PROPOSAL.md):
+  # Recrawl loops (docs/RECRAWL_DESIGN.md §4). Started only after the crawler serves
+  # the recrawl-batches API and lane (docs/CRAWLER_RECRAWL_PROPOSAL.md C5, C6, C10):
   #   docker compose ... --profile recrawl up -d recrawl-plan recrawl-archive
-  # /data is one filesystem mounted once, so the archive renames WARCs instead of copying.
-  # The crawler's recrawl dirs are root:1015 mode 2775, so this user may rename and delete.
+  # isel never writes /data/ipc: the API writes queue files, and the crawler prunes its
+  # results, which isel reads. Run `mkdir -p /data/isel` as the isel user before `up`
+  # (/data is 1777); Docker would otherwise create the bind source as root.
   recrawl-plan:
     extends: {service: isel}
     profiles: [recrawl]
     command: ["recrawl-plan"]
     restart: unless-stopped
+    network_mode: host                  # the gateway listens on 127.0.0.1:4000 only
+    environment:
+      ISEL_RECRAWL_API_TOKEN_FILE: /run/secrets/recrawl_api_token
+    secrets: [recrawl_api_token]
     volumes:
-      - /data:/data
+      - /data/ipc/recrawl_result:/data/ipc/recrawl_result:ro   # result_cap_gb backpressure
+      - /data/isel:/data/isel                                  # min_free_gb is measured here
     mem_limit: 4g
     memswap_limit: 4g
     cpus: 2
@@ -63,10 +69,11 @@ services:
     command: ["recrawl-archive"]
     restart: unless-stopped
     volumes:
-      - /data:/data
-    mem_limit: 4g
-    memswap_limit: 4g
-    cpus: 2
+      - /data/ipc/recrawl_result:/data/ipc/recrawl_result:ro
+      - /data/isel:/data/isel
+    mem_limit: 8g
+    memswap_limit: 8g
+    cpus: 8                             # text extraction: ~21M pages/day x 28 ms at the peak
 
 secrets:
   crawlerdb_dsn:
@@ -79,3 +86,5 @@ secrets:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_dsn
   selectdb_reader_password:
     file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/selectdb_reader_password
+  recrawl_api_token:
+    file: ${ISEL_SECRETS:?set it in the env file (DESIGN §12.5)}/recrawl_api_token
