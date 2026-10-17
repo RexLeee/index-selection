@@ -23,7 +23,7 @@ import pytest
 import sqlalchemy as sa
 from alembic import command
 from conftest import replace
-from recrawl_fakes import ApiStub, FakeCrawler, Page
+from recrawl_fakes import QUEUE_NAME, ApiStub, FakeCrawler, Page
 
 from isel.cli import main as cli_main
 from isel.golden import golden_table, pull_golden
@@ -489,7 +489,7 @@ def _go_live(cfg, admin, work, run_id, urls, shards):
 
 
 def _queue_file(stub, process, url):
-    return stub.dir(process) / f"domain_{host_id(url.split('/')[2]):06d}.json"
+    return stub.dir(process) / QUEUE_NAME.format(host_id(url.split("/")[2]))
 
 
 def _doc(admin, url, *cols):
@@ -515,18 +515,19 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         assert capacity_report(cfg, admin)["docs"] == 4
 
         first = plan_cycle(cfg, admin, T0, api)
-        assert (first["files"], first["docs"], first["refused"], first["unknown"]) == (2, 3, 0, 0)
+        assert (first["batches"], first["docs"], first["refused"], first["unknown"]) == (
+            2, 3, 0, 0)
         a_file, b_file = _queue_file(stub, 0, A1), _queue_file(stub, 1, B1)
         a = json.loads(a_file.read_text())
         assert a["urls"] == [A1, A2] and a["doc_ids"] == [pg_doc_id(A1), pg_doc_id(A2)]
         assert a["domain_id"] == host_id("a.example") and b_file.exists()
         assert a["recrawl_share"] == cfg.recrawl.share_min    # 3 docs need little of 14 days
         assert _doc(admin, A3, "due_at") == (OPEN,)           # the deadline counts from sync
-        assert plan_cycle(cfg, admin, T0, api)["files"] == 0  # one batch per host in flight
+        assert plan_cycle(cfg, admin, T0, api)["batches"] == 0  # one batch per host in flight
 
         a_file.unlink()                                       # the crawler takes it
         second = plan_cycle(cfg, admin, T0 + timedelta(seconds=30), api)
-        assert (second["taken"], second["files"]) == (1, 1)
+        assert (second["taken"], second["batches"]) == (1, 1)
         assert json.loads(a_file.read_text())["urls"] == [A3]
         assert _doc(admin, A1, "state", "dispatched_at") == ("dispatched", T0 + timedelta(
             seconds=30))
@@ -538,7 +539,8 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         out = Path(cfg.recrawl.result_root) / "crawler_00"
         before = sorted(f.name for f in out.iterdir())
         assert archive_cycle(cfg, admin, done) == {
-            "logs": 1, "records": 2, "applied": 2, "texts": 1, "no_warc": 0, "bad_logs": 0}
+            "logs": 1, "records": 2, "applied": 2, "texts": 1, "no_warc": 0, "io_error": 0,
+            "bad_logs": 0}
         base = "recrawl-00-20261015T120100Z-0"
         text_file = f"fetch_date=20261015/crawler_00/{base}.parquet"
         state, stored, text_len, lang, due = _doc(admin, A1, "state", "text_file", "text_len",
@@ -546,7 +548,10 @@ def test_recrawl_sync_plan_archive_and_revisit(selectdb, tmp_path, stub):
         assert (state, stored, lang, due) == (
             "fetched", text_file, "zh", done + timedelta(days=cfg.recrawl.stale_days))
         row = pq.read_table(Path(cfg.recrawl.text_root) / text_file).to_pylist()
-        assert len(row) == 1 and row[0]["doc_id"] == pg_doc_id(A1) and row[0]["url"] == A1
+        manifest = pq.read_table(tmp_path / "full" / "selection" / "run=r1" / "manifest"
+                                 ).to_pylist()
+        (a1_id,) = {m["doc_id"] for m in manifest if m["canonical_url"] == A1}
+        assert len(row) == 1 and row[0]["doc_id"] == a1_id and row[0]["url"] == A1
         assert (row[0]["title"], row[0]["description"], row[0]["lang"]) == (
             "颱風假", "停班停課", "zh")
         assert "防颱準備" in row[0]["body"] and "首頁" not in row[0]["body"]
@@ -593,7 +598,7 @@ def test_recrawl_sync_takes_docs_off_the_list_and_plan_skips_them(selectdb, tmp_
         _go_live(cfg, admin, tmp_path, "r2", [A1], [0])
         assert sync(cfg, admin, now=lambda: OPEN)["dropped"] == 1
         assert _doc(admin, B1, "rank", "state") == (None, "pending")
-        assert plan_cycle(cfg, admin, T0, _api(stub))["files"] == 1
+        assert plan_cycle(cfg, admin, T0, _api(stub))["batches"] == 1
         assert not _queue_file(stub, 1, B1).exists()
         with pytest.raises(RuntimeError, match="freeze window"):
             sync(cfg, admin, now=lambda: FROZEN)
@@ -637,7 +642,7 @@ def test_recrawl_plan_sends_nothing_when_disk_or_results_are_full(selectdb, tmp_
         admin.close()
 
 
-def test_recrawl_plan_releases_refused_batches_and_keeps_unknown_ones(selectdb, tmp_path, stub):
+def test_recrawl_plan_releases_rejected_docs_and_keeps_unknown_ones(selectdb, tmp_path, stub):
     cfg = replace(_recrawl_cfg(selectdb, tmp_path, stub), "recrawl", batch_size=3)
     _setup(cfg)
     admin = _admin(cfg)
@@ -653,22 +658,13 @@ def test_recrawl_plan_releases_refused_batches_and_keeps_unknown_ones(selectdb, 
                              ).fetchone() == (0,)
         stub.fail_get = False
 
-        # 503 stops the cycle; every claimed batch goes back, unsent.
-        stub.forced = [503]
-        got = plan_cycle(cfg, admin, T0, api)
-        assert (got["files"], got["refused"], len(stub.posts)) == (0, 3, 0)
-        assert admin.execute("SELECT count(*) FROM recrawl.host WHERE batch_id IS NOT NULL"
-                             ).fetchone() == (0,)
-
-        # 429 releases only that batch; the rejected URL is gone, its batch-mates retry.
-        stub.forced = [429]
+        # The rejected URL is gone; its batch-mates go out in the next cycle.
         stub.reject_urls = {A2}
         got = plan_cycle(cfg, admin, T0, api)
-        assert (got["files"], got["refused"], got["rejected"]) == (1, 2, 1)
+        assert (got["batches"], got["refused"], got["rejected"]) == (2, 1, 1)
         assert _doc(admin, A2, "state", "fail_reason") == ("gone", "invalid_url")
         assert _doc(admin, A1, "state") == ("pending",)
-        got = plan_cycle(cfg, admin, T0, api)
-        assert got["files"] == 2
+        assert plan_cycle(cfg, admin, T0, api)["batches"] == 1
         assert json.loads(_queue_file(stub, 0, A1).read_text())["urls"] == [A1, A3]
 
         # The reply is lost after the file was written: the batch stays claimed, is seen
@@ -683,10 +679,10 @@ def test_recrawl_plan_releases_refused_batches_and_keeps_unknown_ones(selectdb, 
         stub.lose_reply_s = 1.0
         got = plan_cycle(cfg, admin, T0 + timedelta(minutes=1), _api(stub, timeout_s=0.3))
         stub.lose_reply_s = 0.0
-        assert (got["files"], got["unknown"]) == (0, 1)
+        assert (got["batches"], got["unknown"], got["paused"]) == (0, 1, False)
         c_file = _queue_file(stub, 0, C1)
         assert c_file.exists() and _doc(admin, C1, "state") == ("dispatched",)
-        assert plan_cycle(cfg, admin, T0 + timedelta(minutes=2), api)["files"] == 0
+        assert plan_cycle(cfg, admin, T0 + timedelta(minutes=2), api)["batches"] == 0
         c_file.unlink()
         assert plan_cycle(cfg, admin, T0 + timedelta(minutes=3), api)["taken"] == 1
         assert _doc(admin, C1, "dispatched_at") == (T0 + timedelta(minutes=3),)
@@ -694,17 +690,101 @@ def test_recrawl_plan_releases_refused_batches_and_keeps_unknown_ones(selectdb, 
         admin.close()
 
 
-def test_recrawl_archive_reads_without_writing_and_survives_bad_logs(selectdb, tmp_path, stub):
+@pytest.mark.parametrize(("status", "sent", "refused", "unknown", "paused"), [
+    (200, 3, 0, 0, False),           # any 2xx is queued
+    (409, 2, 1, 0, False),           # that host only
+    (429, 2, 1, 0, False),           # that process only
+    (400, 0, 3, 0, True),            # a 400 without `rejected` refuses the whole request
+    (401, 0, 3, 0, True),
+    (415, 0, 3, 0, True),
+    (503, 0, 3, 0, True),
+    (500, 0, 2, 1, False),           # maybe queued: stays claimed, the rest go back unsent
+])
+def test_recrawl_plan_follows_the_verdict_table(selectdb, tmp_path, status, sent, refused,
+                                                unknown, paused):
+    stub = ApiStub(tmp_path / "recrawl" / "queue", processes=4)
+    cfg = replace(_recrawl_cfg(selectdb, tmp_path, stub), "recrawl", crawler_processes=4)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _go_live(cfg, admin, tmp_path, "r1", [A1, B1, C1], [0, 3, 1])   # three processes
+        sync(cfg, admin, now=lambda: OPEN)
+        api = _api(stub)
+        stub.forced = [status]
+        got = plan_cycle(cfg, admin, T0, api)
+        assert (got["batches"], got["refused"], got["unknown"], got["paused"]) == (
+            sent, refused, unknown, False)
+        assert ("api_error" in got) == paused and len(stub.posts) == (2 if sent else 0)
+        claimed = admin.execute("SELECT count(*) FROM recrawl.host WHERE batch_id IS NOT NULL"
+                                ).fetchone()[0]
+        assert claimed == 3 - refused
+        later = plan_cycle(cfg, admin, T0 + timedelta(seconds=30), api)
+        assert later["paused"] == paused
+        resumed = T0 + timedelta(seconds=cfg.recrawl.api_backoff_s + 1)
+        assert plan_cycle(cfg, admin, resumed, api)["paused"] is False
+    finally:
+        admin.close()
+        stub.close()
+
+
+def test_recrawl_plan_fills_only_free_queue_slots(selectdb, tmp_path):
+    stub = ApiStub(tmp_path / "recrawl" / "queue", processes=2, max_files_per_dir=1)
+    cfg = replace(_recrawl_cfg(selectdb, tmp_path, stub), "recrawl", queue_files_per_dir=1)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _go_live(cfg, admin, tmp_path, "r1", [A1, C1, B1], [0, 1, 3])  # A, C share process 0
+        sync(cfg, admin, now=lambda: OPEN)
+        api = _api(stub)
+        got = plan_cycle(cfg, admin, T0, api)
+        assert (got["batches"], got["refused"]) == (2, 0)              # no 429 is drawn
+        assert _doc(admin, C1, "state", "batch_id") == ("pending", None)
+        assert plan_cycle(cfg, admin, T0, api)["batches"] == 0 and len(stub.posts) == 2
+        _queue_file(stub, 0, A1).unlink()                              # a slot frees up
+        assert plan_cycle(cfg, admin, T0 + timedelta(seconds=30), api)["batches"] == 1
+        assert _queue_file(stub, 0, C1).exists()
+    finally:
+        admin.close()
+        stub.close()
+
+
+def test_recrawl_sync_wakes_a_host_waiting_on_docs_in_backoff(selectdb, tmp_path, stub):
     cfg = _recrawl_cfg(selectdb, tmp_path, stub)
+    _setup(cfg)
+    admin = _admin(cfg)
+    try:
+        _go_live(cfg, admin, tmp_path, "r1", [A1, B1], [0, 3])
+        sync(cfg, admin, now=lambda: OPEN)
+        # A1 waits 30 days after a robots refusal; B is paused 600 s after a 429.
+        month, pause = T0 + timedelta(days=30), T0 + timedelta(seconds=600)
+        admin.execute("UPDATE recrawl.doc SET state = 'failed', due_at = %s WHERE doc_id = %s",
+                      (month, pg_doc_id(A1)))
+        admin.execute("UPDATE recrawl.host SET next_at = %s WHERE host_id = %s",
+                      (month, host_id("a.example")))
+        admin.execute("UPDATE recrawl.host SET next_at = %s WHERE host_id = %s",
+                      (pause, host_id("b.example")))
+        _go_live(cfg, admin, tmp_path, "r2", [A2, A1, B1], [0, 0, 3])
+        sync(cfg, admin, now=lambda: OPEN)
+        assert plan_cycle(cfg, admin, T0, _api(stub))["batches"] == 1
+        assert json.loads(_queue_file(stub, 0, A1).read_text())["urls"] == [A2]
+        assert admin.execute("SELECT next_at FROM recrawl.host WHERE host_id = %s",
+                             (host_id("b.example"),)).fetchone() == (pause,)
+    finally:
+        admin.close()
+
+
+def test_recrawl_archive_reads_without_writing_and_survives_bad_logs(selectdb, tmp_path, stub,
+                                                                    monkeypatch):
+    cfg = replace(_recrawl_cfg(selectdb, tmp_path, stub), "recrawl", batch_size=3)
     _setup(cfg)
     admin = _admin(cfg)
     out = Path(cfg.recrawl.result_root) / "crawler_00"
     try:
-        _go_live(cfg, admin, tmp_path, "r1", [A1, A2], [0, 0])
+        _go_live(cfg, admin, tmp_path, "r1", [A1, A2, A3], [0, 0, 0])
         sync(cfg, admin, now=lambda: OPEN)
         plan_cycle(cfg, admin, T0, _api(stub))
         a = json.loads(_queue_file(stub, 0, A1).read_text())
-        crawler = _crawler(cfg, stub, {A1: ENGLISH, A2: ENGLISH})
+        crawler = _crawler(cfg, stub, {A1: ENGLISH, A2: ENGLISH, A3: ENGLISH})
 
         # A log whose WARC is not there yet waits; it is applied once the WARC appears.
         crawler.seq = 1
@@ -714,13 +794,23 @@ def test_recrawl_archive_reads_without_writing_and_survives_bad_logs(selectdb, t
         assert archive_cycle(cfg, admin, T0)["no_warc"] == 1
         (tmp_path / "held.warc.gz").rename(warc)
 
-        # A record whose bytes do not parse is retried; the crawler's dir is read-only.
+        # A record whose bytes do not parse, or that has no WARC record, is retried alone.
+        # Lines that break the contract fail only their own log. The crawler's dir is
+        # read-only.
         log = out / "recrawl-00-20261015T120000Z-1.jsonl"
         lines = [json.loads(x) for x in log.read_text().splitlines()]
         lines[1]["warc_offset"] = 0                           # points at the warcinfo record
+        good = dict(lines[2])
+        lines[2].update(warc_file=None, warc_offset=None, warc_length=None)
         log.write_text("".join(json.dumps(x) + "\n" for x in lines))
-        (out / "recrawl-00-20261015T120000Z-2.jsonl").write_text('{"batch_id": 1}\n')
-        (out / "recrawl-00-20261015T120000Z-2.warc.gz").write_bytes(b"")
+        poison = ['{"batch_id": 1}', "5", "null", json.dumps({**good, "http_status": "200"}),
+                  json.dumps({**good, "source_url": None}),
+                  json.dumps({**good, "fetched_at": None}),
+                  json.dumps({**good, "last_modified": "yesterday"}),
+                  json.dumps({**good, "http_status": 99999})]
+        for n, line in enumerate(poison, 2):
+            (out / f"recrawl-00-20261015T120000Z-{n}.jsonl").write_text(line + "\n")
+            (out / f"recrawl-00-20261015T120000Z-{n}.warc.gz").write_bytes(b"")
         for f in out.iterdir():
             f.chmod(0o444)
         out.chmod(0o555)
@@ -728,14 +818,39 @@ def test_recrawl_archive_reads_without_writing_and_survives_bad_logs(selectdb, t
             got = archive_cycle(cfg, admin, T0)
         finally:
             out.chmod(0o755)
-        assert (got["logs"], got["bad_logs"], got["texts"]) == (2, 1, 1)
+        assert (got["logs"], got["bad_logs"], got["texts"]) == (1 + len(poison), len(poison), 1)
         assert _doc(admin, A1, "state", "lang") == ("fetched", "en")
         assert _doc(admin, A2, "state", "attempts", "fail_reason") == (
             "failed", 1, "extract_error")
-        (error,) = admin.execute("SELECT error FROM recrawl.log WHERE name = %s",
-                                 ("recrawl-00-20261015T120000Z-2.jsonl",)).fetchone()
-        assert "keys differ" in error
+        assert _doc(admin, A3, "state", "attempts", "fail_reason") == (
+            "failed", 1, "no_warc_record")
+        errors = dict(admin.execute("SELECT name, error FROM recrawl.log WHERE error IS NOT NULL"
+                                    ).fetchall())
+        assert len(errors) == len(poison) and "keys differ" in errors[
+            "recrawl-00-20261015T120000Z-2.jsonl"]
         assert archive_cycle(cfg, admin, T0)["logs"] == 0
+
+        # An unreadable WARC loses nothing: the log waits until it can be read.
+        later = T0 + timedelta(minutes=5)
+        crawler.seq = 20
+        crawler._write(0, [a], later)
+        warc = out / "recrawl-00-20261015T120500Z-20.warc.gz"
+        warc.chmod(0o000)
+        try:
+            got = archive_cycle(cfg, admin, later)
+        finally:
+            warc.chmod(0o644)
+        assert (got["io_error"], got["logs"]) == (1, 0) and "Permission" in got["last_error"]
+
+        # A crash after the files are written and before the DB commit is replayed whole.
+        monkeypatch.setattr("isel.recrawl._apply", lambda *a, **k: pytest.fail("crash"))
+        with pytest.raises(pytest.fail.Exception):
+            archive_cycle(cfg, admin, later)
+        monkeypatch.undo()
+        assert archive_cycle(cfg, admin, later)["logs"] == 1
+        assert _doc(admin, A3, "state", "lang") == ("fetched", "en")
+        texts = list(Path(cfg.recrawl.text_root).rglob("*20261015T120500Z-20.parquet"))
+        assert len(texts) == 1 and not list(Path(cfg.recrawl.text_root).rglob("*.tmp"))
     finally:
         out.chmod(0o755)
         admin.close()
@@ -770,6 +885,7 @@ log_root = "{r.log_root}"
 crawler_processes = 2
 batch_size = 3
 min_free_gb = 0
+archive_workers = 2
 """)
         monkeypatch.setenv(r.api_token_env, stub.token)
         cli = ["--config", str(Path(__file__).resolve().parents[1] / "config" / "isel.toml"),

@@ -100,14 +100,11 @@ def test_pace_count_cap_reaches_share_max_for_any_past_since(base_cfg):
     ({"http_status": None, "fail_reason": "timeout"}, ("retry", "timeout")),
     ({"http_status": None, "fail_reason": "gate_refused"}, ("retry", "gate_refused")),
     ({"http_status": 500}, ("retry", "http_500")),
+    ({"warc_file": None}, ("retry", "no_warc_record")),
+    ({"warc_offset": None}, ("retry", "no_warc_record")),
 ])
 def test_classify(kw, expected):
     assert classify(record(**kw)) == expected
-
-
-def test_classify_rejects_an_html_page_without_its_warc_record():
-    with pytest.raises(RecrawlError, match="without a WARC"):
-        classify(record(warc_file=None))
 
 
 def _log(tmp_path, *records):
@@ -124,15 +121,27 @@ def test_read_fetch_log_keeps_one_record_per_doc_preferring_a_2xx(tmp_path):
                 record(fetched_at="2026-10-15T12:09:00+00:00", http_status=None,
                        fail_reason="timeout", warc_file=None),
                 record(other, http_status=503, warc_file=None))
-    got = {r["source_url"]: r["outcome"] for r in
-           read_fetch_log(path, "recrawl-00-20261015T120000Z-1.warc.gz")}
-    assert got == {URL: "fetched", other: "throttled"}
+    recs = read_fetch_log(path, "recrawl-00-20261015T120000Z-1.warc.gz")
+    assert {r["source_url"]: r["outcome"] for r in recs} == {URL: "fetched", other: "throttled"}
+    assert recs[0]["fetched_at"] == datetime(2026, 10, 15, 12, 0, 1, tzinfo=UTC)
 
 
 @pytest.mark.parametrize(("rec", "message"), [
     ({**record(), "extra": 1}, "keys differ"),
+    (5, "keys differ"),
+    (None, "keys differ"),
     (record(doc_id=1), "doc_id does not match"),
+    (record(doc_id=True), "wrong type"),
+    (record(source_url=None), "wrong type"),
     (record(warc_file="recrawl-00-other.warc.gz"), "warc_file is not"),
+    (record(http_status="200"), "http_status"),
+    (record(http_status=99999), "http_status"),
+    (record(warc_offset=-1), "warc_offset"),
+    (record(content_type=7), "content_type"),
+    (record(retry_after_s="30"), "retry_after_s"),
+    (record(fetched_at=None), "fetched_at"),
+    (record(fetched_at="2026-10-15T12:00:01"), "no UTC offset"),
+    (record(last_modified="Thu, 15 Oct 2026 12:00:00 GMT"), "Invalid isoformat"),
 ])
 def test_read_fetch_log_enforces_the_contract(tmp_path, rec, message):
     with pytest.raises(RecrawlError, match=message):
@@ -172,6 +181,12 @@ def test_recrawl_config_is_strict(tmp_path, base_cfg):
     path.write_text(BASE.read_text().replace('"work/recrawl/log"', '"work/recrawl/text"'))
     with pytest.raises(ConfigError, match="must differ"):
         load_config([path])
+    path.write_text(BASE.read_text().replace("batch_size = 100 ", "batch_size = 101 "))
+    with pytest.raises(ConfigError, match="C10 limit"):
+        load_config([path])
+    path.write_text(BASE.read_text().replace("archive_workers = 8", "archive_workers = 0"))
+    with pytest.raises(ConfigError, match="must be > 0"):
+        load_config([path])
     assert replace(base_cfg, "recrawl", batch_size=1).recrawl.batch_size == 1
 
 
@@ -195,13 +210,31 @@ def test_the_api_client_reads_every_c10_answer(stub):
     assert (queued["urls"], queued["domain_id"], queued["batch_id"]) == ([URL], 7, 1)
     assert api.queued() == {7}
     assert api.submit(_batch(crawler_id=1)) == Reply(409)          # queued in another dir
-    bad = "https://a.example/x?b=2&a=1"                           # not canonical
+    bad = "https://a.example/" + "x" * 2500                       # too long
     assert api.submit(_batch(8, urls=(URL, bad))) == Reply(400, (pg_doc_id(bad),))
+    assert api.submit(_batch(8, urls=(URL, "https://b.example/"))) == Reply(400)  # two hosts
     assert api.submit(_batch(9)) == Reply(201)
     assert api.submit(_batch(10)) == Reply(429)                    # crawler_00 is full
     stub.forced = [503]
     assert api.submit(_batch(11, crawler_id=1)) == Reply(503)
     assert CrawlerApi(stub.url, "wrong", 2.0).submit(_batch(12, crawler_id=1)) == Reply(401)
+
+
+@pytest.mark.parametrize(("url", "ok"), [
+    ("https://a.example/x|s/[1]?b=2&a=1", True),      # sent as is, never canonicalized
+    ("http://8.8.8.8/", True),
+    ("http://127.0.0.1:8080/", False),
+    ("http://localhost/", False),
+    ("http://169.254.169.254/latest/meta-data/", False),
+    ("http://10.0.0.5/admin", False),
+    ("http://scheduler-ingest:8080/healthz", False),
+    ("http://[::1]/", False),
+    ("ftp://a.example/", False),
+    ("https://user@a.example/", False),
+])
+def test_the_stub_applies_the_c10_url_rule(stub, url, ok):
+    reply = CrawlerApi(stub.url, stub.token, 2.0).submit(_batch(urls=(url,)))
+    assert reply == (Reply(201) if ok else Reply(400, (pg_doc_id(url),)))
 
 
 def test_the_api_client_never_mistakes_a_failed_query_for_an_empty_queue(stub):

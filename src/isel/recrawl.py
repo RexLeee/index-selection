@@ -14,8 +14,9 @@ side, including the API it serves to us, is specified in
   `recrawl_share`, the share of the host's requests the crawler gives the
   recrawl lane when the normal lane wants the same host (`pace_share`).
 - `archive` (loop): reads closed fetch logs and their WARCs without changing
-  them (the crawler prunes them), extracts each page's text into Parquet,
-  keeps a gzipped copy of the log, and applies the results idempotently.
+  them (the crawler prunes them). Worker processes extract each page's text
+  into Parquet and keep a gzipped copy of the log; the main process then
+  applies the results idempotently.
 
 Every frontier transaction takes one advisory lock, so plan, archive and sync
 never interleave their updates and cannot deadlock.
@@ -27,6 +28,7 @@ import contextlib
 import gzip
 import json
 import math
+import multiprocessing
 import os
 import re
 import shutil
@@ -34,7 +36,8 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -43,8 +46,8 @@ import numpy as np
 import psycopg
 import pyarrow as pa
 
-from isel.config import Config
-from isel.extract import ExtractError, extract, read_response
+from isel.config import Config, RecrawlCfg
+from isel.extract import extract, read_response
 from isel.io import TMP_SUFFIX, commit_file, open_duckdb, sql_str, write_parquet_atomic
 from isel.manifest import validate_run
 from isel.pg import require_env
@@ -66,22 +69,21 @@ RESULT_COLUMNS = ("batch_id", "doc_id", "outcome", "http_status", "content_type"
                   "fail_reason", "payload_sha1", "etag", "last_modified", "fetched_at",
                   "retry_after_s", "text_len", "lang")
 # One row per fetched page, the input of the inverted index (docs/RECRAWL_DESIGN.md §10).
-# A doc may appear in several files; the row with the latest `fetched_at` wins.
+# A doc may appear in several files; the row with the latest `fetched_at` wins. `doc_id`
+# is unsigned, as in the manifest.
 TEXT_SCHEMA = pa.schema([
-    ("doc_id", pa.int64()), ("batch_id", pa.int64()), ("url", pa.string()),
+    ("doc_id", pa.uint64()), ("batch_id", pa.int64()), ("url", pa.string()),
     ("final_url", pa.string()), ("fetched_at", pa.timestamp("us", tz="UTC")),
     ("http_status", pa.int16()), ("lang", pa.string()), ("title", pa.string()),
     ("description", pa.string()), ("body", pa.string()), ("text_len", pa.int32()),
     ("payload_sha1", pa.string())])
-# API answers that prove the batch was not queued; any other outcome is unknown.
-REFUSED = frozenset({400, 401, 403, 409, 429, 503})
-STOP_SENDING = frozenset({401, 403, 503})
 _DUE = "state IN ({})".format(", ".join(f"'{s}'" for s in DUE_STATES))
 _INT63 = (1 << 63) - 1
+_UINT64 = 1 << 64
 
 
 class RecrawlError(RuntimeError):
-    """Raised when the frontier, a queue directory or a fetch log is inconsistent."""
+    """Raised when the frontier or a fetch log is inconsistent."""
 
 
 def host_id(host: str) -> int:
@@ -96,7 +98,7 @@ def pg_doc_id(url: str) -> int:
 
 
 def process_of(cfg: Config, crawl_shard: int) -> int:
-    """The crawler process that owns `crawl_shard`; its queue dir is `crawler_NN`."""
+    """The crawler process that owns `crawl_shard`: the `crawler_id` of its batches."""
     return crawl_shard // (cfg.crawlerdb.num_shards // cfg.recrawl.crawler_processes)
 
 
@@ -125,8 +127,8 @@ def classify(rec: dict[str, Any]) -> tuple[str, str | None]:
         ctype = (rec["content_type"] or "").split(";")[0].strip().lower()
         if ctype not in HTML_TYPES:
             return "gone", "non_html"
-        if not rec["warc_file"]:
-            raise RecrawlError(f"doc {rec['doc_id']}: an HTML 2xx without a WARC record")
+        if not rec["warc_file"] or rec["warc_offset"] is None or rec["warc_length"] is None:
+            return "retry", "no_warc_record"
         return "fetched", None
     if status in (404, 410):
         return "gone", reason or f"http_{status}"
@@ -145,6 +147,10 @@ def _instance_lock(conn: psycopg.Connection, name: str) -> None:
 
 def _cycle_lock(cur: psycopg.Cursor) -> None:
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (LOCK_CYCLE,))
+
+
+def _crawler_dir(root: str | Path, process: int) -> Path:
+    return Path(root) / f"crawler_{process:02d}"
 
 
 def _refresh_best_rank(cur: psycopg.Cursor, hosts: Iterable[int]) -> None:
@@ -269,11 +275,13 @@ def _load_chunk(cfg: Config, conn: psycopg.Connection, csv_path: Path, run_id: i
             raise RecrawlError(f"{clashes} docs hit a host_id taken by another hostname")
         cur.execute(
             # A new doc is due from the sync; pace_share counts its deadline from here.
-            "INSERT INTO recrawl.doc (doc_id, url, host_id, rank, model_run_id, due_at) "
-            "SELECT doc_id, url, host_id, rank, %s, %s FROM s ON CONFLICT (doc_id) DO UPDATE "
-            "SET rank = EXCLUDED.rank, model_run_id = EXCLUDED.model_run_id "
+            "WITH up AS (INSERT INTO recrawl.doc (doc_id, url, host_id, rank, model_run_id, "
+            "due_at) SELECT doc_id, url, host_id, rank, %s, %s FROM s ON CONFLICT (doc_id) "
+            "DO UPDATE SET rank = EXCLUDED.rank, model_run_id = EXCLUDED.model_run_id "
             "WHERE (recrawl.doc.rank, recrawl.doc.model_run_id) "
-            "IS DISTINCT FROM (EXCLUDED.rank, EXCLUDED.model_run_id)", (run_id, at))
+            "IS DISTINCT FROM (EXCLUDED.rank, EXCLUDED.model_run_id) RETURNING host_id) "
+            + _WAKE.format("(SELECT DISTINCT host_id FROM up)"),
+            (run_id, at, at + timedelta(seconds=cfg.recrawl.host_pause_max_s)))
 
 
 # ---------------------------------------------------------------- plan
@@ -291,12 +299,17 @@ class Reply:
 
 
 class CrawlerApi:
-    """Client of the crawler's `recrawl-batches` routes (proposal C10)."""
+    """Client of the crawler's `recrawl-batches` routes (proposal C10).
+
+    `paused_until` is set when the API refused a whole cycle; the planner claims
+    nothing before then.
+    """
 
     def __init__(self, base_url: str, token: str, timeout_s: float) -> None:
         self.url = f"{base_url}/v1/recrawl-batches"
         self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         self.timeout_s = timeout_s
+        self.paused_until: datetime | None = None
 
     def queued(self) -> set[int]:
         """Host ids with a batch still waiting in any crawler queue directory."""
@@ -341,13 +354,15 @@ def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
     recovers it if it never ran.
     """
     r = cfg.recrawl
-    stats: dict[str, Any] = {"taken": 0, "timed_out": 0, "swept": 0, "files": 0, "docs": 0,
-                             "refused": 0, "rejected": 0, "unknown": 0, "disk_full": False,
+    stats: dict[str, Any] = {"queued": 0, "taken": 0, "timed_out": 0, "swept": 0,
+                             "batches": 0, "docs": 0, "refused": 0, "rejected": 0,
+                             "unknown": 0, "paused": False, "disk_full": False,
                              "result_full": False}
     try:
         queued = api.queued()
     except ApiUnavailable as exc:
         return {**stats, "api_error": str(exc)}
+    stats["queued"] = len(queued)
     batches: list[dict[str, Any]] = []
     with conn.transaction(), conn.cursor() as cur:
         _cycle_lock(cur)
@@ -362,26 +377,28 @@ def plan_cycle(cfg: Config, conn: psycopg.Connection, now: datetime,
             "LIMIT %s) RETURNING host_id", (now, r.sweep_rows))
         swept = [h for (h,) in cur.fetchall()]
         stats["timed_out"], stats["swept"] = len(timed_out), len(swept)
+        _wake(cur, timed_out + swept, now, r.host_pause_max_s)
         _refresh_best_rank(cur, timed_out + swept)
         text_root = Path(r.text_root)
         text_root.mkdir(parents=True, exist_ok=True)
-        if shutil.disk_usage(text_root).free < r.min_free_gb * 1e9:
+        if api.paused_until is not None and now < api.paused_until:
+            stats["paused"] = True
+        elif shutil.disk_usage(text_root).free < r.min_free_gb * 1e9:
             stats["disk_full"] = True
         elif _result_bytes(cfg) > r.result_cap_gb * 1e9:
             stats["result_full"] = True
         else:
             batches = _claim(cfg, cur, queued, now)
     if batches:
-        _send(conn, api, batches, stats)
+        _send(conn, api, batches, stats, now + timedelta(seconds=r.api_backoff_s))
     return stats
 
 
 def _result_bytes(cfg: Config) -> int:
     """Bytes the crawler holds in `result_root`: WARCs and logs not yet pruned."""
     total = 0
-    root = Path(cfg.recrawl.result_root)
     for p in range(cfg.recrawl.crawler_processes):
-        d = root / f"crawler_{p:02d}"
+        d = _crawler_dir(cfg.recrawl.result_root, p)
         if d.is_dir():
             with os.scandir(d) as entries:
                 total += sum(e.stat().st_size for e in entries if e.is_file())
@@ -401,15 +418,45 @@ def _note_taken(cur: psycopg.Cursor, queued: set[int], now: datetime) -> int:
     return len(taken)
 
 
+# A throttle pause ends within host_pause_max_s, so a later next_at was set by _claim for
+# docs in backoff; it must not hold back docs that are due now.
+_WAKE = ("UPDATE recrawl.host h SET next_at = NULL FROM {} AS w(host_id) "
+         "WHERE h.host_id = w.host_id AND h.next_at > %s")
+
+
+def _wake(cur: psycopg.Cursor, hosts: Iterable[int], now: datetime, pause_max_s: int) -> None:
+    """Clears the backoff `next_at` of hosts that have a doc due now."""
+    ids = sorted(set(hosts))
+    if ids:
+        cur.execute(_WAKE.format("unnest(%s::bigint[])"),
+                    (ids, now + timedelta(seconds=pause_max_s)))
+
+
 def _claim(cfg: Config, cur: psycopg.Cursor, queued: set[int],
            now: datetime) -> list[dict[str, Any]]:
-    """Marks the best-ranked ready hosts' due docs `dispatched`; returns their batches."""
+    """Marks the best-ranked ready hosts' due docs `dispatched`; returns their batches.
+
+    Each crawler process gets at most its free queue slots, so a full process
+    neither draws refusals every cycle nor holds back the others.
+    """
     r = cfg.recrawl
+    per = cfg.crawlerdb.num_shards // r.crawler_processes
+    cur.execute("SELECT crawl_shard / %s, count(*) FROM recrawl.host "
+                "WHERE host_id = ANY(%s::bigint[]) GROUP BY 1", (per, sorted(queued)))
+    busy = dict(cur.fetchall())
+    rooms = {p: r.queue_files_per_dir - busy.get(p, 0) for p in range(r.crawler_processes)}
+    rooms = {p: n for p, n in rooms.items() if n > 0}
+    if not rooms:
+        return []
     cur.execute(
-        "SELECT host_id, crawl_shard FROM recrawl.host WHERE batch_id IS NULL "
-        "AND best_rank IS NOT NULL AND (next_at IS NULL OR next_at <= %s) "
-        "AND NOT host_id = ANY(%s::bigint[]) ORDER BY best_rank LIMIT %s",
-        (now, sorted(queued), r.plan_max_files_per_txn))
+        "SELECT x.host_id, x.crawl_shard FROM unnest(%s::int[], %s::int[]) AS q(p, room) "
+        "CROSS JOIN LATERAL (SELECT host_id, crawl_shard, best_rank FROM recrawl.host "
+        "WHERE crawl_shard >= q.p * %s AND crawl_shard < (q.p + 1) * %s "
+        "AND batch_id IS NULL AND best_rank IS NOT NULL AND (next_at IS NULL OR next_at <= %s) "
+        "AND NOT host_id = ANY(%s::bigint[]) ORDER BY best_rank LIMIT least(q.room, %s)) x "
+        "ORDER BY x.best_rank LIMIT %s",
+        (list(rooms), list(rooms.values()), per, per, now, sorted(queued),
+         r.plan_max_batches, r.plan_max_batches))
     shards = dict(cur.fetchall())
     if not shards:
         return []
@@ -462,25 +509,43 @@ def _claim(cfg: Config, cur: psycopg.Cursor, queued: set[int],
 
 
 def _send(conn: psycopg.Connection, api: CrawlerApi, batches: list[dict[str, Any]],
-          stats: dict[str, Any]) -> None:
-    """Sends claimed batches; releases the ones the API refused."""
+          stats: dict[str, Any], pause_until: datetime) -> None:
+    """Sends claimed batches; releases the ones the API refused or that were never sent.
+
+    - 2xx: queued.
+    - 409: this host is still queued; 429: this process is full, so its other
+      batches are not sent; 400 with `rejected`: those docs are unfetchable.
+    - Any other 4xx, or 503: the API refuses everything. Sending stops and the
+      planner pauses until `pause_until`.
+    - 5xx, timeout or no connection: the batch may be queued, so it stays
+      claimed (the dispatch timeout recovers it), and sending stops.
+    """
     refused: list[int] = []
     rejected: list[int] = []
+    full: set[int] = set()
     stop = False
     for batch in batches:
-        if stop:
+        if stop or batch["crawler_id"] in full:
             refused.append(batch["batch_id"])
             continue
         reply = api.submit(batch)
-        if reply.status == 201:
-            stats["files"] += 1
+        status = reply.status
+        if status is not None and 200 <= status < 300:
+            stats["batches"] += 1
             stats["docs"] += len(batch["docs"])
-        elif reply.status in REFUSED:
-            refused.append(batch["batch_id"])
-            rejected += reply.rejected
-            stop = reply.status in STOP_SENDING
-        else:
+        elif status is None or status < 400 or (status >= 500 and status != 503):
             stats["unknown"] += 1
+            stop = True
+        else:
+            refused.append(batch["batch_id"])
+            if status == 429:
+                full.add(batch["crawler_id"])
+            elif status == 400 and reply.rejected:
+                rejected += reply.rejected
+            elif status != 409:
+                stats["api_error"] = f"POST {api.url} answered {status}"
+                api.paused_until = pause_until
+                stop = True
     stats["refused"], stats["rejected"] = len(refused), len(rejected)
     if refused:
         _release(conn, refused, rejected)
@@ -533,21 +598,127 @@ def run_archiver(cfg: Config, conn: psycopg.Connection, once: bool) -> dict[str,
 
 
 def archive_cycle(cfg: Config, conn: psycopg.Connection, now: datetime) -> dict[str, Any]:
-    """Applies every closed fetch log not yet in `recrawl.log`; never changes `result_root`."""
-    totals = dict.fromkeys(("logs", "records", "applied", "texts", "no_warc", "bad_logs"), 0)
-    root = Path(cfg.recrawl.result_root)
-    for p in range(cfg.recrawl.crawler_processes):
-        d = root / f"crawler_{p:02d}"
+    """Applies every closed fetch log not yet in `recrawl.log`; never changes `result_root`.
+
+    `archive_workers` processes do the file work of each log; this process
+    applies the results one log at a time.
+    """
+    r = cfg.recrawl
+    totals: dict[str, Any] = dict.fromkeys(
+        ("logs", "records", "applied", "texts", "no_warc", "io_error", "bad_logs"), 0)
+    todo: list[tuple[int, Path]] = []
+    for p in range(r.crawler_processes):
+        d = _crawler_dir(r.result_root, p)
         if not d.is_dir():
             continue
         logs = sorted(d.glob("*.jsonl"))
         done = {n for (n,) in conn.execute("SELECT name FROM recrawl.log WHERE name = ANY(%s)",
                                            ([log.name for log in logs],)).fetchall()}
-        for log in logs:
-            if log.name not in done:
-                for key, n in _archive_log(cfg, conn, p, log, now).items():
-                    totals[key] += n
+        todo += [(p, log) for log in logs if log.name not in done]
+    if r.archive_workers == 1 or len(todo) < 2:
+        prepared: Iterable[PreparedLog] = (prepare_log(r, p, log) for p, log in todo)
+        _finish_logs(cfg, conn, todo, prepared, now, totals)
+    else:
+        context = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(min(r.archive_workers, len(todo)), mp_context=context) as pool:
+            jobs = [pool.submit(prepare_log, r, p, log) for p, log in todo]
+            _finish_logs(cfg, conn, todo, (job.result() for job in jobs), now, totals)
     return totals
+
+
+def _finish_logs(cfg: Config, conn: psycopg.Connection, todo: list[tuple[int, Path]],
+                 prepared: Iterable[PreparedLog], now: datetime, totals: dict[str, Any]) -> None:
+    for (_, log), done in zip(todo, prepared, strict=True):
+        if done.status == "ok":
+            totals["logs"] += 1
+            totals["records"] += len(done.records)
+            totals["texts"] += done.texts
+            totals["applied"] += _apply(cfg, conn, done.records, done.text_file, log.name, now)
+        elif done.status == "bad":
+            _record_log(conn, log.name, 0, done.error)
+            totals["logs"] += 1
+            totals["bad_logs"] += 1
+        else:
+            # No WARC yet, or an unreadable file: the log is tried again next cycle.
+            totals[done.status] += 1
+            if done.error:
+                totals["last_error"] = done.error
+
+
+@dataclass(frozen=True)
+class PreparedLog:
+    """The file work for one fetch log; `status` is ok, bad, no_warc or io_error."""
+
+    status: str
+    records: list[dict[str, Any]] = field(default_factory=list)
+    text_file: str | None = None
+    texts: int = 0
+    error: str | None = None
+
+
+def prepare_log(r: RecrawlCfg, process: int, log: Path) -> PreparedLog:
+    """Parses one log, writes its text Parquet and its gzipped copy; touches no DB."""
+    m = LOG_NAME_RE.match(log.name)
+    if m is None or int(m.group(1)) != process:
+        return PreparedLog("bad", error=f"name is not recrawl-{process:02d}-<ts>Z-<seq>.jsonl")
+    base = log.name.removesuffix(".jsonl")
+    warc = log.with_name(f"{base}.warc.gz")
+    if not warc.exists():
+        # The crawler prunes the log before its WARC, so this is a log still being closed
+        # or a WARC lost outside the contract; its docs time out and go out again.
+        return PreparedLog("no_warc")
+    try:
+        try:
+            records = read_fetch_log(log, warc.name)
+        except (RecrawlError, ValueError) as exc:
+            return PreparedLog("bad", error=str(exc))
+        rows = _extract_texts(r.max_body_chars, warc, records)
+        rel = _crawler_dir(f"fetch_date={m.group(2)}", process) / f"{base}.parquet"
+        if rows:
+            write_parquet_atomic(pa.Table.from_pylist(rows, schema=TEXT_SCHEMA),
+                                 Path(r.text_root) / rel)
+        dest = _crawler_dir(Path(r.log_root) / m.group(2), process)
+        dest.mkdir(parents=True, exist_ok=True)
+        gz_tmp = dest / f"{base}.jsonl.gz{TMP_SUFFIX}"
+        with log.open("rb") as src, gzip.open(gz_tmp, "wb") as out:
+            shutil.copyfileobj(src, out)
+        commit_file(gz_tmp, dest / f"{base}.jsonl.gz")
+    except OSError as exc:
+        return PreparedLog("io_error", error=f"{log.name}: {exc}")
+    return PreparedLog("ok", records, str(rel) if rows else None, len(rows))
+
+
+def _is_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _check_record(rec: Any) -> None:
+    """Raises ValueError unless `rec` has the C6 types; parses its timestamps in place."""
+    if not isinstance(rec, dict) or set(rec) != FETCH_LOG_KEYS:
+        raise ValueError("keys differ from the fetch-log contract")
+    if not (_is_int(rec["batch_id"]) and _is_int(rec["doc_id"])
+            and isinstance(rec["source_url"], str)):
+        raise ValueError("batch_id, doc_id or source_url has the wrong type")
+    for key in ("final_url", "content_type", "etag", "fail_reason", "warc_file", "payload_sha1"):
+        if rec[key] is not None and not isinstance(rec[key], str):
+            raise ValueError(f"{key} must be a string or null")
+    status = rec["http_status"]
+    if status is not None and not (_is_int(status) and 100 <= status <= 599):
+        raise ValueError("http_status must be an HTTP status code or null")
+    for key in ("warc_offset", "warc_length"):
+        if rec[key] is not None and not (_is_int(rec[key]) and rec[key] >= 0):
+            raise ValueError(f"{key} must be a non-negative integer or null")
+    wait = rec["retry_after_s"]
+    if wait is not None and (isinstance(wait, bool) or not isinstance(wait, int | float)):
+        raise ValueError("retry_after_s must be a number or null")
+    for key in ("dispatched_at", "fetched_at", "last_modified"):
+        if rec[key] is None and key == "last_modified":
+            continue
+        if not isinstance(rec[key], str):
+            raise ValueError(f"{key} must be an ISO 8601 string")
+        rec[key] = datetime.fromisoformat(rec[key])
+        if rec[key].tzinfo is None:
+            raise ValueError(f"{key} has no UTC offset")
 
 
 def read_fetch_log(path: Path, warc_name: str) -> list[dict[str, Any]]:
@@ -555,57 +726,30 @@ def read_fetch_log(path: Path, warc_name: str) -> list[dict[str, Any]]:
     best: dict[int, dict[str, Any]] = {}
     with path.open(encoding="utf-8") as fh:
         for n, line in enumerate(fh, 1):
-            rec = json.loads(line)
-            if set(rec) != FETCH_LOG_KEYS:
-                raise RecrawlError(f"{path.name}:{n}: keys differ from the fetch-log contract")
+            try:
+                rec = json.loads(line)
+                _check_record(rec)
+            except ValueError as exc:
+                raise RecrawlError(f"{path.name}:{n}: {exc}") from exc
             if rec["doc_id"] != pg_doc_id(rec["source_url"]):
                 raise RecrawlError(f"{path.name}:{n}: doc_id does not match source_url")
             if rec["warc_file"] not in (None, warc_name):
                 raise RecrawlError(f"{path.name}:{n}: warc_file is not {warc_name}")
             rec["outcome"], rec["fail_reason"] = classify(rec)
-            key = (rec["outcome"] == "fetched", rec["fetched_at"] or "")
+            key = (rec["outcome"] == "fetched", rec["fetched_at"])
             old = best.get(rec["doc_id"])
-            if old is None or key >= (old["outcome"] == "fetched", old["fetched_at"] or ""):
+            if old is None or key >= (old["outcome"] == "fetched", old["fetched_at"]):
                 best[rec["doc_id"]] = rec
     return list(best.values())
 
 
-def _archive_log(cfg: Config, conn: psycopg.Connection, process: int, log: Path,
-                 now: datetime) -> dict[str, int]:
-    r = cfg.recrawl
-    m = LOG_NAME_RE.match(log.name)
-    if m is None or int(m.group(1)) != process:
-        _record_log(conn, log.name, 0, f"name is not recrawl-{process:02d}-<ts>Z-<seq>.jsonl")
-        return {"logs": 1, "bad_logs": 1}
-    base = log.name.removesuffix(".jsonl")
-    warc = log.with_name(f"{base}.warc.gz")
-    if not warc.exists():
-        # The crawler prunes the log before its WARC, so this is a log still being closed
-        # or a WARC lost outside the contract; its docs time out and go out again.
-        return {"no_warc": 1}
-    try:
-        records = read_fetch_log(log, warc.name)
-    except (RecrawlError, ValueError) as exc:
-        _record_log(conn, log.name, 0, str(exc))
-        return {"logs": 1, "bad_logs": 1}
-    rows = _extract_texts(r.max_body_chars, warc, records)
-    rel = Path(f"fetch_date={m.group(2)}") / f"crawler_{process:02d}" / f"{base}.parquet"
-    if rows:
-        write_parquet_atomic(pa.Table.from_pylist(rows, schema=TEXT_SCHEMA),
-                             Path(r.text_root) / rel)
-    dest = Path(r.log_root) / m.group(2) / f"crawler_{process:02d}"
-    dest.mkdir(parents=True, exist_ok=True)
-    gz_tmp = dest / f"{base}.jsonl.gz{TMP_SUFFIX}"
-    with log.open("rb") as src, gzip.open(gz_tmp, "wb") as out:
-        shutil.copyfileobj(src, out)
-    commit_file(gz_tmp, dest / f"{base}.jsonl.gz")
-    applied = _apply(cfg, conn, records, str(rel) if rows else None, log.name, now)
-    return {"logs": 1, "records": len(records), "applied": applied, "texts": len(rows)}
-
-
 def _extract_texts(max_body_chars: int, warc: Path,
                    records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Text rows of the fetched records; a record that fails to parse becomes a retry."""
+    """Text rows of the fetched records; a record that fails to parse becomes a retry.
+
+    An OSError means the WARC itself is unreadable; it propagates so the whole
+    log is tried again instead of losing its pages.
+    """
     rows = []
     for rec in records:
         rec["text_len"] = rec["lang"] = None
@@ -615,22 +759,26 @@ def _extract_texts(max_body_chars: int, warc: Path,
             payload, charset = read_response(warc, rec["warc_offset"], rec["warc_length"],
                                              rec["final_url"])
             doc = extract(payload, charset, max_body_chars)
-        except (ExtractError, OSError, EOFError, ValueError):
+        except OSError:
+            raise
+        except Exception:
+            # Hostile HTML or a bad record must not stop the archive.
             rec["outcome"], rec["fail_reason"] = "retry", "extract_error"
             continue
         rec["text_len"], rec["lang"] = len(doc.body), doc.lang
-        rows.append({"doc_id": rec["doc_id"], "batch_id": rec["batch_id"],
+        rows.append({"doc_id": rec["doc_id"] % _UINT64, "batch_id": rec["batch_id"],
                      "url": rec["source_url"], "final_url": rec["final_url"],
-                     "fetched_at": datetime.fromisoformat(rec["fetched_at"]),
+                     "fetched_at": rec["fetched_at"],
                      "http_status": rec["http_status"], "lang": doc.lang, "title": doc.title,
                      "description": doc.description, "body": doc.body,
                      "text_len": len(doc.body), "payload_sha1": rec["payload_sha1"]})
     return rows
 
 
-def _record_log(conn: psycopg.Connection, name: str, records: int, error: str | None) -> None:
-    conn.execute("INSERT INTO recrawl.log (name, records, error) VALUES (%s, %s, %s) "
-                 "ON CONFLICT (name) DO NOTHING", (name, records, error))
+def _record_log(db: psycopg.Connection | psycopg.Cursor, name: str, records: int,
+                error: str | None) -> None:
+    db.execute("INSERT INTO recrawl.log (name, records, error) VALUES (%s, %s, %s) "
+               "ON CONFLICT (name) DO NOTHING", (name, records, error))
 
 
 def _apply(cfg: Config, conn: psycopg.Connection, records: list[dict[str, Any]],
@@ -695,6 +843,5 @@ def _apply(cfg: Config, conn: psycopg.Connection, records: list[dict[str, Any]],
         cur.execute("SELECT DISTINCT d.host_id FROM r JOIN recrawl.doc d USING (doc_id)")
         _refresh_best_rank(cur, [h for (h,) in cur.fetchall()])
         # Last, so a crash before here leaves the log to be applied again.
-        cur.execute("INSERT INTO recrawl.log (name, records) VALUES (%s, %s) "
-                    "ON CONFLICT (name) DO NOTHING", (log_name, len(records)))
+        _record_log(cur, log_name, len(records), None)
     return changed

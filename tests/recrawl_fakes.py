@@ -9,21 +9,24 @@ writes WARC + fetch log pairs as C6 specifies, from a dict of canned responses.
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
 import os
+import re
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from w3lib.url import canonicalize_url
 from warcio.statusandheaders import StatusAndHeaders
 from warcio.warcwriter import WARCWriter
 
 QUEUE_NAME = "domain_{:06d}.json"
+QUEUE_RE = re.compile(r"^domain_(\d+)\.json$")
 
 
 class ApiStub:
@@ -32,10 +35,10 @@ class ApiStub:
     def __init__(self, queue_root: Path, processes: int, token: str = "t0ken",
                  max_files_per_dir: int = 384) -> None:
         self.queue_root, self.processes, self.token = queue_root, processes, token
-        self.max_files_per_dir = max_files_per_dir
+        self.max_files_per_dir = max_files_per_dir   # the crawler's 429 limit (C10)
         self.forced: list[int] = []      # statuses to answer POSTs with, in order
         self.fail_get = False
-        self.reject_urls: set[str] = set()   # judged invalid as libs/urls.py would
+        self.reject_urls: set[str] = set()   # judged invalid by the server
         self.lose_reply_s = 0.0          # write the file, then answer too late
         self.posts: list[dict] = []
         self._lock = threading.Lock()
@@ -53,22 +56,23 @@ class ApiStub:
         return self.queue_root / f"crawler_{process:02d}"
 
     def queued(self) -> set[int]:
-        return {int(n[7:-5]) for p in range(self.processes) for n in os.listdir(self.dir(p))
-                if n.startswith("domain_") and n.endswith(".json")}
+        return {int(m.group(1)) for p in range(self.processes) for n in os.listdir(self.dir(p))
+                if (m := QUEUE_RE.match(n))}
 
     def _post(self, body: dict) -> tuple[int, dict]:
         if self.forced:
-            return self.forced.pop(0), {}
+            status = self.forced.pop(0)
+            return status, {"error": "forced", "rejected": []} if status == 400 else {}
         crawler, docs = body.get("crawler_id"), body.get("docs") or []
         if not (isinstance(crawler, int) and 0 <= crawler < self.processes) or not docs:
-            return 400, {"rejected": []}
+            return 400, {"error": "Invalid request body", "rejected": []}
         hosts = {urlsplit(d["url"]).hostname for d in docs}
         if len(hosts) != 1:
-            return 400, {"rejected": []}
+            return 400, {"error": "URLs of more than one hostname", "rejected": []}
         rejected = [{"doc_id": d["doc_id"], "reason": "invalid_url"} for d in docs
                     if not _valid(d["url"]) or d["url"] in self.reject_urls]
         if rejected:
-            return 400, {"rejected": rejected}
+            return 400, {"error": "Invalid HTTP(S) URL", "rejected": rejected}
         with self._lock:
             name = QUEUE_NAME.format(body["host_id"])
             if any((self.dir(p) / name).exists() for p in range(self.processes)):
@@ -76,7 +80,7 @@ class ApiStub:
             target = self.dir(crawler) / name
             if len(os.listdir(target.parent)) >= self.max_files_per_dir:
                 return 429, {}
-            tmp = target.with_name(f".{name}.{threading.get_ident()}.part")
+            tmp = target.with_name(f".{name}.{uuid.uuid4().hex}.part")
             tmp.write_text(json.dumps({
                 "generated_at": datetime.now(UTC).isoformat(), "domain_id": body["host_id"],
                 "batch_id": body["batch_id"], "urls": [d["url"] for d in docs],
@@ -133,9 +137,16 @@ class ApiStub:
 
 
 def _valid(url: str) -> bool:
+    """C10's URL rule: used as sent, so only its scheme, host and length are checked."""
     parts = urlsplit(url)
-    return (parts.scheme in ("http", "https") and bool(parts.hostname)
-            and parts.username is None and len(url) <= 2500 and canonicalize_url(url) == url)
+    host = parts.hostname
+    if not (parts.scheme in ("http", "https") and host and parts.username is None
+            and len(url) <= 2500):
+        return False
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return host != "localhost" and "." in host
 
 
 @dataclass(frozen=True)
