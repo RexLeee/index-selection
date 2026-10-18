@@ -80,10 +80,10 @@ recrawl 的檔案不在 `/work`，路徑由 `[recrawl]` 設定（Host2 的值見
 
 | 路徑 | 內容 | 寫入者 |
 |---|---|---|
-| `/data/ipc/recrawl_queue/crawler_NN/domain_<host_id>.json` | 給 crawler 的 queue 檔，一個 hostname 一個 | crawler 的 API（`recrawl-plan` 經 `POST recrawl-batches` 送出，`docs/CRAWLER_RECRAWL_PROPOSAL.md` C10）；isel 不寫 `/data/ipc` |
-| `/data/ipc/recrawl_result/crawler_NN/recrawl-NN-<ts>Z-<seq>.{warc.gz,jsonl}` | crawler 的 WARC 和 fetch log，保留 24 小時 | crawler（C6、C8）；`recrawl-archive` 只讀 |
-| `/data/isel/text/fetch_date=YYYYMMDD/crawler_NN/<base>.parquet` | 抽出的正文，永久保存，建 inverted index 的來源 | `recrawl-archive` |
-| `/data/isel/log/YYYYMMDD/crawler_NN/<base>.jsonl.gz` | gzip 的 fetch log，永久保存，重建 DB 的依據 | `recrawl-archive` |
+| `/data/manual_bulk_crawls/pending/{job_id}.json` | 給 crawler 的 job 檔，一個 job 一個 | crawler 的 API（`recrawl-plan` 經 `POST /v1/manual-bulk-crawls` 送出，WebCrawler PR #84）；isel 不寫這個目錄 |
+| `/data/manual_bulk_crawls/results/{job_id}/` | `request.json`、`status.json`、每個 URL 的 `NNNNN.json` 和原始 HTML `NNNNN.html` | crawler；`recrawl-archive` 只讀。保留機制待 PR #84 提供 |
+| `/data/isel/text/fetch_date=YYYYMMDD/job-<batch_id>.parquet` | 抽出的正文，永久保存，建 inverted index 的來源 | `recrawl-archive` |
+| `/data/isel/log/YYYYMMDD/job-<batch_id>.jsonl.gz` | gzip 的逐 URL 結果，永久保存，重建 DB 的依據 | `recrawl-archive` |
 
 所有檔案都先寫成 `.tmp`，fsync 後才 rename（`io.py`）。
 
@@ -296,7 +296,7 @@ selection/run=<id>/
 | `url` | 要交給 metric 的拼法（目前是 crawler 的拼法） |
 | `canonical_url` | crawler 的正規化拼法（`w3lib.canonicalize_url`）。同一頁的不同拼法共用 `doc_id` |
 | `host`、`domain_id` | canonical URL 的 host；crawler `domain_state` 的 id（eTLD+1 或拆分的 host），來自 export |
-| `crawl_shard` | crawler 的 0–255 shard，取自該列被打分的 export shard。recrawl 依它找到負責的 crawler process |
+| `crawl_shard` | crawler 的 0–255 shard，取自該列被打分的 export shard。recrawl 不用它，路由由 crawler 的 API 決定 |
 | `index_shard` | `doc_id mod index_shards`，給 indexer 分工 |
 | `score`、`rank`、`reason` | 模型分數、名次（`manifest.RANK_ORDER`：score desc、URL 雜湊 asc、URL asc）、前幾名特徵貢獻（LightGBM SHAP；全量清單為 NULL） |
 | `content_hash`、`simhash`、`lang`、`text_len` | 預留給 Phase B 的內容回饋，目前是 NULL |
@@ -316,7 +316,7 @@ schema 只定義在 `src/isel/schema.py`（SQLAlchemy Core）。改動用 `src/i
 |---|---|---|
 | `public` | `selected_urls_current` | `url` PK、`score`、`first_seen`（NULL）、`run_id` FK（`ON DELETE RESTRICT`）、`selected_at`。欄位和 V1 相同 |
 | `public` | `model_runs` | V1 的欄位，加上 `status`（CHECK：loading、validated、live、retired、abandoned、rolled_back；最多一個 live）、`activated_at`、`config_sha256`、`code_version` |
-| `recrawl` | `host`、`doc`、`log`、`batch_seq` | recrawl 的 frontier：一個 hostname 一個 back queue，一個 doc 一列，`log` 記錄處理過的 fetch log。見 `docs/RECRAWL_DESIGN.md` §4.4。`select` 角色沒有這個 schema 的 USAGE |
+| `recrawl` | `host`、`doc`、`job`、`batch_seq` | recrawl 的 frontier：一個 hostname 一個 back queue，一個 doc 一列，一個送給 crawler API 的 job 一列。見 `docs/RECRAWL_DESIGN.md` §4.4。`select` 角色沒有這個 schema 的 USAGE |
 
 - `run_id`、`selected_at`、`first_seen` 每列都相同。這是刻意的反正規化，因為 V1 的讀者在每列讀這些欄位。
 - 清單表的約束一律叫 `<table>_pkey`、`<table>_run_id_fkey`。`swap` 和 `rollback` 改表名時一起改約束名。
@@ -498,7 +498,7 @@ Mac 經 VPN 只有約 4 MB/s，全量匯出只能在伺服器上跑。
 | 設定 | 理由 |
 |---|---|
 | `profiles: [job]`，用 `run --rm` | 一個指令一個容器，跑完就刪；`up` 不會啟動它；不設 restart、不開 port |
-| 例外：`recrawl-plan`、`recrawl-archive`（`profiles: [recrawl]`） | 它們要持續送 batch 和收結果，所以是常駐 service，`restart: unless-stopped`。每個只能跑一個實例，靠 advisory lock 保證。`recrawl-plan` 用 `network_mode: host` 連 `127.0.0.1:4000` 的 gateway，限制 2 CPU、4 GB；`recrawl-archive` 有 `archive_workers` 個抽取 process，限制 8 CPU、8 GB。兩者都唯讀掛載 `/data/ipc/recrawl_result`，可寫掛載 `/data/isel` |
+| 例外：`recrawl-plan`、`recrawl-archive`（`profiles: [recrawl]`） | 它們要持續送 job 和收結果，所以是常駐 service，`restart: unless-stopped`。每個只能跑一個實例，靠 advisory lock 保證。`recrawl-plan` 用 `network_mode: host` 連 `127.0.0.1:4000` 的 crawler API，限制 2 CPU、4 GB；`recrawl-archive` 有 `archive_workers` 個抽取 process，限制 8 CPU、8 GB。兩者都唯讀掛載 `/data/manual_bulk_crawls/results`，可寫掛載 `/data/isel` |
 | `init: true` | Ctrl-C 和 `docker stop` 能傳到 isel；所有指令都可續跑 |
 | `read_only: true`、`tmpfs: /tmp` | 只有 `/work` 可寫 |
 | secret 檔 + `<NAME>_FILE` | DSN 不出現在 `docker inspect`、env 或 log（V1 的 cron 檔就外洩過 DSN） |
@@ -561,13 +561,11 @@ $J verify-live --batch 19                    # sanity: in-sample batch
 $J derive-positives --batches 20
 $J verify-live --batch 20
 # recrawl (docs/RECRAWL_DESIGN.md §7), each step a Hard Stop
-$J recrawl-sync                              # after each swap; refused in the freeze window.
-                                            # New docs are due from now: run it shortly
-                                            # before the first recrawl-plan (pacing deadline)
+$J recrawl-sync                              # after each swap; refused in the freeze window
 $J recrawl-plan --dry-run                    # per-host capacity report; writes nothing
-# only after the crawler serves recrawl-batches (docs/CRAWLER_RECRAWL_PROPOSAL.md C5, C6, C10)
+# only after PR #84 (4dce38f or later, with ttl_days and DELETE) is merged and deployed
 $D --profile recrawl up -d recrawl-plan recrawl-archive
-$D --profile recrawl stop recrawl-plan       # stops sending new batches at once
+$D --profile recrawl stop recrawl-plan       # stops sending new jobs at once
 ```
 
 - 長指令用 `nohup`，或在 `tmux` 裡跑；中斷後重跑同一個指令就會續跑。

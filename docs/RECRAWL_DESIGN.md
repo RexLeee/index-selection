@@ -4,26 +4,23 @@
 
 ## 0. 結論
 
-2026-10-16 更新：入口改成 crawler API 的 `recrawl-batches` 資源，儲存改成只永久保存正文。理由見 §4.1、§6 和 §8。crawler 端的改動另寫在 `docs/CRAWLER_RECRAWL_PROPOSAL.md`，給 crawler 組討論。
+2026-10-18 更新：入口改成 WebCrawler PR #84 的 manual-bulk-crawl job API。提案的 C5、C6、C8、C10 由它取代，C9 改寫成 API job 的 lane 分配。politeness（C1–C4、C7）不再提出，沿用 crawler 現行的 AutoThrottle。理由見 §4.1 和 §8。同日 PR 更新到 `4dce38f`，加上 `ttl_days`、DELETE 和 FIFO 的 job 順序，isel 跟著改用它們（§4.4）。
 
-- recrawl 不另建爬蟲。它是正式 crawler 的第二條輸入車道。
-- recrawl 和 WebCrawler PR #84 共用同一個入口。PR #84 的 API 服務有兩種資源：
-  - `crawl-requests`：排進 crawlerdb 的待爬清單，送出後無法追蹤；
-  - `recrawl-batches`（提案 C10）：可追蹤的抓取工作，不碰 crawlerdb。isel 只用這一種。
-- isel 不寫 `/data/ipc`。API 寫 queue 檔，crawler 寫結果並自行刪除，isel 只讀。
-- 只永久保存抽出的正文（約 0.4 TB）。WARC 是暫存，crawler 在 24 小時後刪除。實測 crawler 運作時 Host2 `/data` 只剩約 2 TB，放不下 5–6 TB 的 WARC（§6）。
-- 正文 Parquet 足以建立 inverted index（§10）。
-- QPS 合規靠一個跨 process 的 host 閘門（提案 C2）。每個 process 的 Scrapy slot 不夠，原因有兩個：
-  - Scrapy 2.16 的 redirect 會沿用原 host 的 slot；
-  - 同一個 hostname 可能落在兩個 process。
-- isel 以 hostname 為單位規劃：每個 queue 檔只含一個 host 的 URL，每個 host 同時最多一個檔在磁碟上。
-- 原始 HTML 由 crawler 寫成 WARC.gz。isel 從中抽出正文後就不再需要它。
-- 實際每 host 約 0.15 qps，14 天約可抓 108M 頁（§3）。
-- 正式 crawler 現在不保證每 host 0.2 qps。要符合規定，必須改 crawler（提案 C1–C4）。
-- 兩條車道大量搶同一批 host（§3.1）。同一個 host 的額度用加權輪替分配（提案 C9）：
-  - isel 依每個 host 的期限算出 recrawl 份額，範圍 0.25–0.75，寫進 queue 檔；
-  - 一般車道在被搶的 host 上至少保留 25%；
-  - 模擬：recrawl 14 天約 112.8M 頁，一般爬取的尖峰損失 8.5%。
+- recrawl 不另建爬蟲。isel 把 URL 清單交給正式 crawler 的 job API，crawler 用一般的 `html_spider` 抓取。
+- isel 只做三件事：
+  - `POST /v1/manual-bulk-crawls` 送出 job，帶 `ttl_days`；
+  - 必要時 `GET` 查 job 狀態；
+  - 唯讀地讀取 `results/{job_id}/` 裡的結果檔；
+  - 正文存好後，`DELETE` 這個 job 的結果。
+- isel 不寫 crawlerdb，不直接寫 `/data/manual_bulk_crawls`，也不需要知道 crawler 的路由。刪除結果一律透過 API。
+- 只永久保存抽出的正文（約 0.4 TB）。原始 HTML 由 crawler 寫成結果檔，isel 抽完正文就不再需要它。
+- 結果依位置對應到 doc。archive 會先驗證順序；順序不對時，job 標成 `error`，planner 全面停止（§4.4）。
+- 0.2 qps 的規定：
+  - isel 讓 recrawl 自己對每個 host 平均不超過 0.2 qps（`min_gap_s`）；
+  - 跨 lane 的速率沿用 crawler 現行的 AutoThrottle。2026-10-18 決定不再提出 C1–C4、C7。
+- 14 天的上限約 108–123M 頁（§3）。目標是兩週內盡量多抓，rank 高的先抓。
+- 啟動前提：PR #84（`4dce38f` 或之後）已 merge 並部署。isel 依賴它的 `ttl_days` 和 DELETE，否則 `/data` 會塞滿。
+- lane 分配不在 PR #84 的範圍內，已和 crawler 組說好另外追蹤，WebCrawler #85 已改寫成只談這個問題。
 
 ## 1. 規則
 
@@ -182,55 +179,54 @@ URL 集中的程度：
 
 ## 4. 架構
 
-### 4.1 原則：一個抓取平面，一個 host 閘門
+### 4.1 原則：交給正式 crawler，isel 只讀結果
 
-- 「每 host 相鄰請求至少隔 5 秒」需要知道同一 host 的上一次請求。
-- 每個 crawler process 的 Scrapy slot 只知道自己送過的請求。以下情況會讓兩個 process 打同一個 host：
-  - 跨 host 的 redirect：Scrapy 2.16 把 slot 名稱寫進 `meta["download_slot"]`，redirect 複製 meta，所以目標 host 的請求在原 host 的 slot 排隊；
-  - crawlerdb 的白名單切分改變 routing；
-  - isel 用的 routing 快照過期；
-  - process 重啟，slot 的計時歸零。
-- 所以合規放在一個跨 process 的閘門：Host2 tmpfs 上的 SQLite，每次送出前對 hostname 做原子的「檢查並設定」（提案 C2）。
-- isel 的 routing 只決定工作落在哪個 process，不負責合規。
+- 正式 crawler 已經有每 host 的 slot、robots.txt 和 AutoThrottle。PR #84 讓 API 的 URL 走同一個 downloader，所以 recrawl 不需要自己的抓取平面。
+- 「每 host 相鄰請求至少隔 5 秒」仍需要 crawler 端的跨 process 閘門（C2）。原因見 2026-10-13 版的分析：redirect 會沿用原 host 的 slot，同一個 hostname 也可能落在兩個 process。
+- isel 能控制的只有「什麼時候送哪些 URL」。所以它做兩件事：
+  - 同一個 host 同時只在一個 job 裡；
+  - 下一個 job 至少等 `送出的 doc 數 × min_gap_s`。
 
 ### 4.2 元件
 
 ```
-selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,log}
+selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,job}
                                                   │ recrawl-plan（常駐）
                                                   ▼
-     POST 127.0.0.1:4000/scheduler_ingest/v1/recrawl-batches（PR #84 的 gateway，C10）
-                                                  │ API 寫檔
+             POST 127.0.0.1:4000/v1/manual-bulk-crawls {"urls": [...]} → job_id
+                                                  │ API 正規化、去重、分給擁有該 domain 的 crawler
                                                   ▼
-                        /data/ipc/recrawl_queue/crawler_NN/domain_<host_id>.json
-                                                  │
+                       /data/manual_bulk_crawls/pending/{job_id}.json
+                                                  │ 正式 crawler 的 html_spider（priority -1）
                                                   ▼
-               正式 crawler process NN（兩條車道，都先過 host 閘門）
-                                                  │ lane=recrawl
+       /data/manual_bulk_crawls/results/{job_id}/{request,status,NNNNN}.json + NNNNN.html
+                                                  │ recrawl-archive（常駐，只讀）
                                                   ▼
-     /data/ipc/recrawl_result/crawler_NN/recrawl-NN-<ts>Z-<seq>.{warc.gz,jsonl}
-                     │ recrawl-archive（常駐，只讀）           │ crawler 24 小時後刪除
-                     ▼
-     /data/isel/text/fetch_date=YYYYMMDD/crawler_NN/<base>.parquet（正文，永久）
-     /data/isel/log/YYYYMMDD/crawler_NN/<base>.jsonl.gz（fetch log，永久）；更新 recrawl.doc
+     /data/isel/text/fetch_date=YYYYMMDD/job-<batch_id>.parquet（正文，永久）
+     /data/isel/log/YYYYMMDD/job-<batch_id>.jsonl.gz（每個 URL 的結果，永久）；更新 recrawl.doc
 ```
+
+- 結果目錄在整個 job 的 URL 都完成後，才用一次 rename 出現。所以 isel 看到目錄就代表 job 完成。
+- `request.json` 是 API 正規化並去重後的 URL 清單，順序不變（PR 的 `docs/03` §3.6）。`NNNNN.json` 是清單中第 N 個 URL 的結果。
+- job 從 POST 起算 `ttl_days` 天後過期。過期後 crawler 不再處理它，`GET` 回 404，API 容器的 GC 每小時刪掉它的檔案。
+- crawler 依 `created_at` 認領 job，所以 job 是 FIFO。
 
 ### 4.3 crawler 的改動
 
-全部寫在 `docs/CRAWLER_RECRAWL_PROPOSAL.md`：
+全部寫在 `docs/CRAWLER_RECRAWL_PROPOSAL.md`，2026-10-18 的狀態：
 
-| 編號 | 內容 |
-|---|---|
-| C1 | politeness 設定：每 host 並發 1、delay 5 s、不加隨機延遲、AutoThrottle 關閉 |
-| C2 | host 閘門，和以 hostname 為 key 的 slot |
-| C3 | robots.txt：Crawl-delay、5xx 視為禁止、24 小時快取 |
-| C4 | 429/503 放慢同一 host |
-| C5 | recrawl 車道：第二個 queue 目錄，自己的水位和排除集合 |
-| C6 | recrawl 輸出：WARC + fetch log |
-| C7 | 其他 fetcher 走同一個閘門 |
-| C8 | `recrawl_result` 的保留時間（24 小時）和容量上限 |
-| C9 | 車道仲裁：每個 host 的兩條車道依 `recrawl_share` 加權輪替 |
-| C10 | `recrawl-batches` API：在 PR #84 的 API 服務上新增一種資源，替 isel 寫 queue 檔 |
+| 編號 | 內容 | 狀態 |
+|---|---|---|
+| C1 | politeness 設定：每 host 並發 1、delay 5 s、不加隨機延遲、AutoThrottle 關閉 | 不再提出，沿用現行 AutoThrottle |
+| C2 | host 閘門，和以 hostname 為 key 的 slot | 不再提出 |
+| C3 | robots.txt：Crawl-delay、5xx 視為禁止、24 小時快取 | 仍需要 |
+| C4 | 429/503 放慢同一 host | 不再提出 |
+| C5 | recrawl 車道 | 由 PR #84 取代 |
+| C6 | recrawl 輸出：WARC + fetch log | 由 PR #84 的結果目錄取代 |
+| C7 | 其他 fetcher 走同一個閘門 | 不再提出 |
+| C8 | 結果的保留時間 | 由 PR #84 的 `ttl_days`、DELETE 和 GC 取代 |
+| C9 | 車道仲裁 | 改寫成 API job 的 lane 分配問題，WebCrawler #85 只談這一項 |
+| C10 | `recrawl-batches` API | 由 PR #84 的 job API 取代 |
 
 ### 4.4 isel 的元件（`src/isel/recrawl.py`，已實作）
 
@@ -238,16 +234,24 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 | 表 | 一列代表 | 主要欄位 |
 |---|---|---|
-| `recrawl.host` | 一個 hostname 的 back queue | `host_id`（hostname 的 MD5 低 63 位元）、`crawl_shard`、`best_rank`、`next_at`、`batch_id` |
-| `recrawl.doc` | 一個 `doc_id` | `url`、`host_id`、`rank`、`state`、`due_at`、`attempts`、`batch_id`、`dispatched_at`、抓取結果欄位、`text_file`/`text_len`/`lang` |
-| `recrawl.log` | 一個處理過的 fetch log | `name`、`processed_at`、`records`、`error` |
+| `recrawl.host` | 一個 hostname 的 back queue | `host_id`（hostname 的 MD5 低 63 位元）、`best_rank`、`next_at`、`batch_id`（它所在的未結束 job） |
+| `recrawl.doc` | 一個 `doc_id` | `url`、`host_id`、`rank`、`state`、`due_at`、`attempts`、`batch_id`、抓取結果欄位、`text_file`/`text_len`/`lang` |
+| `recrawl.job` | 一個送給 API 的 job | `batch_id`（`batch_seq`）、`job_id`、`doc_ids`（送出順序）、`state`、時間欄位、`deleted_at`（API 上的結果已刪）、`records`、`error` |
 
-- `state` 的值：`pending`、`dispatched`、`fetched`、`failed`、`gone`。
+- doc 的 `state`：`pending`、`dispatched`、`fetched`、`failed`、`gone`。
+- job 的 `state`：
+
+| 狀態 | 意思 | doc |
+|---|---|---|
+| `claimed` | 已寫進 DB，POST 還沒有確定的回應 | `dispatched` |
+| `submitted` | API 回了 `job_id` | `dispatched` |
+| `error` | 結果違反合約（例如順序不對）。planner 全面停止，archive 每輪重試，直到修好或 TTL 到期 | `dispatched` |
+| `applied` | 結果已套用。之後 plan 會 DELETE 它的結果，並填 `deleted_at` | — |
+| `lost` | 不會有結果：API 拒絕、POST 沒回應、API 不認得（包括 TTL 已到期） | 已退回 `pending` |
+
+- job 的期限只有一個：`result_ttl_days`（3 天），isel 在 POST 時送出。到期後由 server 停止 job，isel 不另設逾時。
+
 - doc 是否在 live 清單上由 `rank IS NOT NULL` 表示。sync 只寫 `rank` 和 `model_run_id`，archive 只寫抓取欄位。
-- `host_ready (best_rank) WHERE batch_id IS NULL AND best_rank IS NOT NULL`：planner 先挑可派送的 host。
-- `doc_due (host_id, rank) WHERE rank IS NOT NULL AND state IN ('pending','failed')`：取一個 host 的前 100 個 doc。
-- `doc_stale (due_at) WHERE state = 'fetched' AND rank IS NOT NULL`：抓過的 doc 到期後回到 `pending`。
-- `doc_inflight (batch_id) WHERE state = 'dispatched'`。
 - plan、archive、sync 的每個交易都取同一個 advisory lock，所以不會交錯，也不會死結。
 
 **`recrawl-sync`**：每次 swap 後跑一次。
@@ -255,77 +259,88 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 1. 讀 live run 的 manifest。每個 `doc_id` 取 rank 最小的一列。
 2. 每 1M 列一個交易，upsert `host` 和 `doc`。
 3. 不在新清單的 doc 設成 `rank = NULL`。
-4. 重算 `best_rank`。
-5. 新增或改了 rank 的 doc，會喚醒它的 host（見 plan 的 `next_at` 規則）。
-6. swap 凍結時段內拒絕執行。
+4. 重算 `best_rank`。新增或改了 rank 的 doc 會喚醒它的 host。
+5. swap 凍結時段內拒絕執行。
 
-**`recrawl-plan`**：常駐，每 30 秒一輪。HTTP 呼叫不在 lock 或交易內執行（outbox 順序）。
+**`recrawl-plan`**：常駐，每 30 秒一輪。HTTP 呼叫不在交易內執行。
 
-1. `GET recrawl-batches` 取得還在排隊的 `host_id`。任何錯誤都讓這一輪什麼都不改，不會當成「沒有排隊」。
-2. 交易 T1：
-   - 有 `batch_id` 但不在排隊清單的 host，代表 crawler 已取走。記下 `dispatched_at`，清掉 `host.batch_id`。
-   - 取走超過 `dispatch_timeout_s` 仍沒有結果的 doc 退回 `pending`，`attempts` 不加。
+1. 回收：
+   - `claimed` 超過 `claim_timeout_s`（600 秒）的 job 標成 `lost`，doc 退回 `pending`；
+   - 安全網：`dispatched` 的 doc 或有 `batch_id` 的 host，如果它的 job 已不是 `claimed`/`submitted`/`error`，就釋放；
    - `fetched` 而且到期的 doc 退回 `pending`。
-   - 上面兩種 doc 的 host，如果 `next_at` 晚於 `now + host_pause_max_s`，就清掉 `next_at`。throttle 暫停最多 `host_pause_max_s`，所以更晚的值一定是「只剩退避中的 doc」時設的，不能擋住現在到期的 doc。
-   - 背壓：以下任一情況，這一輪不派送：
-     - 上一輪 API 拒絕了整批請求，還在 `api_backoff_s` 內；
-     - `text_root` 所在的磁碟剩餘低於 `min_free_gb`；
-     - `recrawl_result` 總量超過 `result_cap_gb`。
-   - 每個 crawler process 的空位是 `queue_files_per_dir − 它還在排隊的 batch 數`。排隊數由 GET 的清單對照 `crawl_shard` 算出。每個 process 依 `best_rank` 挑最多「空位」個 host，合計最多 `plan_max_batches` 個。目錄滿時不認領，所以不會每輪收到 429 再退回 20 萬列，也不會讓前 1000 名卡住其他 process。
-   - 每個 host 取最多 100 個到期 doc，標成 `dispatched`，設定 `host.batch_id`，commit。
-3. 逐一 `POST recrawl-batches`。body 是 `{batch_id, crawler_id, host_id, recrawl_share, docs}`。`crawler_id` 和 `host_id` 由 isel 算好，API 不自己算路由。
-4. 依回應判定，交易 T2 退回被拒絕和沒送出的 batch（doc 回 `pending`，清掉 `batch_id`）：
+2. 查狀態：`submitted` 或 `error` 的 job 超過 `job_check_s`（6 小時）仍沒有結果目錄，就 `GET` 一次。
+   - 404：`lost`，doc 退回 `pending`。TTL 到期的 job 走這條。沒修好就過期的 `error` job 也走這條，planner 隨之恢復。
+   - `pending`/`running`：記下 `checked_at`。
+   - `completed` 但看不到目錄：回報 `config_error`。這代表結果目錄沒有掛載對。
+3. 刪除：`applied` 而且 `deleted_at` 是 NULL 的 job，逐一 `DELETE`。
+   - 204 或 404：填 `deleted_at`。
+   - 其他回應或沒有回應：回報 `api_error`，本輪停止，下一輪再試。
+   - planner 停住時也照樣刪除。
+4. 停止條件，任一成立就不認領：
+   - 有 job 在 `error`；
+   - API 上次拒絕了整個 job，還在 `api_backoff_s` 內；
+   - 未結束的 job（`claimed` + `submitted`）已有 `max_jobs_inflight`（48）個；
+   - `text_root` 所在磁碟剩餘低於 `min_free_gb`。
+5. 認領：依 `best_rank` 分頁讀出可派送的 host（沒有未結束的 job，`next_at` 已到）。
+   - 每個 host 取最多 `host_docs_per_job`（120）個到期 doc；
+   - 依序裝進 job，每個 job 最多 `job_size`（3000）個 URL，一輪最多 `plan_max_jobs`（8）個 job；
+   - job 內輪流排列各 host 的 URL，讓 crawler 的 256 個 prefetch 名額分散到多個 host；
+   - 寫入 `recrawl.job`（`claimed`），doc 標成 `dispatched`，host 設 `batch_id` 和 `next_at = now + doc 數 × min_gap_s`，commit。
+6. 逐一 POST（`{"urls": [...], "ttl_days": 3}`），依回應處理：
 
-| 回應 | 判定 | 這一輪接下來 |
-|---|---|---|
-| 2xx | 已排隊 | 繼續 |
-| 409 | 退回：這個 host 還有一批在排隊 | 繼續 |
-| 429 | 退回：這個 process 滿了 | 同一個 `crawler_id` 的其他 batch 不送；其他 process 繼續 |
-| 400 且 `rejected` 非空 | 退回；`rejected` 中的 doc 設成 `gone`（`invalid_url`） | 繼續 |
-| 其他 4xx（含 `rejected` 為空的 400、401、403、404、413、415、422）、503 | 退回；stats 記 `api_error`；暫停 `api_backoff_s` | 停止，未送的退回 |
-| 其他 5xx、timeout、連線中斷 | 結果不明：保持認領 | 停止，未送的退回 |
+| 回應 | 處理 |
+|---|---|
+| 200 + `job_id` | `submitted` |
+| 400「Invalid HTTP(S) URL at index N」 | 第 N 個 doc 標成 `gone`（`invalid_url`），其餘立刻重送，最多 `max_resend` 次 |
+| 其他 400、415、500、503 | API 沒有接受任何 URL。job 標成 `lost` 並釋放；暫停 `api_backoff_s`；未送的 job 也釋放 |
+| 沒有回應、200 但沒有可用的 `job_id` | 結果不明。job 保持 `claimed`，由 claim 逾時回收；未送的 job 釋放 |
 
-   - 結果不明的 batch 可能已經排隊。下一輪的 GET 會看到它還在排隊，或判定已被取走；真的遺失時由 `dispatch_timeout_s` 回收。這樣不會重送，也不會重抓。
-   - `dispatch_timeout_s` 是 8 小時：Crawl-delay 60 秒、份額 0.25 時，100 個 URL 要 24,000 秒。逾時太短會在 crawler 還在抓時重複派送。
-5. `recrawl_share` 由 `pace_share` 算出：
-   - `backlog` 是這個 host 現在到期的 doc 數；`since` 是它們最早的 `due_at`；
-   - `share = clamp(backlog × pace_cycle_s / max(since + pace_days − now, plan_interval_s), share_min, share_max)`；
-   - 意義是「在 `since` 之後 `pace_days` 天內抓完這個 host 需要的份額」。期限過了就給 `share_max`；
-   - backlog 的 count 封頂在 `pace_count_cap`，超過時份額本來就是上限，所以大 host 不用每次數 656k 列；
-   - 新 doc 的 `due_at` 由 `recrawl-sync` 寫成 sync 的時間，所以第一期的期限從 sync 開始算。sync 要在啟動 planner 前不久才跑。
-6. `--dry-run` 輸出每 host 的容量報告，不呼叫 API。
+   - 結果不明的 job 可能已被接受。isel 不知道它的 `job_id`，所以刪不到；TTL 到期後由 server 清掉。
+7. `--dry-run` 輸出每 host 的容量報告，不呼叫 API。
 
-**`recrawl-archive`**：常駐，每 60 秒一輪。它對 `result_root` 只讀不寫。`archive_workers` 個 process 做每個 log 的檔案工作（解析、抽取、寫 Parquet、複製 log），主程序依序套用 DB。
+**`recrawl-archive`**：常駐，每 60 秒一輪。它對 `result_root` 只讀不寫。
 
-1. 只處理不在 `recrawl.log` 的 `.jsonl`。對應的 WARC 不存在時跳過，等下一輪。
-2. 每一行先檢查 key 和型別（C6 的 16 個欄位、時間要有 UTC offset、`http_status` 在 100–599）。有一行不符合，整個 log 就在 `recrawl.log` 記一列 `error`，然後繼續處理其他 log。這樣一行壞資料不會讓 archive 反覆 crash。
-3. 讀 log 或 WARC 時發生 OSError（權限、EIO、讀到一半被刪），這個 log 不記錄，下一輪重試，正文不會因此遺失。
-4. 每一筆 2xx HTML：
-   - 依 `(warc_offset, warc_length)` 讀出 gzip member，確認它是 `WARC-Target-URI = final_url` 的 response record。位移錯誤時，FastWARC 會默默讀到相鄰或截斷的 record，所以這個檢查是必要的；
-   - 用 Resiliparse 抽出 title、`<meta name=description>`、正文（main-content 模式，全是樣板時退回全文，最多 `max_body_chars` 字元）和語言；
-   - 解析失敗時，這一筆當成 `retry`（`extract_error`）；log 有這一筆但沒有 WARC record 時，當成 `retry`（`no_warc_record`）。只有這一筆受影響。
-5. 每個 log 寫一個 zstd Parquet 到 `text_root`，並把 log 用 gzip 複製到 `log_root`。這些 log 是重建 DB 的依據。
-6. 最後在同一個交易裡套用結果，並寫入 `recrawl.log`。檔案先寫、DB 後寫，所以重跑同一個 log 不會有副作用。套用規則：
+1. 候選 job：`submitted` 和 `error`，而且 `result_root/{job_id}` 已存在。`lost` 的 job 不再套用，因為它的 doc 已經重排。
+2. `archive_workers` 個 process 各處理一個 job（`prepare_job`）：
+   - 讀 `request.json`、`status.json`，以及清單中每個位置的 `NNNNN.json`；
+   - 檢查每筆結果：必要欄位、型別、`url` 等於 `request.json` 的第 N 個、`html_file` 只能是 `NNNNN.html`、時間有 UTC offset；
+   - 對應（`map_results`）：
+     - 長度相同：第 i 個結果對應第 i 個 doc。若某位置的 URL 不同，而且等於另一個送出的 URL，代表順序變了，判定違反合約；
+     - 長度較短（API 去掉了重複）：只用完全相同的字串對應。對不上的 doc 記成 `retry`（`unmatched`），下次通常單獨在一個 job，就能用位置對應；
+   - 2xx HTML：計算 `payload_sha1`，用 Resiliparse 抽出 title、description、正文和語言。編碼由位元組或 `<meta charset>` 判斷；
+   - 寫一個正文 Parquet 和一個 gzip 的逐 URL 結果。日期取自 `status.json` 的 `completed_at`，所以重跑會覆蓋同一個檔。
+3. 違反合約：job 標成 `error`，不寫 DB。planner 停止，直到修好後的下一輪成功套用。
+4. 讀檔的 OSError（權限、EIO）：這個 job 下一輪重試，不改狀態。整個目錄消失也算這一種。
+5. 主程序在一個交易內套用，最後才把 job 標成 `applied`，所以 crash 後重跑沒有副作用：
 
 | 結果 | 新狀態 | 下次 |
 |---|---|---|
-| 2xx HTML | `fetched`，記下 `text_file`、`text_len`、`lang` | `stale_days` 後 |
+| 2xx HTML | `fetched`，記下 `text_file`、`text_len`、`lang`、`payload_sha1` | `stale_days` 後 |
 | 2xx 非 HTML、404、410 | `gone` | 不再抓 |
-| robots 禁止、Crawl-delay 過長 | `failed` | `robots_retry_days` 後 |
-| 429、503 | `failed`，並暫停 host（Retry-After，上限 `host_pause_max_s`） | 指數退避 |
-| 其他失敗、正文解析失敗 | `failed`，`attempts + 1` | 指數退避；超過 `max_attempts` 後改等 `stale_days` |
+| `IgnoreRequest`（robots.txt 禁止；其他 middleware 也可能丟出） | `failed` | `robots_retry_days` 後 |
+| 429、503 | `failed`，host 暫停 `retry_base_s` | 指數退避 |
+| 其他失敗、`unmatched`、正文解析失敗 | `failed`，`attempts + 1` | 指數退避；超過 `max_attempts` 後改等 `stale_days` |
 
-   - 2xx：比已存的新就接受，不管 doc 在等哪個 batch；
-   - 失敗：只在 doc 正在等這個 batch 時才算。
+   - 2xx：比已存的新就接受，不管 doc 在等哪個 job；
+   - 失敗：只在 doc 正在等這個 job 時才算；
+   - 這個 job 的 doc 如果完全沒有結果，記成 `no_result` 重試。
 
 設定都在 `config/isel.toml` 的 `[recrawl]`。部署用 `deploy/compose.compute.yaml` 的 `recrawl-plan`、`recrawl-archive` 兩個常駐 service（profile `recrawl`）：
 
-- `recrawl-plan` 用 `network_mode: host`，因為 gateway 只綁 `127.0.0.1:4000`。API token 用 secret 檔 `recrawl_api_token` 提供。
-- 兩者都唯讀掛載 `/data/ipc/recrawl_result`，可寫掛載 `/data/isel`。`up` 之前要先用 isel 使用者執行 `mkdir -p /data/isel`，否則 Docker 會用 root 建立它。
-- `recrawl-archive` 給 8 CPU，`archive_workers = 8`。2026-10-17 用 9 個真實網頁實測，平均 590 KB：
-  - 1 個 process 每頁 6.5 ms，每天約 13.2M 頁，低於尖峰的每天 21M 頁；
-  - 8 個 worker 每天約 45.6M 頁（10 核 Mac）。
-  - 積壓超過 24 小時，crawler 就會先刪 log（C8），結果會遺失，所以要多 process。
+- `recrawl-plan` 用 `network_mode: host`，因為 PR #84 的 API 只綁 `127.0.0.1:4000`。API 沒有驗證，所以不需要 token。DELETE 也由 plan 送出，因為 archive 連不到 API。
+- 兩者都唯讀掛載 `/data/manual_bulk_crawls/results`，可寫掛載 `/data/isel`。結果檔是 root 的 0644，目錄是 0755，isel 的 1014:1015 可以讀。
+- `up` 之前要先用 isel 使用者執行 `mkdir -p /data/isel`，否則 Docker 會用 root 建立它。
+- `recrawl-archive` 給 8 CPU，`archive_workers = 8`。
+
+**錯誤後怎麼恢復**
+
+| 狀況 | 恢復方式 |
+|---|---|
+| job 在 `error` | 修好原因（程式或 server）後，archive 下一輪自動套用，planner 自動恢復。沒修好的話，TTL 到期後它會變成 `lost`，planner 也會恢復 |
+| DELETE 一直失敗 | plan 每輪回報 `api_error` 並重試。結果目錄最晚在 TTL 到期後由 server 清掉 |
+| archive 停機超過 TTL | 已抓到的結果會被 server 刪掉，job 變成 `lost`，doc 重抓。只損失重抓的時間 |
+| planner 或 archive crash | 直接重啟。狀態都在 DB，檔案用 tmp + rename 寫入 |
+| 要撤掉整個 recrawl | `git revert` 後執行 `alembic downgrade 0002`，它會 `DROP SCHEMA recrawl CASCADE`。正文 Parquet 不受影響 |
 
 ### 4.5 每一期的流程
 
@@ -345,17 +360,15 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 ## 5. QPS 合規
 
-| 項目 | 做法 |
-|---|---|
-| 間隔 | C2 的 host 閘門：每 hostname 相鄰兩次送出至少 `max(5 s, Crawl-delay)`，跨 process 和車道 |
-| 車道仲裁 | C9：scheduler 的每個 host 佇列分成兩條車道，依 `recrawl_share` 加權輪替。它只決定誰先送，不影響間隔 |
-| redirect | slot key 一律由 URL 的 hostname 算出，不讀 meta |
-| robots.txt | 照常遵守；robots.txt 請求走同一個閘門；5xx 視為禁止 |
-| Crawl-delay | 寫進閘門；超過 60 秒的 host 不抓 |
-| 429/503 | crawler 放慢同一 host；isel 暫停這個 host 的派送 |
-| 所有機制加總 | 其他 fetcher 啟用前必須接上閘門（C7） |
-| 事後稽核 | dispatch log 經 `verify_politeness.py` 檢查；Loki 每 host 每 10 分鐘 ≤ 120 次 |
-| PR #84 的 `crawl-requests` | 它送來的 URL 走一般車道，同樣經過閘門，和 recrawl 車道共用每 host 的額度 |
+| 項目 | 做法 | 狀態 |
+|---|---|---|
+| recrawl 自己的速率 | isel 讓同一 host 的下一個 job 至少等 `doc 數 × min_gap_s`，平均不超過 0.2 qps | 已實作 |
+| 一個 job 內的突發 | crawler 用 AutoThrottle，每 host 並發 16、delay 0.25 s，所以 job 內可能短時間超過 0.2 qps | 沿用現行 AutoThrottle |
+| 跨 lane 加總 | 一般 crawl 和 API 請求共用 slot，但 crawler 不保證 5 秒間隔 | 沿用現行 AutoThrottle |
+| 車道分配 | PR #84 固定 priority -1，一般 crawl 在同一 host 上永遠優先 | WebCrawler #85 追蹤 |
+| robots.txt | crawler 照常遵守；被拒的 URL 回 `IgnoreRequest` | PR #84 已處理 |
+| 429/503 | isel 暫停這個 host 的派送 | 已實作 |
+| 事後稽核 | Loki 每 host 每 10 分鐘 ≤ 120 次 | 試抓時檢查 |
 
 ## 6. 儲存
 
@@ -367,27 +380,44 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 | 資料 | 大小估計 | 位置 | 保留方式 |
 |---|---|---|---|
-| queue 檔 | 每目錄最多 384 個（C10 的 `max_files_per_dir`），可忽略 | Host2 `/data/ipc/recrawl_queue`，由 API 寫入 | crawler 讀完即刪 |
-| WARC + fetch log（暫存） | 尖峰約每天 0.9 TB（前 3 天每天約 21M 頁），平均約每天 0.33 TB | Host2 `/data/ipc/recrawl_result` | crawler 24 小時後刪除，先刪 log 再刪 WARC；isel 只讀 |
-| 正文 Parquet | 約 0.35–0.4 TB | Host2 `/data/isel/text/fetch_date=YYYYMMDD/crawler_NN/` | 永久 |
-| gzip 的 fetch log | 約 8 GB | Host2 `/data/isel/log/YYYYMMDD/crawler_NN/` | 永久；selectdb 沒有備份，這些 log 是重建 DB 的依據 |
+| pending job 檔 | 每個 job 一個，最多 `max_jobs_inflight` 個，可忽略 | Host2 `/data/manual_bulk_crawls/pending` | crawler 發布結果後刪除 |
+| 原始 HTML + 每 URL 的 JSON（暫存） | 壓縮後的 128M 頁就有 5–6 TB；每個 URL 兩個檔 | Host2 `/data/manual_bulk_crawls/results/{job_id}` | isel 套用後立刻 DELETE；isel 沒刪到的由 TTL（3 天）清掉 |
+| 正文 Parquet | 約 0.35–0.4 TB | Host2 `/data/isel/text/fetch_date=YYYYMMDD/job-<batch_id>.parquet` | 永久 |
+| gzip 的逐 URL 結果 | 約 8 GB | Host2 `/data/isel/log/YYYYMMDD/job-<batch_id>.jsonl.gz` | 永久；selectdb 沒有備份，這些檔是重建 DB 的依據 |
 | `recrawl` schema | 約 37 GB（未實測） | Host1 selectdb（`:5445`） | 常駐 |
 
-- planner 有兩道背壓：`/data/isel` 剩餘低於 `min_free_gb`（800 GB），或 `recrawl_result` 超過 `result_cap_gb`（1000 GB）時停止派送。
+- planner 的背壓：`/data/isel` 剩餘低於 `min_free_gb`（800 GB）時停止派送；未結束的 job 最多 `max_jobs_inflight` 個。
+- 結果目錄同時只留未套用的 job，加上少數等 DELETE 重試的 job。上限約為 `max_jobs_inflight` × `job_size` = 144k 頁。
 - Host1 `/data` 在 2026-10-16 只剩 229 GB（97%）。`recrawl` schema 的 37 GB 要等 Host1 有空間再載入（R1）。
-- 每頁正文的實際大小要在試抓後更新。
+- 每頁正文的實際大小要在試抓後更新。2026-10-17 的 590 KB 只來自 9 個網頁的 CPU 測試，不能拿來估磁碟用量。
 
 ## 7. 分階段
 
 | 階段 | 內容 | 前提 |
 |---|---|---|
-| R0 | schema（0003）、`recrawl-sync`/`plan`/`archive`、正文抽取、測試、提案文件（已完成；2026-10-16 改成 API 入口和正文儲存，並有本地 e2e） | 只動本 repo |
-| R1 | ⛔ `recrawl-sync` 在 live 上載入；`recrawl-plan --dry-run` 容量報告 | batch 20 swap 完成 |
-| R2 | crawler 組實作 C1–C7 和 C10；上線後跑稽核 | crawler 組同意；crawler 復工；PR #84 合併 |
-| R3 | ⛔ 啟動 `recrawl-plan`、`recrawl-archive`，試抓 1–5M 頁，量測 WARC 和正文大小 | R2 |
-| R4 | 全量；之後每期只抓增量 | C8 的保留時間和容量上限定案 |
+| R0 | schema（0003）、`recrawl-sync`/`plan`/`archive`、正文抽取、測試（2026-10-18 改接 PR #84 job API；本地 e2e 包含 PR 的真實 API 和結果寫入程式） | 只動本 repo |
+| R1 | ⛔ 確認 `:5445` 在 0002 後，`migrate-selectdb` 到 0003；`recrawl-sync` 在 live 上載入；`recrawl-plan --dry-run` 容量報告 | batch 20 swap 完成 |
+| R2 | PR #84（`4dce38f` 或之後）merge 並部署 | crawler 組同意；crawler 復工 |
+| R3 | ⛔ 啟動 `recrawl-plan`、`recrawl-archive`，試抓 1–5M 頁，量測 HTML 和正文大小 | R2 |
+| R4 | 全量；之後每期只抓增量 | R3 的量測 |
 
 ## 8. 不採用的做法
+
+2026-10-18 改接 PR #84 時新增的決定：
+
+| 做法 | 不採用的理由 |
+|---|---|
+| 用 URL 字串對應結果 | API 會正規化 URL。例如 PR 的 w3lib 2.3.1 把 `%25C3%25A9` 改成 `%C3%A9`，用字串會找不到 doc。所以用位置，並驗證順序 |
+| 用比例門檻判斷順序錯誤 | 一個 job 會放同一個 host 的 120 個 URL。整個 host 被改寫時就佔 4%，比例門檻會誤判並停住 planner。改用精確檢查：不同的 URL 若等於另一個送出的 URL，才算順序錯誤 |
+| 讀 `.incomplete/` 拿部分結果 | 那是 PR 的內部目錄，沒有寫進合約 |
+| isel 以 root 執行並刪除結果 | 破壞 isel 非 root 的部署；`.claims/{job}` 也是 server 的內部目錄。PR #84 已提供 DELETE |
+| 每個 job 只送一個 crawler 的 URL | 原本用來避開 uuid 順序造成的插隊。PR #84 已改成 FIFO，不再需要 |
+| 等整波 job 都完成再送下一波 | 最慢的 host 會拖住整波 |
+| isel 自己的 job 逾時，再用 DELETE 取消 | 要同時維護 isel 的逾時和 server 的 TTL 兩個期限。改用 TTL 當唯一期限：server 會停止過期的 job，isel 從 404 得知 |
+| 套用 `lost` job 晚到的結果 | TTL 到期後 server 會丟掉晚到的結果，所以不會再有晚到的目錄。刪掉這段處理，程式比較簡單 |
+| TTL 用 PR 的預設 14 天 | 沒套用的結果會在 `/data` 留 14 天。3 天已足夠 FIFO 下的 job 跑完；archive 停機超過 3 天，只會重抓 |
+
+以下是 2026-10-18 之前的決定，以 C5、C6、C9、C10 為前提，保留作紀錄：
 
 | 做法 | 不採用的理由 |
 |---|---|
@@ -415,12 +445,14 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 ## 9. 風險與待確認
 
-1. crawler 組是否同意提案的 C1–C10。C1 會改變正式 crawler 的行為；C10 要在 PR #84 的 API 服務上新增資源。
-2. crawler 何時復工。它從 2026-10-06 起停止運作，2026-10-16 仍是 `Exited (137)`。
-3. 正式 crawler 在 C1 之後的吞吐量。
-4. WARC 和正文的實際大小，以及 C8 的保留時間是否足夠。
-5. Wikimedia Enterprise snapshot 能不能用。
-6. 「low level domain」已確認為完整 hostname。若助教另有解釋，3 節的表要改用 eTLD+1 那一列：最大的是 wikipedia.org，要 56.7 天；14 天可抓 122.0M。
+1. PR #84 何時 merge 並部署。`4dce38f` 已有 TTL、DELETE 和 FIFO，這是啟動的前提。
+2. lane 分配（#85 的 C9）。一般 crawl 最忙的正是最大的 host；等待中的 API 請求還佔著 prefetch 名額，可能讓一個 crawler 停止收 API URL。雙方已在 PR 留言說好不在 #84 處理，#84 之後再做。
+3. `result_ttl_days` 是否夠長。lane 分配改好之前，忙碌 host 上的 job 可能 3 天跑不完。試抓時要量 job 從送出到完成的時間。
+4. politeness 沿用 crawler 現行的 AutoThrottle，跨 lane 的 0.2 qps 沒有額外保證。試抓時用 Loki 稽核每 host 每 10 分鐘的請求數。
+5. crawler 何時復工。它從 2026-10-06 起停止運作，2026-10-16 仍是 `Exited (137)`。
+6. HTML 和正文的實際大小。
+7. Wikimedia Enterprise snapshot 能不能用。
+8. 「low level domain」已確認為完整 hostname。若助教另有解釋，3 節的表要改用 eTLD+1 那一列：最大的是 wikipedia.org，要 56.7 天；14 天可抓 122.0M。
 
 ## 10. Inverted index（規劃）
 
@@ -428,7 +460,7 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 **資料來源**
 
-- 正文 Parquet（`text_root`）是唯一的資料來源。欄位：`doc_id, batch_id, url, final_url, fetched_at, http_status, lang, title, description, body, text_len, payload_sha1`。
+- 正文 Parquet（`text_root`）是唯一的資料來源。每個 job 一個檔。欄位：`doc_id, batch_id, url, final_url, fetched_at, http_status, lang, title, description, body, text_len, payload_sha1`。`batch_id` 是 `recrawl.job` 的主鍵，`payload_sha1` 是原始 HTML 的 SHA-1。
 - `doc_id` 是 uint64，和 manifest 相同，可以直接 join。`recrawl.doc` 裡的 `doc_id` 是同一個值的 signed BIGINT。
 - 只讀 `**/*.parquet`。crash 可能留下 `.parquet.tmp`，要略過。
 - 同一個 doc 可能出現在多個檔案裡，例如重抓或重跑。建索引時每個 `doc_id` 只取 `fetched_at` 最新的一列。

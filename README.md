@@ -63,7 +63,7 @@ $J rollback
 $J verify-live --batch 20                       # the metric's own SQL as its reader role
 $J recrawl-sync                                 # live run -> recrawl.{host,doc}
 $J recrawl-plan --dry-run                       # per-host capacity report
-# loops, after the crawler serves the recrawl-batches API (docs/CRAWLER_RECRAWL_PROPOSAL.md C10):
+# loops, after PR #84 (4dce38f or later) is merged and deployed (docs/RECRAWL_DESIGN.md §0):
 # docker compose -f deploy/compose.compute.yaml --profile recrawl up -d recrawl-plan recrawl-archive
 ```
 
@@ -92,6 +92,6 @@ SERP 指令需要自己的 `ISEL_SERPAPI_KEY`、`ISEL_SERPER_KEY`，不能用課
 | `migrations/` | Alembic 的 `env.py` 和 revision |
 | `publish.py` | selectdb 清單的載入、swap、rollback，以及照 Metric 的方式讀清單 |
 | `manifest.py` | selection 的輸出契約（doc_id、host、domain_id、crawl_shard、rank），給 publish、recrawl 和未來的 indexer |
-| `recrawl.py` | recrawl frontier：sync 載入 live run、plan 經 crawler API 送出 batch、archive 套用 fetch log 並保存正文 |
+| `recrawl.py` | recrawl frontier：sync 載入 live run、plan 經 crawler 的 job API（WebCrawler PR #84）送出 job、archive 依位置對應結果並保存正文 |
 | `extract.py` | 從 WARC response record 抽出 title、description、正文和語言，給 inverted index 用 |
 | `cli.py` | 子指令 |

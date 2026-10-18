@@ -3,9 +3,22 @@
 - 對象：WebCrawler（crawler 組）
 - 提案人：index selection 組
 - 日期：2026-10-13；2026-10-16 更新（新增 C10，C8 改成保留時間）；2026-10-17 更新（C10 對齊 PR #84 `35c5677`：URL 原樣使用、400 格式、多 worker；C6 檔案權限）
-- 狀態：草稿，待 crawler 組討論
+- 狀態：草稿，待 crawler 組討論。2026-10-18：C5、C6、C8、C10 由 WebCrawler PR #84（`4dce38f`）取代，C9 改寫成 API job 的 lane 分配，C1–C4、C7 不再提出，見下方「2026-10-18 狀態」
 
 本文所有路徑都相對於 `WebCrawler/`，版本是 `2e4f87c`，和 Host2 `/opt/WebCrawler` 一致。Scrapy 原始碼取自 Host2 的 `webcrawler-crawler` image，版本 2.16.0。
+
+## 2026-10-18 狀態
+
+PR #84 改成 job API：`POST /v1/manual-bulk-crawls` 回傳 `job_id`，正式 crawler 用 priority -1 抓取，結果寫到 `/data/manual_bulk_crawls/results/{job_id}/`。`4dce38f` 再加上 `ttl_days`（1–60 天，從送出算起）、`DELETE /v1/manual-bulk-crawls/{job_id}`、每小時的 GC，以及 FIFO 的 job 順序。isel 已改接這個介面（`docs/RECRAWL_DESIGN.md` §4）。
+
+| 編號 | 狀態 |
+|---|---|
+| C1–C4、C7 | 不再提出。politeness 沿用 crawler 現行的 AutoThrottle |
+| C5、C6、C10 | 由 PR #84 的 job API 和結果目錄取代 |
+| C8 | 由 PR #84 的 `ttl_days`、DELETE 和 GC 取代 |
+| C9 | 改寫成 API job 的 lane 分配問題：API 請求在忙碌的 host 上永遠排最後，等待時又佔著 prefetch 名額。雙方已在 PR 留言說好 #84 之後再做 |
+
+WebCrawler #85 在 2026-10-18 改寫成只談 C9，英文全文以 issue 為準。以下第 0 節之後的內容是 2026-10-17 的版本，保留作紀錄。
 
 ## 0. 摘要
 
