@@ -15,7 +15,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-from isel.config import SERP_PROVIDERS, Config, ConfigError, load_config
+from isel.config import Config, ConfigError, load_config
 from isel.io import atomic_write_json, open_duckdb, read_json, sql_str
 
 
@@ -111,39 +111,6 @@ def cmd_pull_full(cfg: Config, args: argparse.Namespace) -> Any:
             session.close()
 
 
-def cmd_trends_snapshot(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.pseudo import TrendspyClient, make_client, serp_ledger, trends_snapshot
-
-    if args.source == "trendspy":
-        client: Any = TrendspyClient(cfg.trends)
-    else:
-        client = make_client(cfg, "serpapi", serp_ledger(cfg, cfg.work_dir))
-    return trends_snapshot(cfg, client, cfg.work_dir / "trends")
-
-
-def cmd_trends_compare(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.pseudo import compare_snapshots
-
-    return compare_snapshots(cfg, cfg.work_dir / "trends", args.a, args.b)
-
-
-def cmd_pseudo_calibrate(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.pseudo import make_client, run_calibration, serp_ledger
-
-    ledger = serp_ledger(cfg, cfg.work_dir)
-    return run_calibration(cfg, cfg.work_dir, args.batch, args.tag, args.n,
-                           make_client(cfg, "serpapi", ledger), make_client(cfg, "serper", ledger),
-                           ledger)
-
-
-def cmd_pseudo_batch(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.pseudo import make_client, run_pseudo_batch, serp_ledger
-
-    ledger = serp_ledger(cfg, cfg.work_dir)
-    return run_pseudo_batch(cfg, cfg.work_dir, args.source, args.batch_id, args.head,
-                            args.random, make_client(cfg, args.provider, ledger), ledger)
-
-
 def cmd_validate_routing(cfg: Config, args: argparse.Namespace) -> Any:
     """Row-weighted share of sample rows whose shard the router predicts."""
     from isel.urlnorm import HOST_RE
@@ -192,27 +159,15 @@ def cmd_build_dataset(cfg: Config, args: argparse.Namespace) -> Any:
         (golden_urls,) = store.con.execute(
             f"SELECT count(DISTINCT raw_url) FROM gold WHERE batch_id = {b.batch_id}").fetchone()
         summary[str(b.batch_id)] = {
-            "created_at": b.created_at, "as_of": b.as_of, "official": b.official,
-            "available_at": b.available_at, "golden_urls": golden_urls,
+            "created_at": b.created_at, "as_of": b.as_of, "golden_urls": golden_urls,
             "pool_rows_est": store.pool_size(b.batch_id) / store.rate,
             "positive_rows": positives, "head_rows": head, "random_rows": rand,
             "canonical_only_positives": canonical_only,
             "has_history": store.has_history(b.batch_id),
-            **(store.label_audit(b.batch_id) if b.official else {}),
+            **store.label_audit(b.batch_id),
         }
     atomic_write_json(cfg.work_dir / "datasets" / "summary.json", summary)
     return summary
-
-
-def cmd_pseudo_gate(cfg: Config, args: argparse.Namespace) -> Any:
-    from isel.golden import pseudo_batch_path
-    from isel.pseudo import positive_gate
-
-    summary = read_json(cfg.work_dir / "datasets" / "summary.json")
-    meta = read_json(pseudo_batch_path(cfg.work_dir, args.batch_id).with_suffix(".json"))
-    if summary is None or meta is None:
-        raise SystemExit("run pseudo-batch and build-dataset (with config/pseudo.toml) first")
-    return positive_gate(cfg, summary, meta, args.batch_id)
 
 
 def cmd_backtest(cfg: Config, args: argparse.Namespace) -> Any:
@@ -356,23 +311,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("derive-sample", help="hash-sample the full export into sample/")
     p = sub.add_parser("derive-positives", help="golden URLs' rows from the full export")
     p.add_argument("--batches")
-    p = sub.add_parser("trends-snapshot", help="pull the trending pool of every trends.geos")
-    p.add_argument("--source", choices=["trendspy", "serpapi"], required=True)
-    p = sub.add_parser("trends-compare", help="keyword Jaccard and volume rank correlation")
-    p.add_argument("--a", required=True, help="snapshot id, e.g. the trendspy one")
-    p.add_argument("--b", required=True, help="snapshot id taken at about the same time")
-    p = sub.add_parser("pseudo-calibrate", help="SerpApi vs Serper vs stored official URLs")
-    p.add_argument("--batch", type=int, required=True)
-    p.add_argument("--tag", required=True, help="one of golden.tags")
-    p.add_argument("--n", type=int, required=True)
-    p = sub.add_parser("pseudo-batch", help="write golden/pseudo/batch=<id>.parquet")
-    p.add_argument("--source", required=True, help="official:<batch> or snapshot:<id>")
-    p.add_argument("--batch-id", type=int, required=True)
-    p.add_argument("--head", type=int, default=0)
-    p.add_argument("--random", type=int, required=True)
-    p.add_argument("--provider", choices=SERP_PROVIDERS, required=True)
-    p = sub.add_parser("pseudo-gate", help="crawled-positive rate of a backfill vs official")
-    p.add_argument("--batch-id", type=int, required=True)
     sub.add_parser("validate-routing")
     sub.add_parser("build-dataset")
     p = sub.add_parser("backtest")
@@ -384,7 +322,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--baselines")
     p = sub.add_parser("forward-eval")
     p.add_argument("--model-dir", required=True, action="append",
-                   help="repeat to compare models, e.g. official-only and +pseudo")
+                   help="repeat to compare the models of several runs")
     p.add_argument("--batch", type=int, required=True)
     p.add_argument("--baselines")
     p = sub.add_parser("select-sample")
@@ -419,11 +357,6 @@ COMMANDS = {
     "pull-full": cmd_pull_full,
     "derive-sample": cmd_derive_sample,
     "derive-positives": cmd_derive_positives,
-    "trends-snapshot": cmd_trends_snapshot,
-    "trends-compare": cmd_trends_compare,
-    "pseudo-calibrate": cmd_pseudo_calibrate,
-    "pseudo-batch": cmd_pseudo_batch,
-    "pseudo-gate": cmd_pseudo_gate,
     "validate-routing": cmd_validate_routing,
     "build-dataset": cmd_build_dataset,
     "backtest": cmd_backtest,

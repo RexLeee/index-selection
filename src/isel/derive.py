@@ -117,7 +117,7 @@ def derive_positives(cfg: Config, work_dir: Path,
 
     Raises:
         RuntimeError: If the export is unfinished or `positives/` came from another export.
-        ValueError: If a requested batch is not in the golden set of this config.
+        ValueError: If a requested batch is not in the golden set.
     """
     export, exported = _export(work_dir)
     out = work_dir / "positives"
@@ -127,13 +127,12 @@ def derive_positives(cfg: Config, work_dir: Path,
         raise RuntimeError(f"{out} holds positives with no _meta.json; move it away first")
     if meta and meta.get("export_started_at") != exported["started_at"]:
         raise RuntimeError(f"{out} holds positives from another export; move it away first")
-    golden = read_golden(work_dir, include_pseudo=cfg.golden.use_pseudo)
+    golden = read_golden(work_dir)
     ids = golden.column("batch_id").to_pylist()
     wanted = set(batches) if batches else set(ids)
     unknown = sorted(wanted - set(ids))
     if unknown:
-        raise ValueError(f"batches {unknown} are not in the golden set; pseudo batches "
-                         "need config/pseudo.toml")
+        raise ValueError(f"batches {unknown} are not in the golden set")
     pairs = {(b, u) for b, raw, canon in zip(ids, golden.column("raw_url").to_pylist(),
                                              golden.column("canonical_url").to_pylist(),
                                              strict=True)

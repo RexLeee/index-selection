@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,7 +22,7 @@ from isel.evaluate import (
     render_report,
 )
 from isel.features import FeatureStore, open_store, resolve_set
-from isel.golden import PSEUDO, read_golden
+from isel.golden import read_golden
 from isel.io import atomic_write_json, code_version, sql_str, utc_id
 from isel.manifest import write_run
 from isel.model import (
@@ -56,8 +55,7 @@ def _fit_all(cfg: Config, store: FeatureStore, batches: list[int], feature_sets:
     needed = list(dict.fromkeys(f for s in sets for f in resolve_set(cfg, s)))
     m = training_matrix(store, batches, needed)
     offset = case_control_offset(store.rate, cfg.dataset.neg_rate)
-    official = [store.batch(b) for b in batches if store.batch(b).official]
-    valid = max(official, key=lambda b: b.created_at).batch_id if official else None
+    valid = max(batches, key=lambda b: store.batch(b).created_at) if batches else None
     models = {model_name(fs): fit_lgbm(cfg, m, resolve_set(cfg, fs), offset, valid)
               for fs in feature_sets}
     if "v1_features" in baselines:
@@ -160,8 +158,7 @@ def train_frozen(cfg: Config, work_dir: Path, baselines: list[str]) -> Path:
     for name, model in models.items():
         model.meta.update(snapshot_at=store.snapshot_at, sample_fingerprint=store.fingerprint,
                           trained_at=datetime.now(UTC),
-                          config_sha256=cfg.sha256(), code_version=code_version(), name=name,
-                          use_pseudo=cfg.golden.use_pseudo)
+                          config_sha256=cfg.sha256(), code_version=code_version(), name=name)
         model.save(out / name.replace(":", "_"))
     return out
 
@@ -186,80 +183,28 @@ def frozen_model(cfg: Config, store: FeatureStore, model_dir: Path) -> TrainedMo
     return model
 
 
-def _align(frame: pa.Table, base: pa.Table) -> pa.Table:
-    """Reorders `frame` into the (url, shard) row order of `base`."""
-    keys = list(zip(frame.column("url").to_pylist(), frame.column("shard").to_pylist(),
-                    strict=True))
-    index = {k: i for i, k in enumerate(keys)}
-    base_keys = zip(base.column("url").to_pylist(), base.column("shard").to_pylist(),
-                    strict=True)
-    order = [index.get(k, -1) for k in base_keys]
-    if len(index) != len(keys) or len(order) != len(keys) or -1 in order:
-        raise RuntimeError("the official and pseudo stores built different frames")
-    return frame.take(pa.array(order, pa.int64()))
-
-
-def _pseudo_overlap(work_dir: Path, snapshot_at: datetime, golden: dict[str, Golden],
-                    hits: dict[str, dict[str, set]]) -> dict[str, Any]:
-    """Splits each tag's golden URLs and hits by whether pseudo data known by S0 had them."""
-    rows = read_golden(work_dir, include_pseudo=True)
-    pseudo = rows.filter(pc.and_(pc.equal(rows.column("label_source"), PSEUDO),
-                                 pc.less_equal(rows.column("available_at"),
-                                               pa.scalar(snapshot_at, rows["available_at"].type))))
-    known = set(pseudo.column("raw_url").to_pylist()) | set(
-        pseudo.column("canonical_url").to_pylist())
-    out = {}
-    for tag, g in golden.items():
-        inside = {u for u in g.urls if u in known or g.canonical[u] in known}
-        out[tag] = {"golden_urls": len(g.urls), "in_pseudo": len(inside),
-                    "hits": {name: {"in_pseudo": len(by_tag[tag] & inside),
-                                    "not_in_pseudo": len(by_tag[tag] - inside)}
-                             for name, by_tag in hits.items()}}
-    return out
-
-
 def forward_eval(cfg: Config, work_dir: Path, model_dirs: list[Path], batch: int,
                  baselines: list[str]) -> Path:
     """Evaluates frozen models on a batch created after the snapshot.
 
-    Models trained with pseudo golden (`use_pseudo` in their meta) are scored on
-    features built with pseudo batches and named `<name>+pseudo`; the others use
-    official-only features. Frames are aligned by (url, shard), so every paired
-    difference compares the same rows. Only official golden is evaluated.
+    The models of every directory are scored on the same frame.
     """
-    groups: dict[bool, dict[str, TrainedModel]] = defaultdict(dict)
-    for model_dir in model_dirs:
-        for name, model in load_models(model_dir, cfg.model.num_threads).items():
-            use = bool(model.meta.get("use_pseudo", False))
-            groups[use][f"{name}+pseudo" if use else name] = model
-    stores = {use: open_store(replace(cfg, golden=replace(cfg.golden, use_pseudo=use)),
-                              work_dir)
-              for use in groups}
-    base_use = False not in stores   # official-only features when present
-    base = stores[base_use]
-    for use, models in groups.items():
-        if any(m.meta.get("sample_fingerprint") != stores[use].fingerprint
-               for m in models.values()):
-            raise RuntimeError("a model was trained on another sample; "
-                               f"the sample is {stores[use].fingerprint}")
-    b = base.batch(batch)
-    if b.created_at <= base.snapshot_at:
+    store = open_store(cfg, work_dir)
+    models = {name: model for model_dir in model_dirs
+              for name, model in load_models(model_dir, cfg.model.num_threads).items()}
+    if any(m.meta.get("sample_fingerprint") != store.fingerprint for m in models.values()):
+        raise RuntimeError(f"a model was trained on another sample; the sample is "
+                           f"{store.fingerprint}")
+    if store.batch(batch).created_at <= store.snapshot_at:
         raise RuntimeError(f"batch {batch} existed before the snapshot; use backtest")
-    base_frame = base.frame(batch, "eval")
-    frames = {use: base_frame if use == base_use else _align(s.frame(batch, "eval"), base_frame)
-              for use, s in stores.items()}
-    raw = {name: m.raw_score(frames[use]) for use, models in groups.items()
-           for name, m in models.items()}
     rules = [r for r in baselines if r in RULE_BASELINES]
     reference = model_name(cfg.model.feature_set)
-    reference = reference if reference in raw else next(iter(raw))
-    models = {name: m for ms in groups.values() for name, m in ms.items()}
-    result, hits, golden = _batch_result(cfg, base, batch, base_frame, models, raw, rules,
-                                         reference, read_golden(work_dir).to_pylist())
-    result["pseudo_overlap"] = _pseudo_overlap(work_dir, base.snapshot_at, golden, hits)
+    reference = reference if reference in models else next(iter(models))
+    result, _, _ = _evaluate(cfg, store, batch, models, rules, reference,
+                             read_golden(work_dir).to_pylist())
     results = {"title": f"Forward evaluation on batch {batch}", "reference": reference,
-               "k_headline": cfg.eval.k_headline, "sample_rate": base.rate,
-               "snapshot_at": base.snapshot_at, "model_dirs": [str(d) for d in model_dirs],
+               "k_headline": cfg.eval.k_headline, "sample_rate": store.rate,
+               "snapshot_at": store.snapshot_at, "model_dirs": [str(d) for d in model_dirs],
                "config_sha256": cfg.sha256(), "code_version": code_version(),
                "batches": {str(batch): result}, "pooled": {}}
     out = work_dir / "forward_evals" / f"batch={batch}_{utc_id()}"

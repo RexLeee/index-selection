@@ -37,13 +37,8 @@ uv run isel $C pull-dims                        # crawlerdb: needs TA approval
 uv run isel $C validate-routing                 # share of sample rows whose shard the crawler rule predicts
 uv run isel $C build-dataset
 uv run isel $C backtest --feature-sets full,no_inlinks,no_domain,no_history
-uv run isel $C trends-snapshot --source trendspy  # pseudo golden: free trending pool
-uv run isel $C trends-compare --a <id> --b <id>   # trendspy vs SerpApi snapshot
-uv run isel $C pseudo-calibrate --batch 19 --tag random --n 100
-uv run isel $C pseudo-batch --source official:19 --batch-id 10019 --random 800 --provider serper
-uv run isel $C train                            # M0: official golden only
-uv run isel $C --config config/pseudo.toml train  # M1: official + pseudo golden
-uv run isel $C forward-eval --model-dir work/models/<M0> --model-dir work/models/<M1> --batch 20
+uv run isel $C train
+uv run isel $C forward-eval --model-dir work/models/<id> --batch 20
 uv run isel $C select-sample --model-dir work/models/<id>
 uv run isel $C validate-manifest --run-dir work/selection/run=<id>
 
@@ -63,7 +58,7 @@ $J rollback
 $J verify-live --batch 20                       # the metric's own SQL as its reader role
 ```
 
-SERP 指令需要自己的 `ISEL_SERPAPI_KEY`、`ISEL_SERPER_KEY`，不能用課程的 `SERPAPI_KEY`。完整步驟、讀取時段限制和偽 golden 的校準門檻見 `docs/DESIGN.md` §5.1、§9–§10。容器和部署見 §12。
+完整步驟和讀取時段限制見 `docs/DESIGN.md` §9–§10。容器和部署見 §12。
 
 ## 結構
 
@@ -73,8 +68,7 @@ SERP 指令需要自己的 `ISEL_SERPAPI_KEY`、`ISEL_SERPER_KEY`，不能用課
 | `pg.py` | 唯讀 session、會照 PostgreSQL 詞法掃描的 SQL gate、限速、讀取時段與 IO 負載防護 |
 | `io.py` | 原子寫入、DuckDB 連線、憑證檢查 |
 | `urlnorm.py` | canonical URL、shard key、shard 路由 |
-| `golden.py` | metricdb → golden 和 trending 池；讀取時可加入偽 golden |
-| `pseudo.py` | 偽 golden：trending 快照與比對、官方選 query 規則、SERP client、額度帳本、校準 |
+| `golden.py` | metricdb → golden |
 | `pull.py` | crawlerdb → split hosts、全量匯出 |
 | `derive.py` | 全量匯出 → 雜湊 sample、正例 |
 | `features.py` | 時間點候選池、特徵登記表、洩漏防護 |

@@ -5,10 +5,8 @@ Leakage rules (see docs/DESIGN.md):
 * The pool of batch b is the crawled rows with `last_fetch_ok < as_of_b`, where
   `as_of_b = min(created_b - lead_h, snapshot_at)`. Each URL is fetched once,
   so this rebuilds the crawl as it stood before the batch existed.
-* Golden-derived features of batch b only use batches created before b whose
-  rows were available (`available_at`) by `as_of_b`, decayed by age. Pseudo
-  batches are fetched after the official batch they extend, so they only reach
-  batches whose as-of time is later than their fetch time.
+* Golden-derived features of batch b only use batches created at or before
+  `as_of_b`, decayed by age.
 * Columns the crawler derives from golden labels are in `FORBIDDEN` and can
   never enter a feature set.
 * A row's features never depend on whether the sample holds it. Domain and
@@ -29,7 +27,7 @@ import duckdb
 import pyarrow as pa
 
 from isel.config import Config
-from isel.golden import OFFICIAL, golden_files
+from isel.golden import golden_path
 from isel.io import open_duckdb, read_json, sql_str
 from isel.urlnorm import HOST_RE, DomainKeyer
 
@@ -141,8 +139,6 @@ class Batch:
     batch_id: int
     created_at: datetime
     as_of: datetime
-    available_at: datetime
-    official: bool
 
 
 def _ts(value: datetime) -> str:
@@ -205,35 +201,25 @@ class FeatureStore:
             f"FROM ({' UNION ALL BY NAME '.join(parts)}) "
             "QUALIFY row_number() OVER (PARTITION BY url, shard "
             "ORDER BY is_sample OR in_agg DESC) = 1")
-        files = golden_files(self.work_dir, cfg.golden.use_pseudo)
-        golden = f"[{', '.join(sql_str(str(f)) for f in files)}]"
+        golden = sql_str(str(golden_path(self.work_dir)))
         excluded = list(cfg.golden.exclude_batches) or [-1]
         rows = con.execute(
-            f"SELECT batch_id, min(batch_created_at), max(available_at), "
-            f"bool_and(label_source = {sql_str(OFFICIAL)}), count(DISTINCT label_source) "
-            f"FROM read_parquet({golden}) WHERE batch_id NOT IN ({', '.join(map(str, excluded))}) "
+            f"SELECT batch_id, min(batch_created_at) FROM read_parquet({golden}) "
+            f"WHERE batch_id NOT IN ({', '.join(map(str, excluded))}) "
             "GROUP BY batch_id ORDER BY batch_id").fetchall()
-        mixed = [int(r[0]) for r in rows if r[4] > 1]
-        if mixed:
-            raise RuntimeError(f"batch ids {mixed} hold both official and pseudo rows; "
-                               "raise pseudo.id_offset")
         lead = timedelta(hours=cfg.golden.lead_h)
-        self.batches = [Batch(int(b), t, min(t - lead, self.snapshot_at), a, bool(o))
-                        for b, t, a, o, _ in rows]
+        self.batches = [Batch(int(b), t, min(t - lead, self.snapshot_at)) for b, t in rows]
         missing = [b.batch_id for b in self.batches
                    if not (self.work_dir / "positives" / f"batch={b.batch_id}.parquet").exists()]
         if missing:
             raise RuntimeError(f"positives are missing for batches {missing}; run derive-positives")
         if next_batch:
-            official = [b.batch_id for b in self.batches if b.official]
-            t = self.snapshot_at + lead
-            self.batches.append(Batch(max(official) + 1 if official else 1, t, self.snapshot_at,
-                                      t, True))
-        con.execute("CREATE OR REPLACE TEMP TABLE batches (batch_id BIGINT, "
-                    "created_at TIMESTAMPTZ, as_of TIMESTAMPTZ, available_at TIMESTAMPTZ)")
-        con.executemany("INSERT INTO batches VALUES (?, ?, ?, ?)",
-                        [(b.batch_id, b.created_at, b.as_of, b.available_at)
-                         for b in self.batches])
+            last = max((b.batch_id for b in self.batches), default=0)
+            self.batches.append(Batch(last + 1, self.snapshot_at + lead, self.snapshot_at))
+        con.execute("CREATE OR REPLACE TEMP TABLE batches "
+                    "(batch_id BIGINT, created_at TIMESTAMPTZ, as_of TIMESTAMPTZ)")
+        con.executemany("INSERT INTO batches VALUES (?, ?, ?)",
+                        [(b.batch_id, b.created_at, b.as_of) for b in self.batches])
         con.execute(
             "CREATE OR REPLACE TEMP TABLE gold0 AS SELECT g.batch_id, g.query_id, g.raw_url, "
             "g.canonical_url, list_contains(g.tags, 'head') AS in_head, "
@@ -260,7 +246,7 @@ class FeatureStore:
             "CREATE OR REPLACE TEMP TABLE pairs AS SELECT s.batch_id AS src, d.batch_id AS dst, "
             f"pow(0.5, date_diff('second', s.created_at, d.as_of) / 86400.0 / {half_life}) AS w "
             "FROM batches s JOIN batches d "
-            "ON s.created_at < d.created_at AND s.available_at <= d.as_of")
+            "ON s.created_at < d.created_at AND s.created_at <= d.as_of")
         self._aggregates()
 
     def _domain_keyer(self) -> DomainKeyer:
@@ -536,14 +522,14 @@ LEFT JOIN (SELECT * FROM uhist WHERE batch_id = {batch_id}) u ON u.url = c.url
         """Counts sample negatives of `batch_id` that look like golden URLs.
 
         `neg_later_golden` and `neg_next_golden` count negatives whose URL is
-        golden in any later official batch or in the next one. `neg_variant_golden`
+        golden in any later batch or in the next one. `neg_variant_golden`
         counts negatives that differ from a golden spelling of this batch only by
         scheme, a leading `www.` or a trailing `/`; the official metric compares
         raw strings, so those rows are true negatives. Later batches are future
         information, so this is a diagnostic and never feeds a model.
         """
         b = self.batch(batch_id)
-        later = sorted((x for x in self.batches if x.official and x.created_at > b.created_at),
+        later = sorted((x for x in self.batches if x.created_at > b.created_at),
                        key=lambda x: x.created_at)
         ids = ", ".join(str(x.batch_id) for x in later) or "NULL"
         nxt = later[0].batch_id if later else "NULL"

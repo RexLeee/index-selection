@@ -15,7 +15,6 @@ dependencies = [
     "scikit-learn>=1.7",
     "sqlalchemy>=2.0",
     "tldextract==5.1.1",
-    "trendspy>=0.1.6",
     "w3lib>=2.5",
 ]
 

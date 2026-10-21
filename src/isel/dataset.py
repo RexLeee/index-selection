@@ -38,14 +38,13 @@ def to_numpy(table: pa.Table, features: list[str]) -> np.ndarray:
 def train_batches(cfg: Config, store: FeatureStore, test_batch: int) -> list[int]:
     """Label batches usable to train a model that is evaluated on `test_batch`.
 
-    A batch qualifies when its rows were available at the test batch's as-of
-    time, is at or after `dataset.first_label_batch`, and has golden history for
-    its priors. Pseudo batches qualify only once their SERP fetch is done.
+    A batch qualifies when it existed at the test batch's as-of time, is at or
+    after `dataset.first_label_batch`, and has golden history for its priors.
     """
     test = store.batch(test_batch)
     return [b.batch_id for b in store.batches
             if b.batch_id >= cfg.dataset.first_label_batch
-            and b.available_at <= test.as_of and b.batch_id != test_batch
+            and b.created_at <= test.as_of and b.batch_id != test_batch
             and store.has_history(b.batch_id)]
 
 
