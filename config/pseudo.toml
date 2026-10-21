@@ -1,3 +1,0 @@
-# Overlay for model M1: official golden plus pseudo golden (docs/DESIGN.md §5.1).
-[golden]
-use_pseudo = true

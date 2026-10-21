@@ -18,7 +18,7 @@ import pyarrow.compute as pc
 from conftest import replace, small_cfg
 
 from isel.derive import derive_positives, derive_sample
-from isel.golden import PSEUDO, golden_table, pseudo_batch_path
+from isel.golden import golden_table
 from isel.io import atomic_write_json, write_parquet_atomic
 from isel.pull import FULL_SCHEMA
 
@@ -79,22 +79,6 @@ def make_world(seed: int = 1, domains: int = 120, pages_per_domain: int = 60,
         golden_rows.append((b, created, qid, f"q{qid}", 100, ["head"], 9,
                             f"https://uncrawled{b}.example/x"))
     return World(pages, golden_rows, batches)
-
-
-def write_pseudo(world: World, work_dir: Path, batch_id: int, created_at: datetime,
-                 available_at: datetime, n_urls: int = 200, seed: int = 3) -> list[str]:
-    """Writes a pseudo golden batch and its positives; returns its URLs."""
-    rng = random.Random(seed)
-    weights = [math.exp(4 * p["_quality"] + 1.5 * p["_root"]) for p in world.pages]
-    chosen = list(dict.fromkeys(p["url"] for p in rng.choices(world.pages, weights, k=n_urls)))
-    rows = [(batch_id, created_at, 900_000 + i // 8, f"p{i // 8}", 1, ["random"], i % 8 + 1, u)
-            for i, u in enumerate(chosen)]
-    write_parquet_atomic(golden_table(rows, label_source=PSEUDO, available_at=available_at),
-                         pseudo_batch_path(work_dir, batch_id))
-    clean = {r["url"]: r for r in crawl_rows(world)}
-    write_parquet_atomic(pa.Table.from_pylist([clean[u] for u in chosen], schema=FULL_SCHEMA),
-                         work_dir / "positives" / f"batch={batch_id}.parquet")
-    return chosen
 
 
 def crawl_rows(world: World) -> list[dict]:

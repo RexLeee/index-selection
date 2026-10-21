@@ -48,14 +48,6 @@ def test_base_config_loads(base_cfg):
     ("[selectdb]\nadmin_dsn_env = 'ISEL_CRAWLERDB_DSN'\n", "must differ"),
     ("[selectdb]\nforbidden_ports = []\n", "forbidden_ports"),
     ("[schedule]\nswap_freeze_window = ['20:00', '11:30']\n", "swap_freeze_window"),
-    ("[serp.providers.serpapi]\nkey_env = 'SERPAPI_KEY'\n", "course key"),
-    ("[serp.providers.serper]\nkey_env = 'SERPAPI_KEY'\n", "course key"),
-    ("[serp.providers.serper]\nbudget_period = 'week'\n", "budget_period"),
-    ("[serp.providers.bing]\nkey_env = 'X'\nurl = 'https://b'\nmin_interval_s = 1.0\n"
-     "budget = 1\nbudget_period = 'total'\n", "exactly"),
-    ("[trends]\nhours = 500\n", "trends.hours"),
-    ("[pseudo]\ngate_provider_overlap = 1.5\n", "gate"),
-    ("[pseudo]\ngate_trend_jaccard = -0.1\n", "gate"),
 ])
 def test_config_rejects_bad_values(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):

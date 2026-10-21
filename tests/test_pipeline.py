@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from argparse import Namespace
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import numpy as np
 import pyarrow as pa
@@ -10,13 +10,13 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import pytest
 from conftest import replace, small_cfg
-from synth import SNAPSHOT, make_world, write_pseudo, write_work_dir
+from synth import make_world, write_work_dir
 
 from isel.backtest import forward_eval, run_backtest, select_sample, train_frozen
 from isel.cli import cmd_backtest, cmd_build_dataset
 from isel.dataset import train_batches, training_matrix
 from isel.features import FeatureStore, resolve_set
-from isel.golden import PSEUDO, golden_table, pseudo_batch_path
+from isel.golden import golden_table
 from isel.io import atomic_write_json, open_duckdb, read_json, write_parquet_atomic
 from isel.manifest import validate_run
 from isel.urlnorm import canonicalize
@@ -80,80 +80,20 @@ def test_training_batches_precede_the_test_batch(work):
         assert all(store.batch(b).created_at <= test.as_of for b in chosen)
 
 
-PSEUDO_ID = 10005
-PSEUDO_FETCHED = datetime(2026, 5, 15, tzinfo=UTC)   # after batch 8's as-of, before S0
-
-
-def _with_pseudo(work, world):
-    urls = write_pseudo(world, work, PSEUDO_ID, world.batches[5], PSEUDO_FETCHED)
-    return replace(small_cfg(work), "golden", use_pseudo=True), urls
-
-
-def _sorted_frame(store, batch):
-    return store.frame(batch, "eval").sort_by([("url", "ascending"), ("shard", "ascending")])
-
-
-def test_pseudo_fetched_after_as_of_leaves_backtests_unchanged(work, world):
-    cfg = small_cfg(work)
-    cfg_p, _ = _with_pseudo(work, world)
-    plain, with_p = _store(cfg, work), _store(cfg_p, work)
-    assert PSEUDO_ID in [b.batch_id for b in with_p.batches]
-    for t in (6, 8):
-        a, b = _sorted_frame(plain, t), _sorted_frame(with_p, t)
-        assert a.schema.names == b.schema.names and a.num_rows == b.num_rows
-        changed = []
-        for n in a.schema.names:
-            x, y = a.column(n), b.column(n)
-            if pa.types.is_floating(x.type):
-                same = np.allclose(np.array(x.to_pylist(), float), np.array(y.to_pylist(), float),
-                                   rtol=1e-9, atol=1e-12, equal_nan=True)
-            else:
-                same = x.equals(y)
-            if not same:
-                changed.append(n)
-        assert changed == [], (t, changed)
-        assert train_batches(cfg, plain, t) == train_batches(cfg_p, with_p, t)
-
-
-def test_pseudo_available_before_snapshot_feeds_the_next_batch(work, world):
-    cfg_p, urls = _with_pseudo(work, world)
-    plain = _store(small_cfg(work), work, next_batch=True)
-    with_p = _store(cfg_p, work, next_batch=True)
-    assert plain.batches[-1].batch_id == with_p.batches[-1].batch_id == 10
-    assert PSEUDO_ID in train_batches(cfg_p, with_p, 10)
-    a, b = _sorted_frame(plain, 10), _sorted_frame(with_p, 10)
-    hist_a = dict(zip(a.column("url").to_pylist(), a.column("hist_decayed").to_pylist(),
-                      strict=True))
-    hist_b = dict(zip(b.column("url").to_pylist(), b.column("hist_decayed").to_pylist(),
-                      strict=True))
-    assert any((hist_b[u] or 0) > (hist_a[u] or 0) for u in urls if u in hist_a)
-
-
-def test_frozen_model_validates_on_the_last_official_batch(work, world):
-    cfg_p, _ = _with_pseudo(work, world)
-    model_dir = train_frozen(cfg_p, work, [])
+def test_frozen_model_validates_on_the_latest_batch(work):
+    model_dir = train_frozen(small_cfg(work), work, [])
     meta = read_json(model_dir / "lgbm_full" / "meta.json")
-    assert PSEUDO_ID in meta["train_batches"]
+    assert meta["train_batches"] == list(range(2, 9))
     assert meta["valid_batch"] == 8
-    assert meta["use_pseudo"] is True
 
 
-def test_forward_eval_pairs_the_official_and_pseudo_models(work, world):
+def test_forward_eval_scores_the_models_of_several_runs(work):
     cfg = small_cfg(work)
-    cfg_p, _ = _with_pseudo(work, world)
-    m0, m1 = train_frozen(cfg, work, []), train_frozen(cfg_p, work, [])
-    out = forward_eval(cfg, work, [m0, m1], 9, ["random"])
-    result = read_json(out / "results.json")["batches"]["9"]
-    scorers = result["tags"]["head"]["scorers"]
-    assert {"lgbm:full", "lgbm:full+pseudo", "random"} <= set(scorers)
-    assert "diff_vs_reference_ci95" in scorers["lgbm:full+pseudo"]
-    overlap = result["pseudo_overlap"]["head"]
-    assert 0 < overlap["in_pseudo"] <= overlap["golden_urls"]
-    split = overlap["hits"]["lgbm:full+pseudo"]
-    k = str(cfg.eval.k_headline)
-    rate = scorers["lgbm:full+pseudo"]["k"][k]["indexed_exact_rate"]
-    assert split["in_pseudo"] + split["not_in_pseudo"] == round(
-        rate * result["tags"]["head"]["golden_urls"])
+    runs = [train_frozen(cfg, work, []), train_frozen(cfg, work, ["v1_features"])]
+    out = forward_eval(cfg, work, runs, 9, ["random"])
+    scorers = read_json(out / "results.json")["batches"]["9"]["tags"]["head"]["scorers"]
+    assert {"lgbm:full", "v1_features", "random"} <= set(scorers)
+    assert "diff_vs_reference_ci95" in scorers["v1_features"]
 
 
 def test_store_refuses_an_unfinished_sample(work):
@@ -168,31 +108,6 @@ def test_store_refuses_batches_without_positives(work):
     (work / "positives" / "batch=3.parquet").unlink()
     with pytest.raises(RuntimeError, match=r"positives are missing for batches \[3\]"):
         _store(small_cfg(work), work)
-
-
-def test_store_refuses_a_pseudo_batch_that_reuses_an_official_id(work, world):
-    write_pseudo(world, work, 5, world.batches[5], PSEUDO_FETCHED)
-    cfg = replace(small_cfg(work), "golden", use_pseudo=True)
-    with pytest.raises(RuntimeError, match=r"batch ids \[5\] hold both"):
-        _store(cfg, work)
-
-
-@pytest.mark.parametrize("available_at, known", [
-    (SNAPSHOT + timedelta(days=1), False),    # fetched after S0: no model could use it
-    (SNAPSHOT - timedelta(days=1), True),
-])
-def test_pseudo_overlap_counts_only_pseudo_known_by_s0(work, world, available_at, known):
-    cfg = small_cfg(work)
-    model_dir = train_frozen(cfg, work, [])
-    urls = sorted({r[7] for r in world.golden_rows if r[0] == 9})[:20]
-    rows = [(10007, world.batches[8], i, f"p{i}", 1, ["random"], 1, u)
-            for i, u in enumerate(urls)]
-    write_parquet_atomic(golden_table(rows, label_source=PSEUDO, available_at=available_at),
-                         pseudo_batch_path(work, 10007))
-    out = forward_eval(cfg, work, [model_dir], 9, ["random"])
-    overlap = read_json(out / "results.json")["batches"]["9"]["pseudo_overlap"]
-    in_pseudo = sum(t["in_pseudo"] for t in overlap.values())
-    assert (in_pseudo >= len(urls)) if known else in_pseudo == 0
 
 
 def test_decay_weights_fall_with_age(work):
