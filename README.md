@@ -58,7 +58,7 @@ $J rollback
 $J verify-live --batch 20                       # the metric's own SQL as its reader role
 $J recrawl-sync                                 # live run -> recrawl.{host,doc}
 $J recrawl-plan --dry-run                       # per-host capacity report
-# loops, after PR #84 (4dce38f or later) is merged and deployed (docs/RECRAWL_DESIGN.md §0):
+# loops, after PR #84 (bd40191 or later) is merged and deployed (docs/RECRAWL_DESIGN.md §0):
 # docker compose -f deploy/compose.compute.yaml --profile recrawl up -d recrawl-plan recrawl-archive
 ```
 

@@ -74,7 +74,7 @@ recrawl 的檔案不在 `/work`，路徑由 `[recrawl]` 設定（Host2 的值見
 | 路徑 | 內容 | 寫入者 |
 |---|---|---|
 | `/data/manual_bulk_crawls/pending/{job_id}.json` | 給 crawler 的 job 檔，一個 job 一個 | crawler 的 API（`recrawl-plan` 經 `POST /v1/manual-bulk-crawls` 送出，WebCrawler PR #84）；isel 不寫這個目錄 |
-| `/data/manual_bulk_crawls/results/{job_id}/` | `request.json`、`status.json`、每個 URL 的 `NNNNN.json` 和原始 HTML `NNNNN.html` | crawler；`recrawl-archive` 只讀。保留機制待 PR #84 提供 |
+| `/data/manual_bulk_crawls/results/{job_id}/` | `request.json`（`urls`、`crawler_ids`），以及每個 crawler 分區 `crawler_NN/` 裡每個 URL 的 `NNNNN.json`、原始 HTML `NNNNN.html` 和 `progress.json` | API 建立，crawler 寫入；`recrawl-archive` 只讀。job 完成與否只看 API 的 `GET`。保留機制是 PR #84 的 `ttl_days` 和 DELETE |
 | `/data/isel/text/fetch_date=YYYYMMDD/job-<batch_id>.parquet` | 抽出的正文，永久保存，建 inverted index 的來源 | `recrawl-archive` |
 | `/data/isel/log/YYYYMMDD/job-<batch_id>.jsonl.gz` | gzip 的逐 URL 結果，永久保存，重建 DB 的依據 | `recrawl-archive` |
 
@@ -504,7 +504,7 @@ $J verify-live --batch 20
 # recrawl (docs/RECRAWL_DESIGN.md §7), each step a Hard Stop
 $J recrawl-sync                              # after each swap; refused in the freeze window
 $J recrawl-plan --dry-run                    # per-host capacity report; writes nothing
-# only after PR #84 (4dce38f or later, with ttl_days and DELETE) is merged and deployed
+# only after PR #84 (bd40191 or later: ttl_days, DELETE, per-crawler result partitions) is merged and deployed
 $D --profile recrawl up -d recrawl-plan recrawl-archive
 $D --profile recrawl stop recrawl-plan       # stops sending new jobs at once
 ```

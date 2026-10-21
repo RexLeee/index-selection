@@ -6,6 +6,8 @@
 
 2026-10-18 更新：入口改成 WebCrawler PR #84 的 manual-bulk-crawl job API。提案的 C5、C6、C8、C10 由它取代，C9 改寫成 API job 的 lane 分配。politeness（C1–C4、C7）不再提出，沿用 crawler 現行的 AutoThrottle。理由見 §4.1 和 §8。同日 PR 更新到 `4dce38f`，加上 `ttl_days`、DELETE 和 FIFO 的 job 順序，isel 跟著改用它們（§4.4）。
 
+2026-10-21 更新：PR head 是 `bd40191`。job 依 crawler 拆成分區，不再用檔案鎖；結果目錄在 POST 時就建立，只有 API 的狀態查詢能判斷 job 完成。isel 改成由 planner 查狀態，archive 從 `crawler_NN/` 分區讀結果（§4.2、§4.4）。
+
 - recrawl 不另建爬蟲。isel 把 URL 清單交給正式 crawler 的 job API，crawler 用一般的 `html_spider` 抓取。
 - isel 只做三件事：
   - `POST /v1/manual-bulk-crawls` 送出 job，帶 `ttl_days`；
@@ -19,7 +21,7 @@
   - isel 讓 recrawl 自己對每個 host 平均不超過 0.2 qps（`min_gap_s`）；
   - 跨 lane 的速率沿用 crawler 現行的 AutoThrottle。2026-10-18 決定不再提出 C1–C4、C7。
 - 14 天的上限約 108–123M 頁（§3）。目標是兩週內盡量多抓，rank 高的先抓。
-- 啟動前提：PR #84（`4dce38f` 或之後）已 merge 並部署。isel 依賴它的 `ttl_days` 和 DELETE，否則 `/data` 會塞滿。
+- 啟動前提：PR #84（`bd40191` 或之後）已 merge 並部署。isel 依賴它的 `ttl_days` 和 DELETE，否則 `/data` 會塞滿。
 - lane 分配不在 PR #84 的範圍內，已和 crawler 組說好另外追蹤，WebCrawler #85 已改寫成只談這個問題。
 
 ## 1. 規則
@@ -196,18 +198,20 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
              POST 127.0.0.1:4000/v1/manual-bulk-crawls {"urls": [...]} → job_id
                                                   │ API 正規化、去重、分給擁有該 domain 的 crawler
                                                   ▼
-                       /data/manual_bulk_crawls/pending/{job_id}.json
-                                                  │ 正式 crawler 的 html_spider（priority -1）
+        /data/manual_bulk_crawls/pending/{job_id}.json + pending/crawler_NN/{job_id}.json
+                                                  │ 正式 crawler 的 html_spider（priority 0，每個 process 最多 128 個在途）
                                                   ▼
-       /data/manual_bulk_crawls/results/{job_id}/{request,status,NNNNN}.json + NNNNN.html
-                                                  │ recrawl-archive（常駐，只讀）
+       /data/manual_bulk_crawls/results/{job_id}/request.json
+       /data/manual_bulk_crawls/results/{job_id}/crawler_NN/{NNNNN.json, NNNNN.html, progress.json}
+                                                  │ recrawl-plan 用 GET 確認完成；recrawl-archive（常駐，只讀）
                                                   ▼
      /data/isel/text/fetch_date=YYYYMMDD/job-<batch_id>.parquet（正文，永久）
      /data/isel/log/YYYYMMDD/job-<batch_id>.jsonl.gz（每個 URL 的結果，永久）；更新 recrawl.doc
 ```
 
-- 結果目錄在整個 job 的 URL 都完成後，才用一次 rename 出現。所以 isel 看到目錄就代表 job 完成。
-- `request.json` 是 API 正規化並去重後的 URL 清單，順序不變（PR 的 `docs/03` §3.6）。`NNNNN.json` 是清單中第 N 個 URL 的結果。
+- API 在 POST 時就建好 `results/{job_id}/`、`request.json` 和每個 crawler 的空分區。所以目錄存在不代表完成。
+- 每個 crawler 只寫自己的分區，寫完時在 `progress.json` 填 `completed_at`。所有分區都完成，API 的 `GET` 才回 `completed`。磁碟上沒有 `status.json`（PR 的 `docs/03` §3.7）。
+- `request.json` 有 API 正規化並去重後的 `urls`，順序不變，還有每個 URL 的 `crawler_ids`。第 n 個結果是 `crawler_{crawler_ids[n]:02d}/{n:05d}.json`，HTML 在同一個分區。API 的下載路由也這樣解析。
 - job 從 POST 起算 `ttl_days` 天後過期。過期後 crawler 不再處理它，`GET` 回 404，API 容器的 GC 每小時刪掉它的檔案。
 - crawler 依 `created_at` 認領 job，所以 job 是 FIFO。
 
@@ -245,6 +249,7 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 |---|---|---|
 | `claimed` | 已寫進 DB，POST 還沒有確定的回應 | `dispatched` |
 | `submitted` | API 回了 `job_id` | `dispatched` |
+| `completed` | API 的 `GET` 回 `completed`。記下 API 的 `completed_at`，等 archive 套用 | `dispatched` |
 | `error` | 結果違反合約（例如順序不對）。planner 全面停止，archive 每輪重試，直到修好或 TTL 到期 | `dispatched` |
 | `applied` | 結果已套用。之後 plan 會 DELETE 它的結果，並填 `deleted_at` | — |
 | `lost` | 不會有結果：API 拒絕、POST 沒回應、API 不認得（包括 TTL 已到期） | 已退回 `pending` |
@@ -266,12 +271,15 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 1. 回收：
    - `claimed` 超過 `claim_timeout_s`（600 秒）的 job 標成 `lost`，doc 退回 `pending`；
-   - 安全網：`dispatched` 的 doc 或有 `batch_id` 的 host，如果它的 job 已不是 `claimed`/`submitted`/`error`，就釋放；
+   - 安全網：`dispatched` 的 doc 或有 `batch_id` 的 host，如果它的 job 已不是 `claimed`/`submitted`/`completed`/`error`，就釋放；
    - `fetched` 而且到期的 doc 退回 `pending`。
-2. 查狀態：`submitted` 或 `error` 的 job 超過 `job_check_s`（6 小時）仍沒有結果目錄，就 `GET` 一次。
-   - 404：`lost`，doc 退回 `pending`。TTL 到期的 job 走這條。沒修好就過期的 `error` job 也走這條，planner 隨之恢復。
+2. 查狀態：`submitted`、`completed`、`error` 的 job，距離上次查詢超過 `status_poll_s`（60 秒）就 `GET` 一次。48 個 job 約每秒 1 次請求。
+   - `completed`，而且 job 還是 `submitted`：標成 `completed`，記下 API 的 `completed_at`。
+   - `completed` 但看不到結果目錄：job 保持 `submitted`，回報 `config_error`，本輪不認領。這代表結果目錄沒有掛載對，所有 job 都讀不到。
+   - 404：`lost`，doc 退回 `pending`。TTL 到期的 job 走這條。沒修好就過期的 `error` job、archive 來不及套用的 `completed` job 也走這條。
    - `pending`/`running`：記下 `checked_at`。
-   - `completed` 但看不到目錄：回報 `config_error`。這代表結果目錄沒有掛載對。
+   - API 有回應但不能用，例如 5xx 或格式不對：回報 `api_error`，跳過這個 job，繼續查其他 job。所以一個壞掉的 job 不會擋住其他 job 的完成。
+   - 連不上 API：回報 `api_error`，本輪停止查詢，避免每個 job 各等一次逾時。
 3. 刪除：`applied` 而且 `deleted_at` 是 NULL 的 job，逐一 `DELETE`。
    - 204 或 404：填 `deleted_at`。
    - 其他回應或沒有回應：回報 `api_error`，本輪停止，下一輪再試。
@@ -279,7 +287,9 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 4. 停止條件，任一成立就不認領：
    - 有 job 在 `error`；
    - API 上次拒絕了整個 job，還在 `api_backoff_s` 內；
-   - 未結束的 job（`claimed` + `submitted`）已有 `max_jobs_inflight`（48）個；
+   - 結果目錄沒有掛載對（上一步的 `config_error`）；
+   - 在 crawler 的 job（`claimed` + `submitted`）已有 `max_jobs_inflight`（48）個；
+   - 等 archive 套用的 `completed` job 也已有 `max_jobs_inflight` 個（`archive_lag`）；
    - `text_root` 所在磁碟剩餘低於 `min_free_gb`。
 5. 認領：依 `best_rank` 分頁讀出可派送的 host（沒有未結束的 job，`next_at` 已到）。
    - 每個 host 取最多 `host_docs_per_job`（120）個到期 doc；
@@ -300,15 +310,16 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 **`recrawl-archive`**：常駐，每 60 秒一輪。它對 `result_root` 只讀不寫。
 
-1. 候選 job：`submitted` 和 `error`，而且 `result_root/{job_id}` 已存在。`lost` 的 job 不再套用，因為它的 doc 已經重排。
+1. 候選 job：`completed` 和 `error`，而且 `result_root/{job_id}` 存在。archive 不呼叫 API。目錄已消失的 job 留給 planner，`GET` 回 404 後就變成 `lost`。`lost` 的 job 不再套用，因為它的 doc 已經重排。
 2. `archive_workers` 個 process 各處理一個 job（`prepare_job`）：
-   - 讀 `request.json`、`status.json`，以及清單中每個位置的 `NNNNN.json`；
+   - 讀 `request.json` 的 `urls` 和 `crawler_ids`。兩者要等長，`crawler_ids` 要是非負整數；
+   - 讀清單中每個位置在它的分區裡的 `NNNNN.json`；
    - 檢查每筆結果：必要欄位、型別、`url` 等於 `request.json` 的第 N 個、`html_file` 只能是 `NNNNN.html`、時間有 UTC offset；
    - 對應（`map_results`）：
      - 長度相同：第 i 個結果對應第 i 個 doc。若某位置的 URL 不同，而且等於另一個送出的 URL，代表順序變了，判定違反合約；
      - 長度較短（API 去掉了重複）：只用完全相同的字串對應。對不上的 doc 記成 `retry`（`unmatched`），下次通常單獨在一個 job，就能用位置對應；
    - 2xx HTML：計算 `payload_sha1`，用 Resiliparse 抽出 title、description、正文和語言。編碼由位元組或 `<meta charset>` 判斷；
-   - 寫一個正文 Parquet 和一個 gzip 的逐 URL 結果。日期取自 `status.json` 的 `completed_at`，所以重跑會覆蓋同一個檔。
+   - 寫一個正文 Parquet 和一個 gzip 的逐 URL 結果。日期取自 job 的 `completed_at`（planner 記下的 API 值），所以重跑會覆蓋同一個檔。
 3. 違反合約：job 標成 `error`，不寫 DB。planner 停止，直到修好後的下一輪成功套用。
 4. 讀檔的 OSError（權限、EIO）：這個 job 下一輪重試，不改狀態。整個目錄消失也算這一種。
 5. 主程序在一個交易內套用，最後才把 job 標成 `applied`，所以 crash 後重跑沒有副作用：
@@ -339,6 +350,7 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 | job 在 `error` | 修好原因（程式或 server）後，archive 下一輪自動套用，planner 自動恢復。沒修好的話，TTL 到期後它會變成 `lost`，planner 也會恢復 |
 | DELETE 一直失敗 | plan 每輪回報 `api_error` 並重試。結果目錄最晚在 TTL 到期後由 server 清掉 |
 | archive 停機超過 TTL | 已抓到的結果會被 server 刪掉，job 變成 `lost`，doc 重抓。只損失重抓的時間 |
+| 某個 crawler 停機 | 每個 job 的 URL 分在多個 crawler，所以幾乎每個 job 都等它。在途的 job 滿 `max_jobs_inflight` 後，planner 停止認領。crawler 在 TTL 內回來，job 就照常完成。超過 TTL，job 變成 `lost`，其他分區已抓到的結果也跟著丟掉 |
 | planner 或 archive crash | 直接重啟。狀態都在 DB，檔案用 tmp + rename 寫入 |
 | 要撤掉整個 recrawl | `git revert` 後執行 `alembic downgrade 0002`，它會 `DROP SCHEMA recrawl CASCADE`。正文 Parquet 不受影響 |
 
@@ -365,7 +377,7 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 | recrawl 自己的速率 | isel 讓同一 host 的下一個 job 至少等 `doc 數 × min_gap_s`，平均不超過 0.2 qps | 已實作 |
 | 一個 job 內的突發 | crawler 用 AutoThrottle，每 host 並發 16、delay 0.25 s，所以 job 內可能短時間超過 0.2 qps | 沿用現行 AutoThrottle |
 | 跨 lane 加總 | 一般 crawl 和 API 請求共用 slot，但 crawler 不保證 5 秒間隔 | 沿用現行 AutoThrottle |
-| 車道分配 | PR #84 固定 priority -1，一般 crawl 在同一 host 上永遠優先 | WebCrawler #85 追蹤 |
+| 車道分配 | PR #84 `bd40191`：API 請求 priority 0，每個 process 最多 128 個在途（`max_concurrency_ratio` 0.5）。這是上限，不是保底 | WebCrawler #85 追蹤 |
 | robots.txt | crawler 照常遵守；被拒的 URL 回 `IgnoreRequest` | PR #84 已處理 |
 | 429/503 | isel 暫停這個 host 的派送 | 已實作 |
 | 事後稽核 | Loki 每 host 每 10 分鐘 ≤ 120 次 | 試抓時檢查 |
@@ -380,14 +392,14 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 | 資料 | 大小估計 | 位置 | 保留方式 |
 |---|---|---|---|
-| pending job 檔 | 每個 job 一個，最多 `max_jobs_inflight` 個，可忽略 | Host2 `/data/manual_bulk_crawls/pending` | crawler 發布結果後刪除 |
+| pending job 檔 | 每個 job 一個 manifest，加上每個 crawler 一個佇列檔，可忽略 | Host2 `/data/manual_bulk_crawls/pending` | 佇列檔由 crawler 做完後刪除；manifest 由 DELETE 或 GC 刪除 |
 | 原始 HTML + 每 URL 的 JSON（暫存） | 壓縮後的 128M 頁就有 5–6 TB；每個 URL 兩個檔 | Host2 `/data/manual_bulk_crawls/results/{job_id}` | isel 套用後立刻 DELETE；isel 沒刪到的由 TTL（3 天）清掉 |
 | 正文 Parquet | 約 0.35–0.4 TB | Host2 `/data/isel/text/fetch_date=YYYYMMDD/job-<batch_id>.parquet` | 永久 |
 | gzip 的逐 URL 結果 | 約 8 GB | Host2 `/data/isel/log/YYYYMMDD/job-<batch_id>.jsonl.gz` | 永久；selectdb 沒有備份，這些檔是重建 DB 的依據 |
 | `recrawl` schema | 約 37 GB（未實測） | Host1 selectdb（`:5445`） | 常駐 |
 
-- planner 的背壓：`/data/isel` 剩餘低於 `min_free_gb`（800 GB）時停止派送；未結束的 job 最多 `max_jobs_inflight` 個。
-- 結果目錄同時只留未套用的 job，加上少數等 DELETE 重試的 job。上限約為 `max_jobs_inflight` × `job_size` = 144k 頁。
+- planner 的背壓：`/data/isel` 剩餘低於 `min_free_gb`（800 GB）時停止派送；在 crawler 的 job 和等 archive 的 `completed` job 各最多 `max_jobs_inflight` 個。
+- 結果目錄同時只留未套用的 job，加上少數等 DELETE 重試的 job。上限約為 2 × `max_jobs_inflight` × `job_size` = 288k 頁。
 - Host1 `/data` 在 2026-10-16 只剩 229 GB（97%）。`recrawl` schema 的 37 GB 要等 Host1 有空間再載入（R1）。
 - 每頁正文的實際大小要在試抓後更新。2026-10-17 的 590 KB 只來自 9 個網頁的 CPU 測試，不能拿來估磁碟用量。
 
@@ -395,9 +407,9 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 | 階段 | 內容 | 前提 |
 |---|---|---|
-| R0 | schema（0003）、`recrawl-sync`/`plan`/`archive`、正文抽取、測試（2026-10-18 改接 PR #84 job API；本地 e2e 包含 PR 的真實 API 和結果寫入程式） | 只動本 repo |
+| R0 | schema（0003）、`recrawl-sync`/`plan`/`archive`、正文抽取、測試（2026-10-18 改接 PR #84 job API；2026-10-21 對齊 `bd40191`；本地 e2e 包含 PR 的真實 API 和分區寫入程式） | 只動本 repo |
 | R1 | ⛔ 確認 `:5445` 在 0002 後，`migrate-selectdb` 到 0003；`recrawl-sync` 在 live 上載入；`recrawl-plan --dry-run` 容量報告 | batch 20 swap 完成 |
-| R2 | PR #84（`4dce38f` 或之後）merge 並部署 | crawler 組同意；crawler 復工 |
+| R2 | PR #84（`bd40191` 或之後）merge 並部署 | crawler 組同意；crawler 復工 |
 | R3 | ⛔ 啟動 `recrawl-plan`、`recrawl-archive`，試抓 1–5M 頁，量測 HTML 和正文大小 | R2 |
 | R4 | 全量；之後每期只抓增量 | R3 的量測 |
 
@@ -416,6 +428,15 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 | isel 自己的 job 逾時，再用 DELETE 取消 | 要同時維護 isel 的逾時和 server 的 TTL 兩個期限。改用 TTL 當唯一期限：server 會停止過期的 job，isel 從 404 得知 |
 | 套用 `lost` job 晚到的結果 | TTL 到期後 server 會丟掉晚到的結果，所以不會再有晚到的目錄。刪掉這段處理，程式比較簡單 |
 | TTL 用 PR 的預設 14 天 | 沒套用的結果會在 `/data` 留 14 天。3 天已足夠 FIFO 下的 job 跑完；archive 停機超過 3 天，只會重抓 |
+
+2026-10-21 對齊 `bd40191` 時新增的決定：
+
+| 做法 | 不採用的理由 |
+|---|---|
+| archive 自己讀各分區的 `progress.json` 判斷完成 | 這是複製 API 的 `job_status`。PR 文件寫明只有 API 判斷完成，而且這個格式一週內改了兩次。也會漏掉 API 的過期檢查 |
+| archive 用 HTTP 下載結果 | 一個 3,000 URL 的 job 約 6,000 次 GET，全量約每秒 60 MB 經過 FastAPI。archive 也就要連得到 API。isel 和結果在同一台機器，直接讀檔就好 |
+| 掃描 `crawler_*` 目錄找結果檔 | 會看到 `.json.tmp`、`progress.json` 等其他檔；crawler 編號超過 99 時目錄名稱是 3 位數。改用 `request.json` 的 `crawler_ids` 直接定位，和 API 的下載路由一致 |
+| `completed` 的 job 也算進 `max_jobs_inflight` | 它已經不佔 crawler。算進去會讓 archive 的延遲拖慢派送；改成另外設一個同樣大小的上限 |
 
 以下是 2026-10-18 之前的決定，以 C5、C6、C9、C10 為前提，保留作紀錄：
 
@@ -445,14 +466,15 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 
 ## 9. 風險與待確認
 
-1. PR #84 何時 merge 並部署。`4dce38f` 已有 TTL、DELETE 和 FIFO，這是啟動的前提。
-2. lane 分配（#85 的 C9）。一般 crawl 最忙的正是最大的 host；等待中的 API 請求還佔著 prefetch 名額，可能讓一個 crawler 停止收 API URL。雙方已在 PR 留言說好不在 #84 處理，#84 之後再做。
-3. `result_ttl_days` 是否夠長。lane 分配改好之前，忙碌 host 上的 job 可能 3 天跑不完。試抓時要量 job 從送出到完成的時間。
-4. politeness 沿用 crawler 現行的 AutoThrottle，跨 lane 的 0.2 qps 沒有額外保證。試抓時用 Loki 稽核每 host 每 10 分鐘的請求數。
-5. crawler 何時復工。它從 2026-10-06 起停止運作，2026-10-16 仍是 `Exited (137)`。
-6. HTML 和正文的實際大小。
-7. Wikimedia Enterprise snapshot 能不能用。
-8. 「low level domain」已確認為完整 hostname。若助教另有解釋，3 節的表要改用 eTLD+1 那一列：最大的是 wikipedia.org，要 56.7 天；14 天可抓 122.0M。
+1. PR #84 何時 merge 並部署。`bd40191` 有 TTL、DELETE、FIFO 和分區結果，isel 已對齊它（2026-10-21 本地 e2e）。PR 再改結果格式時，isel 要跟著改。
+2. lane 分配（#85 的 C9）。一般 crawl 最忙的正是最大的 host；等待中的 API 請求還佔著 prefetch 名額，可能讓一個 crawler 停止收 API URL。雙方已在 PR 留言說好不在 #84 處理，#84 之後再做。`bd40191` 的 128 名額只是 API 的上限，沒有保底。
+3. API 內部的 head-of-line。128 個名額包含在 scheduler 排隊的請求，依 job、index 順序填，沒有 per-host 上限。依 rank 排，前 50 個 job 每個只有約 29 個 host，分到 16 個 crawler 後每個約 2 個。若大 host 被 AutoThrottle 壓到約 0.3 qps，總速率約 10 req/s，遠低於 14 天需要的 106 req/s。只調小 `host_docs_per_job` 會讓大 host 在「一個 host 只在一個 job」的規則下抓不完。候選解法是讓同一 host 同時在多個 job，由 `next_at` 控速；等 Loki 或試抓的實測再決定。
+4. `result_ttl_days` 是否夠長。lane 分配改好之前，忙碌 host 上的 job 可能 3 天跑不完。試抓時要量 job 從送出到完成的時間。
+5. politeness 沿用 crawler 現行的 AutoThrottle，跨 lane 的 0.2 qps 沒有額外保證。試抓時用 Loki 稽核每 host 每 10 分鐘的請求數。
+6. crawler 已復工。它從 2026-10-06 起停止運作，2026-10-20 約 03:30 UTC 重新啟動（2026-10-21 唯讀確認）。PR #84 的 API 還沒部署。
+7. HTML 和正文的實際大小。
+8. Wikimedia Enterprise snapshot 能不能用。
+9. 「low level domain」已確認為完整 hostname。若助教另有解釋，3 節的表要改用 eTLD+1 那一列：最大的是 wikipedia.org，要 56.7 天；14 天可抓 122.0M。
 
 ## 10. Inverted index（規劃）
 
