@@ -294,7 +294,7 @@ selection run (manifest) ──recrawl-sync──► selectdb recrawl.{host,doc,
 5. 認領：依 `best_rank` 分頁讀出可派送的 host（沒有未結束的 job，`next_at` 已到）。
    - 每個 host 取最多 `host_docs_per_job`（120）個到期 doc；
    - 依序裝進 job，每個 job 最多 `job_size`（3000）個 URL，一輪最多 `plan_max_jobs`（8）個 job；
-   - job 內輪流排列各 host 的 URL，讓 crawler 的 256 個 prefetch 名額分散到多個 host；
+   - job 內輪流排列各 host 的 URL，讓每個 crawler process 的 128 個 API 名額分散到多個 host；
    - 寫入 `recrawl.job`（`claimed`），doc 標成 `dispatched`，host 設 `batch_id` 和 `next_at = now + doc 數 × min_gap_s`，commit。
 6. 逐一 POST（`{"urls": [...], "ttl_days": 3}`），依回應處理：
 
