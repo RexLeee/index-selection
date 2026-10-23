@@ -1,0 +1,96 @@
+{
+ "t_sample": 4113.843281548106,
+ "t_used": 4113.843281548106,
+ "projection": {
+  "icu": {
+   "bytes_per_doc": 1790.8191605342056,
+   "bytes_per_text_byte": 0.43531535792007403,
+   "by_ratio_tb": 0.2292248525483783,
+   "by_doc_tb": 0.22922485254837832
+  },
+  "icu_q1": {
+   "bytes_per_doc": 1841.2127555988316,
+   "bytes_per_text_byte": 0.47940235464536113,
+   "by_ratio_tb": 0.2524398279444686,
+   "by_doc_tb": 0.23567523271665045
+  },
+  "icu_q2": {
+   "bytes_per_doc": 1860.437300937301,
+   "bytes_per_text_byte": 0.4530435769299989,
+   "by_ratio_tb": 0.2385600352258558,
+   "by_doc_tb": 0.2381359745199745
+  },
+  "icu_nowait": {
+   "bytes_per_doc": 3262.7429817388934,
+   "bytes_per_text_byte": 0.7931130960611291,
+   "by_ratio_tb": 0.4176311016625784,
+   "by_doc_tb": 0.4176311016625784
+  },
+  "freqs": {
+   "bytes_per_doc": 952.5610974834196,
+   "bytes_per_text_byte": 0.23155016666676603,
+   "by_ratio_tb": 0.1219278204778777,
+   "by_doc_tb": 0.12192782047787772
+  },
+  "zstd": {
+   "bytes_per_doc": 1796.21072953575,
+   "bytes_per_text_byte": 0.43662594965450574,
+   "by_ratio_tb": 0.22991497338057598,
+   "by_doc_tb": 0.229914973380576
+  },
+  "source_body": {
+   "bytes_per_doc": 3232.3065094939584,
+   "bytes_per_text_byte": 0.7857145467820518,
+   "by_ratio_tb": 0.4137352332152267,
+   "by_doc_tb": 0.4137352332152267
+  }
+ },
+ "recovery_source_tb": 0.1884062491142001,
+ "budget": {
+  "free_before_prune_tb": 1.3194139533312,
+  "text_tb": 0.4,
+  "staging_tb": 0.0135,
+  "B_tb": 0.81532255799808,
+  "B_keep_10pct_of_disk_tb": 0.14393601704959985,
+  "room_below_flood_stage_tb": 0.5249249851903997
+ },
+ "footprint": {
+  "icu": {
+   "one_index_tb": 0.2292248525483783,
+   "keep_prev_steady_tb": 0.4584497050967566,
+   "build_peak_tb": [
+    0.4584497050967566,
+    0.876080806759335
+   ],
+   "build_peak_keep_prev_tb": [
+    0.6876745576451349,
+    1.1053056593077133
+   ]
+  },
+  "freqs": {
+   "one_index_tb": 0.1219278204778777,
+   "keep_prev_steady_tb": 0.2438556409557554,
+   "build_peak_tb": [
+    0.2438556409557554,
+    0.5541897105478332
+   ],
+   "build_peak_keep_prev_tb": [
+    0.3657834614336331,
+    0.6761175310257109
+   ]
+  },
+  "zstd": {
+   "one_index_tb": 0.22991497338057598,
+   "keep_prev_steady_tb": 0.45982994676115196,
+   "build_peak_tb": [
+    0.45982994676115196,
+    0.8781511692559281
+   ],
+   "build_peak_keep_prev_tb": [
+    0.689744920141728,
+    1.108066142636504
+   ]
+  }
+ },
+ "S_holds_icu": true
+}

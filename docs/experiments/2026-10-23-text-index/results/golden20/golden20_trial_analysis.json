@@ -1,0 +1,463 @@
+{
+ "variants": {
+  "icu_bg0": {
+   "docs": 362,
+   "present_pairs": 375,
+   "found_pairs": 354,
+   "recall_given_present": 0.944,
+   "head": 0.9378531073446328,
+   "random": 0.9521531100478469,
+   "ndcg": 0.043514131993391006,
+   "zero_hit_rate": 0.19455852156057496,
+   "delta_vs_icu": 0.04717460317460309,
+   "delta_ci95": [
+    0.026509712473182935,
+    0.06912253774846555
+   ]
+  },
+  "icu_en_most": {
+   "docs": 44390,
+   "present_pairs": 378,
+   "found_pairs": 332,
+   "recall_given_present": 0.8783068783068783,
+   "head": 0.8587570621468926,
+   "random": 0.8867924528301887,
+   "ndcg": 0.03827801055509431,
+   "zero_hit_rate": 0.03542094455852156,
+   "delta_vs_icu": -0.0185185185185186,
+   "delta_ci95": [
+    -0.048387096774193505,
+    0.010471204188481686
+   ]
+  },
+  "icu": {
+   "docs": 44390,
+   "present_pairs": 378,
+   "found_pairs": 339,
+   "recall_given_present": 0.8968253968253969,
+   "head": 0.8926553672316384,
+   "random": 0.9009433962264151,
+   "ndcg": 0.038501875705075225,
+   "zero_hit_rate": 0.039527720739219716
+  }
+ },
+ "icu_breakdown": {
+  "script": {
+   "ascii": {
+    "present_pairs": 263,
+    "recall_given_present": 0.894
+   },
+   "han": {
+    "present_pairs": 45,
+    "recall_given_present": 0.911
+   },
+   "kana": {
+    "present_pairs": 26,
+    "recall_given_present": 1.0
+   },
+   "other": {
+    "present_pairs": 23,
+    "recall_given_present": 0.783
+   },
+   "latin-ext": {
+    "present_pairs": 21,
+    "recall_given_present": 0.905
+   }
+  },
+  "text_len": {
+   ">=2k": {
+    "present_pairs": 199,
+    "recall_given_present": 0.95
+   },
+   "200-2k": {
+    "present_pairs": 93,
+    "recall_given_present": 0.892
+   },
+   "<200": {
+    "present_pairs": 86,
+    "recall_given_present": 0.779
+   }
+  },
+  "site": {
+   "other": {
+    "present_pairs": 301,
+    "recall_given_present": 0.9
+   },
+   "www.youtube.com": {
+    "present_pairs": 44,
+    "recall_given_present": 0.909
+   },
+   "en.wikipedia.org": {
+    "present_pairs": 33,
+    "recall_given_present": 0.848
+   }
+  },
+  "tag": {
+   "random": {
+    "present_pairs": 201,
+    "recall_given_present": 0.9
+   },
+   "head": {
+    "present_pairs": 166,
+    "recall_given_present": 0.892
+   },
+   "head+random": {
+    "present_pairs": 11,
+    "recall_given_present": 0.909
+   }
+  }
+ },
+ "icu_misses": [
+  {
+   "keyword": "dia do professor",
+   "url": "https://en.wikipedia.org/wiki/Defense_Intelligence_Agency",
+   "text_len": 64171,
+   "top1": {
+    "url": "https://eesc.usp.br/comunicacao-admin/?p=19366",
+    "title": "Programa WASH concede bolsas de Pré-Iniciação Científica – EESC-USP / Comunicação"
+   }
+  },
+  {
+   "keyword": "seedorf",
+   "url": "https://www.transfermarkt.us/clarence-seedorf/profil/spieler/4168",
+   "text_len": 0,
+   "top1": {
+    "url": "https://de.wikipedia.org/wiki/Enrico_Caruso",
+    "title": "Enrico Caruso – Wikipedia"
+   }
+  },
+  {
+   "keyword": "manifestation 17 octobre 2026",
+   "url": "https://www.youtube.com/watch?v=ucyRLhhpEck",
+   "text_len": 49,
+   "top1": {
+    "url": "https://www.humanite.fr/social-et-economie/-/hollande-prudent",
+    "title": "Hollande prudent - L'Humanité"
+   }
+  },
+  {
+   "keyword": "serie a",
+   "url": "https://www.foxsports.com/soccer/serie-a/teams",
+   "text_len": 1371,
+   "top1": {
+    "url": "https://www.programme-tv.net/programme/series-tv/r2409-pacific-homicide/saisons/2/",
+    "title": "Saison 2 de Pacific homicide (2003) | Télé-Loisirs"
+   }
+  },
+  {
+   "keyword": "mls",
+   "url": "https://www.mlssoccer.com/standings/2026/conference",
+   "text_len": 286,
+   "top1": {
+    "url": "https://www.tudn.com/futbol/mls/minnesota-united-entrenador-adrian-heath-pueden-dejar-a-carlos-vela-y-chicharito-hernandez-aqui-si-quieren",
+    "title": "Minnesota United: \"Pueden dejar a Carlos Vela y CH14 aquí, si quieren\" | TUDN MLS | TUDN"
+   }
+  },
+  {
+   "keyword": "cpi",
+   "url": "https://www.bls.gov/charts/consumer-price-index/consumer-price-index-by-category-line-chart.htm",
+   "text_len": 25599,
+   "top1": {
+    "url": "https://paraibaja.com.br/cpi-da-telefonia-confirma-investimentos-na-pb-nesta-terca/",
+    "title": "CPI da telefonia confirma investimentos na PB nesta terça | Paraíba Já"
+   }
+  },
+  {
+   "keyword": "fenerbahce",
+   "url": "https://www.transfermarkt.com/fenerbahce/startseite/verein/36",
+   "text_len": 0,
+   "top1": {
+    "url": "http://www.jeunesfooteux.com/Mercato-Bayern-Munich-forcing-de-Fenerbahce-pour-Arjen-Robben_a31652.html",
+    "title": "Mercato Bayern Munich : forcing de Fenerbahçe pour Arjen Robben - Jeunesfooteux"
+   }
+  },
+  {
+   "keyword": "londres",
+   "url": "https://www.tripadvisor.com/Tourism-g186338-London_England-Vacations.html",
+   "text_len": 23269,
+   "top1": {
+    "url": "https://www.lessentiel.lu/fr/story/un-incendie-ravage-un-immeuble-a-londres-224743823284",
+    "title": "19 étages – Un incendie ravage un immeuble à Londres - L'essentiel"
+   }
+  },
+  {
+   "keyword": "celtic",
+   "url": "https://www.nba.com/celtics/roster",
+   "text_len": 21,
+   "top1": {
+    "url": "https://liveticker.morgenpost.de/fussball/sco-premier-league/se38521/2021-championship/statistik-scorer/",
+    "title": "Assists, Tore und Punkte: Die besten Fußballspieler der Premiership"
+   }
+  },
+  {
+   "keyword": "島崎和歌子",
+   "url": "https://fod.fujitv.co.jp/person/W93-1430",
+   "text_len": 0,
+   "top1": {
+    "url": "https://www1.targma.jp/urakenplus/2019/01/10/post25743/",
+    "title": "浦研的日日是好日-『フランクフルトへ』2019.01.10 : 浦研プラス -島崎英純＋福田正博ウエブマガジン"
+   }
+  },
+  {
+   "keyword": "man city media rule breach",
+   "url": "https://www.newadvent.org/cathen/09580c.htm",
+   "text_len": 19169,
+   "top1": {
+    "url": "https://turnto10.com/weather/weather-blog/lingering-rain-showers-on-thursday-drier-in-time-for-the-weekend-rhode-island-massachusetts",
+    "title": "Lingering rain showers on Thursday, drier in time for the weekend"
+   }
+  },
+  {
+   "keyword": "alexander nübel",
+   "url": "https://www.transfermarkt.us/alexander-nubel/profil/spieler/195778",
+   "text_len": 0,
+   "top1": {
+    "url": "https://www.sport1.de/news/fussball/bundesliga/2020/06/fc-schalke-04-plant-mit-david-wagner-die-zukunft-warum-das-ein-fehler-ist",
+    "title": "S04-Bekenntnis zu Wagner ein Fehler"
+   }
+  },
+  {
+   "keyword": "liverpool – man city",
+   "url": "https://www.mancity.com/citytv/mens/liverpool-0-3-city-brief-highlights-63927338",
+   "text_len": 920,
+   "top1": {
+    "url": "https://www.youtube.com/watch?v=E-Rr8TvJSC4",
+    "title": "Key Highlights: Liverpool 0-3 Man City | 10 men Reds defeated - YouTube"
+   }
+  },
+  {
+   "keyword": "manchester united x spurs",
+   "url": "https://www.flashscore.com/match/football/manchester-united-ppjDR086/tottenham-UDg08Ohm/",
+   "text_len": 1384,
+   "top1": {
+    "url": "https://thepeoplesperson.com/2017/08/23/tottenham-hotspur-name-their-price-for-manchester-united-target-danny-rose-report-187951/",
+    "title": "Tottenham Hotspur name their price for Manchester United target Danny Rose - report - Man United News And Transfer News | The Peoples Person"
+   }
+  },
+  {
+   "keyword": "liverpool – manchester city",
+   "url": "https://www.mancity.com/citytv/mens/liverpool-0-3-city-brief-highlights-63927338",
+   "text_len": 920,
+   "top1": {
+    "url": "https://sportresultate.watson.ch/fussball/england-premier-league/ma9234694/brighton--hove-albion_crystal-palace/liveticker/",
+    "title": "Brighton & Hove Albion gegen Crystal Palace | 14.01.2022"
+   }
+  },
+  {
+   "keyword": "aéroport",
+   "url": "https://www.dfwairport.com/",
+   "text_len": 8674,
+   "top1": {
+    "url": "https://tw.trip.com/trains/france/route/aeroport-roissy-cdg-to-paris-gare-du-nord/",
+    "title": "從Aeroport Roissy Cdg至巴黎北站的火車票價最低 TWD2,344.00 起｜TGV INOUI (SNCF 列車)"
+   }
+  },
+  {
+   "keyword": "tornade",
+   "url": "https://www.oed.com/dictionary/tornade_n",
+   "text_len": 1493,
+   "top1": {
+    "url": "https://junior.universalis.fr/classification/sciences-de-la-vie-et-de-la-terre-18000/planete-terre-histoire-et-structure-18001/planete-terre-18003/risques-et-catastrophes-naturelles-18014",
+    "title": "Risques et catastrophes naturelles - Classification thématique - Encyclopædia Universalis Junior"
+   }
+  },
+  {
+   "keyword": "lewis koumas",
+   "url": "https://www.bcfc.com/pages/en/media-article/blues-complete-loan-signing-of-lewis-koumas",
+   "text_len": 0,
+   "top1": {
+    "url": "https://www.jacksonlewis.com/locations/nashville",
+    "title": "Nashville - Jackson Lewis"
+   }
+  },
+  {
+   "keyword": "middlesbrough vs wolves",
+   "url": "https://en.wikipedia.org/wiki/Middlesbrough_F.C.",
+   "text_len": 61647,
+   "top1": {
+    "url": "https://www.dazn.com/es-es/news/f%C3%BAtbol/tottenham-vs-wolves-fecha-hora-canal-tv-donde-ver-online-premier-league-espana/14l8gbz13h7fh1j6bknxdz3m5x",
+    "title": "Tottenham vs Wolves: fecha, hora, canal, TV y dónde ver online la Premier League en España | DAZN News España"
+   }
+  },
+  {
+   "keyword": "संजय राउत",
+   "url": "https://en.wikipedia.org/wiki/Sanjay_Raut",
+   "text_len": 6277,
+   "top1": {
+    "url": "https://www.jansatta.com/national/thats-how-we-speak-in-marathi-i-have-full-knowledge-of-the-language-sanjay-raut/4582880/",
+    "title": "'क्या फूलों की बरसात कर दें', गाली देने पर संजय राउत को नहीं कोई पछतावा | Sanjay Raut First Statement After Abusive Language | Jansatta"
+   }
+  },
+  {
+   "keyword": "روما ضد الريال",
+   "url": "https://www.tod.tv/ar/sports/football/uefa-champions-league/league-stage/roma-vs-real-madrid-5061834",
+   "text_len": 124,
+   "top1": {
+    "url": "https://al-ain.com/article/iranian-riyal-collapsing-lowest-dollar-9-months",
+    "title": "الريال الإيراني يسجل أكبر انهيار أمام الدولار منذ 9 شهور"
+   }
+  },
+  {
+   "keyword": "मध्य प्रदेश उच्च न्यायालय",
+   "url": "https://en.wikipedia.org/wiki/Madhya_Pradesh_High_Court",
+   "text_len": 22173,
+   "top1": {
+    "url": "https://panchjanya.com/2023/06/08/283390/bharat/case-related-to-conversion-come-in-azamgarh-uttar-pradesh/",
+    "title": "आजमगढ़ : मंदिर में ग्रामीण कर रहे थे पूजा, गांव की महिला पहुंची ईसाइयत का करने लगी प्रचार, 7 के खिलाफ केस दर्ज"
+   }
+  },
+  {
+   "keyword": "aktie",
+   "url": null,
+   "text_len": 0,
+   "top1": {
+    "url": "https://www.ad-hoc-news.de/themen/Totvs",
+    "title": "THEMA TOTVS"
+   }
+  },
+  {
+   "keyword": "television",
+   "url": null,
+   "text_len": 0,
+   "top1": {
+    "url": "https://grokipedia.com/page/Roberto_Naar",
+    "title": "Roberto Naar — Grokipedia"
+   }
+  },
+  {
+   "keyword": "lethal injection",
+   "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC1124498/",
+   "text_len": 131,
+   "top1": {
+    "url": "https://fox11online.com/news/nation-world/gov-bill-lee-gary-sutton-execution-reprieve-2027-tennessee",
+    "title": "Governor grants Gary Sutton, next on Tennessee's death row, reprieve until Oct. 7, 2027"
+   }
+  },
+  {
+   "keyword": "林茨 對 利物浦",
+   "url": "https://www.youtube.com/watch?v=LFrfIFhGdrQ&vl=te",
+   "text_len": 49,
+   "top1": {
+    "url": "http://news.7m.com.cn/news/20240409/649325.shtml",
+    "title": "萨拉赫:克洛普和我解释了离任原因 那是他的生活 - 7M足球新闻"
+   }
+  },
+  {
+   "keyword": "艾司摩爾",
+   "url": "https://www.asml.com/en",
+   "text_len": 1368,
+   "top1": {
+    "url": "https://www.rfa.org/cantonese/world/2025/06/24/china-chips-matebook/",
+    "title": "美國出口管制奏效 華為MateBook Fold搭載舊版本晶片 – RFA 自由亞洲電台粵語部"
+   }
+  },
+  {
+   "keyword": "liverpool match",
+   "url": "https://www.mancity.com/citytv/mens/liverpool-0-3-city-brief-highlights-63927338",
+   "text_len": 920,
+   "top1": {
+    "url": "https://www.sportsmole.co.uk/football/fa-cup/exeter-city-vs-liverpool_game_50803.html",
+    "title": "Exeter City vs Liverpool - FA Cup - January 8, 2016 - Match Guide, Data Analysis, Standings - Football - Sports Mole"
+   }
+  },
+  {
+   "keyword": "tv programme",
+   "url": "https://www.programme-television.org/",
+   "text_len": 4093,
+   "top1": {
+    "url": "https://tv.parismatch.be/cesoir-tele",
+    "title": "- programme TV Belgique ce soir programme TELE Belgique ce soir"
+   }
+  },
+  {
+   "keyword": "times of india",
+   "url": null,
+   "text_len": 0,
+   "top1": {
+    "url": "https://www.youtube.com/timesofindia",
+    "title": "Times Of India - YouTube"
+   }
+  },
+  {
+   "keyword": "runway",
+   "url": "https://app.runwayml.com/",
+   "text_len": 0,
+   "top1": {
+    "url": "https://www.vogue.com./fashion-shows/russia-fall-2016/ksenia-seraya/slideshow/collection",
+    "title": "KseniaSeraya Russia Fall 2016 Fashion Show | Vogue"
+   }
+  },
+  {
+   "keyword": "ucl men",
+   "url": "https://www.skysports.com/champions-league-scores-fixtures",
+   "text_len": 173,
+   "top1": {
+    "url": "https://fanshop.slavia.cz/en/p3469-t-shirt-slavia-x-ucl-anthem-unisex-blue?_fid=vdiz",
+    "title": "T-Shirt SLAVIA X UCL Anthem Unisex Blue"
+   }
+  },
+  {
+   "keyword": "senat",
+   "url": "https://en.wikipedia.org/wiki/United_States_Senate",
+   "text_len": 78962,
+   "top1": {
+    "url": "https://www.lejsl.com/videos/scandale-du-periscolaire-a-paris-anne-hidalgo-s-est-expliquee-devant-le-senat-3klzkfq?playlist=qls5zz",
+    "title": "Scandale du périscolaire à Paris : Anne Hidalgo s'est expliquée devant le Sénat"
+   }
+  },
+  {
+   "keyword": "อาร์เซนอล พบ ลีดส์",
+   "url": "https://monomax-assets.mvp.fan/games/6a95d0290c4717e98025658a.html",
+   "text_len": 0,
+   "top1": {
+    "url": "https://www.sanook.com/sport/1635179/",
+    "title": "ดูบอลสด พรีเมียร์ลีก เวสต์แฮม พบ อาร์เซนอล คืนนี้ เวลา 22:30 น."
+   }
+  },
+  {
+   "keyword": "อาร์เซนอล พบ ลีดส์",
+   "url": "https://www.mancity.com/citytv/mens/pep-premier-league-press-conference-city-v-arsenal-63912020",
+   "text_len": 1625,
+   "top1": {
+    "url": "https://www.sanook.com/sport/1635179/",
+    "title": "ดูบอลสด พรีเมียร์ลีก เวสต์แฮม พบ อาร์เซนอล คืนนี้ เวลา 22:30 น."
+   }
+  },
+  {
+   "keyword": "台新銀行",
+   "url": "https://richart.tw/WebBank/users/login?lang=zh-tw",
+   "text_len": 0,
+   "top1": {
+    "url": "https://ec.ltn.com.tw/article/breakingnews/5497397",
+    "title": "前五月刷出2.09兆同期新高 母親節、連假及報稅帶動成長 - 自由財經"
+   }
+  },
+  {
+   "keyword": "red",
+   "url": "https://www.youtube.com/watch?v=Ru8LG-_HGd4",
+   "text_len": 49,
+   "top1": {
+    "url": "https://nhentai.jp.net/g/201411/115",
+    "title": "Page 115 of 156 – (SUPER25) [monica (Azuma)] RED x RED (Fate/stay night) [Chinese] | nhentai"
+   }
+  },
+  {
+   "keyword": "dump truck",
+   "url": "https://www.youtube.com/@PeachAndDrumsy",
+   "text_len": 72,
+   "top1": {
+    "url": "https://fox11online.com/topic/William%20Heritage%20Winery",
+    "title": "Green Bay Topic William Heritage Winery | News, Weather, Sports, Breaking News"
+   }
+  },
+  {
+   "keyword": "vocm news",
+   "url": "https://player.vocm.com/",
+   "text_len": 303,
+   "top1": {
+    "url": "https://vocm.com/news/page/6/",
+    "title": "Local News | VOCM"
+   }
+  }
+ ]
+}

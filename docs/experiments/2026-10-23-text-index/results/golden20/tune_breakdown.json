@@ -1,0 +1,224 @@
+{
+ "runs": {
+  "baseline": "icu:comb_t2",
+  "final": "url:best_t2+url"
+ },
+ "breakdown": {
+  "text_len": {
+   ">=2k": {
+    "pairs": 5556,
+    "baseline": 0.834,
+    "final": 0.863
+   },
+   "200-2k": {
+    "pairs": 2826,
+    "baseline": 0.785,
+    "final": 0.824
+   },
+   "<200": {
+    "pairs": 2320,
+    "baseline": 0.594,
+    "final": 0.68
+   }
+  },
+  "site": {
+   "other": {
+    "pairs": 8641,
+    "baseline": 0.773,
+    "final": 0.816
+   },
+   "www.youtube.com": {
+    "pairs": 1178,
+    "baseline": 0.701,
+    "final": 0.739
+   },
+   "en.wikipedia.org": {
+    "pairs": 883,
+    "baseline": 0.818,
+    "final": 0.881
+   }
+  },
+  "tag": {
+   "random": {
+    "pairs": 5321,
+    "baseline": 0.805,
+    "final": 0.84
+   },
+   "head": {
+    "pairs": 5100,
+    "baseline": 0.734,
+    "final": 0.787
+   },
+   "head+random": {
+    "pairs": 281,
+    "baseline": 0.73,
+    "final": 0.769
+   }
+  },
+  "all": {
+   "all": {
+    "pairs": 10702,
+    "baseline": 0.769,
+    "final": 0.813
+   }
+  }
+ },
+ "fixed": 782,
+ "broken": 313,
+ "examples": {
+  "fixed": [
+   {
+    "keyword": "brewers vs dodgers",
+    "url": "https://www.espn.com/mlb/game/_/gameId/401908031/dodgers-brewers",
+    "text_len": 1330
+   },
+   {
+    "keyword": "liverpool vs man city",
+    "url": "https://www.youtube.com/watch?v=E-Rr8TvJSC4",
+    "text_len": 49
+   },
+   {
+    "keyword": "liverpool vs man city",
+    "url": "https://www.liverpoolfc.com/news/watch-match-action-liverpool-man-city-premier-league",
+    "text_len": 1457
+   },
+   {
+    "keyword": "estudiantes x flamengo",
+    "url": "https://www.espn.com/soccer/match/_/gameId/401912523",
+    "text_len": 4438
+   },
+   {
+    "keyword": "estudiantes x flamengo",
+    "url": "https://www.cnnbrasil.com.br/esportes/futebol/futebol-internacional/libertadores-da-america/flamengo-segura-pressao-do-estudiantes-na-ida-da-semifinal-da-libertadores/",
+    "text_len": 3597
+   },
+   {
+    "keyword": "uefa champions league",
+    "url": "https://gaming.uefa.com/",
+    "text_len": 798
+   },
+   {
+    "keyword": "uefa champions league",
+    "url": "https://en.wikipedia.org/wiki/UEFA_Champions_League",
+    "text_len": 64258
+   },
+   {
+    "keyword": "uefa champions league",
+    "url": "https://www.uefa.com/uefachampionsleague/",
+    "text_len": 4431
+   },
+   {
+    "keyword": "champions league",
+    "url": "https://www.uefa.com/uefachampionsleague/",
+    "text_len": 4431
+   },
+   {
+    "keyword": "champions league",
+    "url": "https://en.wikipedia.org/wiki/UEFA_Champions_League",
+    "text_len": 64258
+   },
+   {
+    "keyword": "bills vs rams",
+    "url": "https://www.espn.com/nfl/recap/_/gameId/401872994",
+    "text_len": 5186
+   },
+   {
+    "keyword": "bills vs rams",
+    "url": "https://www.nfl.com/videos/bills-vs-rams-highlights-week-5",
+    "text_len": 4858
+   },
+   {
+    "keyword": "49ers vs seahawks",
+    "url": "https://www.nfl.com/games/seahawks-at-49ers-2025-reg-18",
+    "text_len": 473
+   },
+   {
+    "keyword": "ravens vs falcons",
+    "url": "https://www.thefalcoholic.com/atlanta-falcons-scores-results/97161/falcons-vs-ravens-recap-back-on-the-bumpy-road-again-michael-penix-jr-drake-london-jake-matthews",
+    "text_len": 19552
+   },
+   {
+    "keyword": "eagles",
+    "url": "https://es.wikipedia.org/wiki/Eagles",
+    "text_len": 32395
+   }
+  ],
+  "broken": [
+   {
+    "keyword": "jewel andrew",
+    "url": "https://www.youtube.com/watch?v=bW0WlLye84k",
+    "text_len": 49
+   },
+   {
+    "keyword": "jewel andrew",
+    "url": "https://www.youtube.com/watch?v=Z5lFuGhXHTQ",
+    "text_len": 49
+   },
+   {
+    "keyword": "texas vs oklahoma",
+    "url": "https://en.wikipedia.org/wiki/Red_River_Rivalry",
+    "text_len": 37618
+   },
+   {
+    "keyword": "william chapman yorkshire",
+    "url": "https://www.bbc.com/news/articles/ck054nvzr676o",
+    "text_len": 5605
+   },
+   {
+    "keyword": "roma x real madrid",
+    "url": "https://sports.yahoo.com/articles/ucl-roma-3-4-real-210000074.html",
+    "text_len": 401
+   },
+   {
+    "keyword": "flamengo x fluminense",
+    "url": "https://pt.wikipedia.org/wiki/Fla-Flu",
+    "text_len": 114375
+   },
+   {
+    "keyword": "classificações de sociedade esportiva palmeiras x corinthians",
+    "url": "https://www.cnnbrasil.com.br/esportes/brasileirao/palmeiras-da-show-humilha-corinthians-e-mergulha-rival-na-crise/",
+    "text_len": 3323
+   },
+   {
+    "keyword": "manchester city – paris-sg",
+    "url": "https://www.bbc.com/sport/football/videos/cqp8gn9x801po",
+    "text_len": 371
+   },
+   {
+    "keyword": "roma vs real madrid",
+    "url": "https://www.espn.com/soccer/match/_/gameId/439176/real-madrid-as-roma",
+    "text_len": 498
+   },
+   {
+    "keyword": "man utd vs spurs",
+    "url": "https://www.espn.com/soccer/story/_/id/50147983/man-united-tottenham-live-premier-league-latest-updates-commentary-score-result",
+    "text_len": 880
+   },
+   {
+    "keyword": "eagles vs jaguars",
+    "url": "https://www.nfl.com/videos/can-t-miss-play-51-yard-td-first-score-of-eagles-jags-game-comes-on-parker-washington-s-speedy-sprint",
+    "text_len": 6293
+   },
+   {
+    "keyword": "social security increase 2027",
+    "url": "https://seniorsleague.org/cola-watch/",
+    "text_len": 7966
+   },
+   {
+    "keyword": "william chapman tiger",
+    "url": "https://www.bbc.com/news/articles/ck054nvzr676o",
+    "text_len": 5605
+   },
+   {
+    "keyword": "sri lanka vs pakistan",
+    "url": "https://www.youtube.com/watch?v=387SDQtBDb8",
+    "text_len": 49
+   },
+   {
+    "keyword": "sri lanka vs pakistan",
+    "url": "https://www.youtube.com/watch?v=E8ZE5tspVOQ",
+    "text_len": 49
+   }
+  ]
+ }
+}

@@ -1,0 +1,532 @@
+{
+ "variants": {
+  "icu": {
+   "docs": 54370,
+   "present_pairs": 10702,
+   "found_pairs": 8231,
+   "recall_given_present": 0.7691085778359186,
+   "head": 0.7338784612525553,
+   "random": 0.8009639414494824,
+   "ndcg": 0.6094898765688478,
+   "zero_hit_rate": 0.000513347022587269
+  },
+  "icu_bg0": {
+   "docs": 10345,
+   "present_pairs": 10702,
+   "found_pairs": 8626,
+   "recall_given_present": 0.8060175668099421,
+   "head": 0.7740196989407173,
+   "random": 0.8359514459121742,
+   "ndcg": 0.6415027684808866,
+   "zero_hit_rate": 0.002566735112936345,
+   "delta_vs_icu": 0.036908988974023504,
+   "delta_ci95": [
+    0.03153276072041816,
+    0.04261536431011386
+   ]
+  },
+  "icu_bg11k": {
+   "docs": 20614,
+   "present_pairs": 10702,
+   "found_pairs": 8536,
+   "recall_given_present": 0.7976079237525696,
+   "head": 0.7636127113919345,
+   "random": 0.8297036772581221,
+   "ndcg": 0.634088045807682,
+   "zero_hit_rate": 0.002053388090349076,
+   "delta_vs_icu": 0.028499345916651042,
+   "delta_ci95": [
+    0.02442426654204478,
+    0.032870965690570915
+   ]
+  },
+  "icu_bg22k": {
+   "docs": 32320,
+   "present_pairs": 10702,
+   "found_pairs": 8400,
+   "recall_given_present": 0.7849000186880957,
+   "head": 0.7502322988292139,
+   "random": 0.8168511245983577,
+   "ndcg": 0.6230212263926788,
+   "zero_hit_rate": 0.001540041067761807,
+   "delta_vs_icu": 0.015791440852177097,
+   "delta_ci95": [
+    0.012819274599424973,
+    0.018903331188845185
+   ]
+  },
+  "standard": {
+   "docs": 54370,
+   "present_pairs": 10702,
+   "found_pairs": 8083,
+   "recall_given_present": 0.7552793870304616,
+   "head": 0.7203122096264635,
+   "random": 0.788111388789718,
+   "ndcg": 0.6002916423902116,
+   "zero_hit_rate": 0.002053388090349076,
+   "delta_vs_icu": -0.01382919080545697,
+   "delta_ci95": [
+    -0.017596216326053026,
+    -0.01029258328280384
+   ]
+  },
+  "icu_most": {
+   "docs": 54370,
+   "present_pairs": 10702,
+   "found_pairs": 8347,
+   "recall_given_present": 0.7799476733320875,
+   "head": 0.7502322988292139,
+   "random": 0.8079257408068546,
+   "ndcg": 0.6240512855029062,
+   "zero_hit_rate": 0.000513347022587269,
+   "delta_vs_icu": 0.010839095496168905,
+   "delta_ci95": [
+    0.004167361282586784,
+    0.017713815107863344
+   ]
+  },
+  "icu_en_most": {
+   "docs": 54370,
+   "present_pairs": 10702,
+   "found_pairs": 8406,
+   "recall_given_present": 0.7854606615585872,
+   "head": 0.7576658613640588,
+   "random": 0.8113173866476259,
+   "ndcg": 0.6281405195859835,
+   "zero_hit_rate": 0.000513347022587269,
+   "delta_vs_icu": 0.01635208372266861,
+   "delta_ci95": [
+    0.009325688776421023,
+    0.023382588989205866
+   ]
+  }
+ },
+ "icu_breakdown": {
+  "script": {
+   "ascii": {
+    "present_pairs": 7637,
+    "recall_given_present": 0.765
+   },
+   "han": {
+    "present_pairs": 1102,
+    "recall_given_present": 0.808
+   },
+   "latin-ext": {
+    "present_pairs": 734,
+    "recall_given_present": 0.774
+   },
+   "kana": {
+    "present_pairs": 658,
+    "recall_given_present": 0.802
+   },
+   "other": {
+    "present_pairs": 571,
+    "recall_given_present": 0.706
+   }
+  },
+  "text_len": {
+   ">=2k": {
+    "present_pairs": 5556,
+    "recall_given_present": 0.834
+   },
+   "200-2k": {
+    "present_pairs": 2826,
+    "recall_given_present": 0.785
+   },
+   "<200": {
+    "present_pairs": 2320,
+    "recall_given_present": 0.594
+   }
+  },
+  "site": {
+   "other": {
+    "present_pairs": 8641,
+    "recall_given_present": 0.773
+   },
+   "www.youtube.com": {
+    "present_pairs": 1178,
+    "recall_given_present": 0.701
+   },
+   "en.wikipedia.org": {
+    "present_pairs": 883,
+    "recall_given_present": 0.818
+   }
+  },
+  "tag": {
+   "random": {
+    "present_pairs": 5321,
+    "recall_given_present": 0.805
+   },
+   "head": {
+    "present_pairs": 5100,
+    "recall_given_present": 0.734
+   },
+   "head+random": {
+    "present_pairs": 281,
+    "recall_given_present": 0.73
+   }
+  }
+ },
+ "icu_misses": [
+  {
+   "keyword": "brewers vs dodgers",
+   "url": "https://www.espn.com/mlb/game/_/gameId/401908031/dodgers-brewers",
+   "text_len": 1330,
+   "top1": {
+    "url": "https://www.foxsports.com/watch/fmc-mqv2dod5xnzdze1i",
+    "title": "Brewers Advance to World Series! 🚨 Jeter, Papi & A-Rod Break Down HISTORIC Sweep vs Dodgers | FOX Sports"
+   }
+  },
+  {
+   "keyword": "liverpool vs man city",
+   "url": "https://www.liverpoolfc.com/news/watch-match-action-liverpool-man-city-premier-league",
+   "text_len": 1457,
+   "top1": {
+    "url": "https://www.espn.com/soccer/story/_/id/50158413/liverpool-man-city-premier-league-result-score-recap-erling-haaland-ryan-gravenberch-jeremy-doku-rayan-cherki",
+    "title": "Liverpool 0-3 Man City: Visitors block out the noise to beat 10-man hosts - ESPN"
+   }
+  },
+  {
+   "keyword": "liverpool vs man city",
+   "url": "https://www.youtube.com/watch?v=E-Rr8TvJSC4",
+   "text_len": 49,
+   "top1": {
+    "url": "https://www.espn.com/soccer/story/_/id/50158413/liverpool-man-city-premier-league-result-score-recap-erling-haaland-ryan-gravenberch-jeremy-doku-rayan-cherki",
+    "title": "Liverpool 0-3 Man City: Visitors block out the noise to beat 10-man hosts - ESPN"
+   }
+  },
+  {
+   "keyword": "liverpool vs man city",
+   "url": "https://www.hotstar.com/in/sports/football/liverpool-vs-manchester-city-extended-highlights/1540082575/video/highlights/watch",
+   "text_len": 110,
+   "top1": {
+    "url": "https://www.espn.com/soccer/story/_/id/50158413/liverpool-man-city-premier-league-result-score-recap-erling-haaland-ryan-gravenberch-jeremy-doku-rayan-cherki",
+    "title": "Liverpool 0-3 Man City: Visitors block out the noise to beat 10-man hosts - ESPN"
+   }
+  },
+  {
+   "keyword": "liverpool vs man city",
+   "url": "https://www.bbc.com/sport/football/videos/c6vgy2ll1zypo",
+   "text_len": 492,
+   "top1": {
+    "url": "https://www.espn.com/soccer/story/_/id/50158413/liverpool-man-city-premier-league-result-score-recap-erling-haaland-ryan-gravenberch-jeremy-doku-rayan-cherki",
+    "title": "Liverpool 0-3 Man City: Visitors block out the noise to beat 10-man hosts - ESPN"
+   }
+  },
+  {
+   "keyword": "liverpool vs man city",
+   "url": "https://www.youtube.com/watch?v=3uoy7oVLriY",
+   "text_len": 49,
+   "top1": {
+    "url": "https://www.espn.com/soccer/story/_/id/50158413/liverpool-man-city-premier-league-result-score-recap-erling-haaland-ryan-gravenberch-jeremy-doku-rayan-cherki",
+    "title": "Liverpool 0-3 Man City: Visitors block out the noise to beat 10-man hosts - ESPN"
+   }
+  },
+  {
+   "keyword": "भारत मौसम विज्ञान विभाग",
+   "url": "https://mausam.imd.gov.in/hindinew/",
+   "text_len": 0,
+   "top1": {
+    "url": "https://hi.wikipedia.org/wiki/%E0%A4%AD%E0%A4%BE%E0%A4%B0%E0%A4%A4_%E0%A4%AE%E0%A5%8C%E0%A4%B8%E0%A4%AE_%E0%A4%B5%E0%A4%BF%E0%A4%9C%E0%A5%8D%E0%A4%9E%E0%A4%BE%E0%A4%A8_%E0%A4%B5%E0%A4%BF%E0%A4%AD%E0%A4%BE%E0%A4%97",
+    "title": "भारत मौसम विज्ञान विभाग - विकिपीडिया"
+   }
+  },
+  {
+   "keyword": "estudiantes x flamengo",
+   "url": "https://www.cnnbrasil.com.br/esportes/futebol/futebol-internacional/libertadores-da-america/flamengo-segura-pressao-do-estudiantes-na-ida-da-semifinal-da-libertadores/",
+   "text_len": 3597,
+   "top1": {
+    "url": "https://www.lance.com.br/flamengo/ao-vivo-flamengo-visita-estudiantes-pelo-primeiro-jogo-da-semi-da-libertadores.html",
+    "title": "AO VIVO: Flamengo visita Estudiantes pelo primeiro jogo da semi da Libertadores"
+   }
+  },
+  {
+   "keyword": "estudiantes x flamengo",
+   "url": "https://www.espn.com/soccer/match/_/gameId/401912523",
+   "text_len": 4438,
+   "top1": {
+    "url": "https://www.lance.com.br/flamengo/ao-vivo-flamengo-visita-estudiantes-pelo-primeiro-jogo-da-semi-da-libertadores.html",
+    "title": "AO VIVO: Flamengo visita Estudiantes pelo primeiro jogo da semi da Libertadores"
+   }
+  },
+  {
+   "keyword": "uefa champions league",
+   "url": "https://gaming.uefa.com/",
+   "text_len": 798,
+   "top1": {
+    "url": "https://www.espn.com/soccer/team/_/id/494/slavia_prague",
+    "title": "Slavia Prague Scores, Stats and Highlights - ESPN"
+   }
+  },
+  {
+   "keyword": "uefa champions league",
+   "url": "https://en.wikipedia.org/wiki/UEFA_Champions_League",
+   "text_len": 64258,
+   "top1": {
+    "url": "https://www.espn.com/soccer/team/_/id/494/slavia_prague",
+    "title": "Slavia Prague Scores, Stats and Highlights - ESPN"
+   }
+  },
+  {
+   "keyword": "uefa champions league",
+   "url": "https://www.espn.com/soccer/standings/_/league/uefa.champions",
+   "text_len": 1490,
+   "top1": {
+    "url": "https://www.espn.com/soccer/team/_/id/494/slavia_prague",
+    "title": "Slavia Prague Scores, Stats and Highlights - ESPN"
+   }
+  },
+  {
+   "keyword": "uefa champions league",
+   "url": "https://www.uefa.com/uefachampionsleague/",
+   "text_len": 4431,
+   "top1": {
+    "url": "https://www.espn.com/soccer/team/_/id/494/slavia_prague",
+    "title": "Slavia Prague Scores, Stats and Highlights - ESPN"
+   }
+  },
+  {
+   "keyword": "ind vs wi",
+   "url": "https://www.hotstar.com/in/sports/cricket/ind-fall-of-wickets-vs-wi-in-4th-t20i/1271715544/watch",
+   "text_len": 110,
+   "top1": {
+    "url": "https://scopalabor.vercel.app/post/ind-vs-wi-live-streaming-score/",
+    "title": "Ind Vs Wi Live Streaming Score - Scopalabor"
+   }
+  },
+  {
+   "keyword": "ind vs wi",
+   "url": "https://www.icc-cricket.com/tournaments/mens-t20-world-cup-2026/matches/268125/india-vs-west-indies",
+   "text_len": 2094,
+   "top1": {
+    "url": "https://scopalabor.vercel.app/post/ind-vs-wi-live-streaming-score/",
+    "title": "Ind Vs Wi Live Streaming Score - Scopalabor"
+   }
+  },
+  {
+   "keyword": "champions league",
+   "url": "https://gaming.uefa.com/",
+   "text_len": 798,
+   "top1": {
+    "url": "https://www.espn.com/soccer/team/_/id/494/slavia_prague",
+    "title": "Slavia Prague Scores, Stats and Highlights - ESPN"
+   }
+  },
+  {
+   "keyword": "champions league",
+   "url": "https://en.wikipedia.org/wiki/List_of_European_Cup_and_UEFA_Champions_League_finals",
+   "text_len": 19313,
+   "top1": {
+    "url": "https://www.espn.com/soccer/team/_/id/494/slavia_prague",
+    "title": "Slavia Prague Scores, Stats and Highlights - ESPN"
+   }
+  },
+  {
+   "keyword": "champions league",
+   "url": "https://www.uefa.com/uefachampionsleague/",
+   "text_len": 4431,
+   "top1": {
+    "url": "https://www.espn.com/soccer/team/_/id/494/slavia_prague",
+    "title": "Slavia Prague Scores, Stats and Highlights - ESPN"
+   }
+  },
+  {
+   "keyword": "champions league",
+   "url": "https://en.wikipedia.org/wiki/UEFA_Champions_League",
+   "text_len": 64258,
+   "top1": {
+    "url": "https://www.espn.com/soccer/team/_/id/494/slavia_prague",
+    "title": "Slavia Prague Scores, Stats and Highlights - ESPN"
+   }
+  },
+  {
+   "keyword": "champions league",
+   "url": "https://www.espn.com/soccer/schedule/_/league/uefa.champions",
+   "text_len": 785,
+   "top1": {
+    "url": "https://www.espn.com/soccer/team/_/id/494/slavia_prague",
+    "title": "Slavia Prague Scores, Stats and Highlights - ESPN"
+   }
+  },
+  {
+   "keyword": "bills vs rams",
+   "url": "https://www.espn.com/nfl/recap/_/gameId/401872994",
+   "text_len": 5186,
+   "top1": {
+    "url": "https://www.nfl.com/videos/game-highlights-bills-vs-rams-week-5",
+    "title": "Game Highlights: Buffalo Bills vs. Los Angeles Rams | Week 5"
+   }
+  },
+  {
+   "keyword": "bills vs rams",
+   "url": "https://www.nfl.com/videos/bills-vs-rams-highlights-week-5",
+   "text_len": 4858,
+   "top1": {
+    "url": "https://www.nfl.com/videos/game-highlights-bills-vs-rams-week-5",
+    "title": "Game Highlights: Buffalo Bills vs. Los Angeles Rams | Week 5"
+   }
+  },
+  {
+   "keyword": "bills vs rams",
+   "url": "https://www.therams.com/news/game-recap-rams-fall-to-bills-37-34-in-overtime-on-monday-night-football",
+   "text_len": 43867,
+   "top1": {
+    "url": "https://www.nfl.com/videos/game-highlights-bills-vs-rams-week-5",
+    "title": "Game Highlights: Buffalo Bills vs. Los Angeles Rams | Week 5"
+   }
+  },
+  {
+   "keyword": "49ers vs seahawks",
+   "url": "https://www.nfl.com/games/seahawks-at-49ers-2025-reg-18",
+   "text_len": 473,
+   "top1": {
+    "url": "https://www.nfl.com/videos/49ers-top-plays-vs-seahawks-week-5",
+    "title": "San Francisco 49ers' top plays vs. Seattle Seahawks | Week 5"
+   }
+  },
+  {
+   "keyword": "ravens vs falcons",
+   "url": "https://www.thefalcoholic.com/atlanta-falcons-scores-results/97161/falcons-vs-ravens-recap-back-on-the-bumpy-road-again-michael-penix-jr-drake-london-jake-matthews",
+   "text_len": 19552,
+   "top1": {
+    "url": "https://www.atlantafalcons.com/game-day/2026/reg-week5/falcons-vs-ravens/",
+    "title": "Falcons vs Ravens | Week 5 | October 11, 2026 | Atlanta Falcons – atlantafalcons.com"
+   }
+  },
+  {
+   "keyword": "texas vs oklahoma",
+   "url": "https://www.youtube.com/watch?v=GmjIu45FBns&xstg=CAMSBhUDzO3xHw%3D%3D",
+   "text_len": 49,
+   "top1": {
+    "url": "https://soonersports.com:443/sports/womens-basketball/roster/kiersten-johnson/17826",
+    "title": "Kiersten Johnson - 2024-25 - Women's Basketball - University of Oklahoma"
+   }
+  },
+  {
+   "keyword": "atlético-mg x torque",
+   "url": "https://www.youtube.com/watch?v=yzlDcUqo2io",
+   "text_len": 49,
+   "top1": {
+    "url": "http://pds-dev.aaos.org/ufa/video/video-atletico-mg-x-city-torque-liv-str-oeynjtw.html",
+    "title": "[TRANSMISSÃO AO VIVO] Atlético MG x City Torque AO VIVO na TV"
+   }
+  },
+  {
+   "keyword": "atlético-mg x santos",
+   "url": "https://www.youtube.com/watch?v=u-Ge3UF6hCE",
+   "text_len": 49,
+   "top1": {
+    "url": "https://www.lance.com.br/futebol-nacional/veja-gols-em-atletico-mg-e-santos-pelo-campeonato-brasileiro.html",
+    "title": "Veja gols em Atlético-MG x Santos: Borbas vira a partida com golaço"
+   }
+  },
+  {
+   "keyword": "eagles",
+   "url": "https://es.wikipedia.org/wiki/Eagles",
+   "text_len": 32395,
+   "top1": {
+    "url": "https://www.philadelphiaeagles.com/photos/",
+    "title": "Philadelphia Eagles Photos"
+   }
+  },
+  {
+   "keyword": "eagles",
+   "url": "https://www.youtube.com/shorts/2aMOGJqnP3Y",
+   "text_len": 49,
+   "top1": {
+    "url": "https://www.philadelphiaeagles.com/photos/",
+    "title": "Philadelphia Eagles Photos"
+   }
+  },
+  {
+   "keyword": "eagles",
+   "url": "https://eagles.com/pages/tour",
+   "text_len": 4,
+   "top1": {
+    "url": "https://www.philadelphiaeagles.com/photos/",
+    "title": "Philadelphia Eagles Photos"
+   }
+  },
+  {
+   "keyword": "oregon school shooting",
+   "url": "https://www.bbc.com/news/live/cw62jgzdpng2t",
+   "text_len": 10797,
+   "top1": {
+    "url": "https://en.wikipedia.org/wiki/Oregon_school_shooting",
+    "title": "Oregon school shooting - Wikipedia"
+   }
+  },
+  {
+   "keyword": "oregon school shooting",
+   "url": "https://www.opb.org/article/2026/10/16/oregon-school-shooting-bend-silver-rail/",
+   "text_len": 516,
+   "top1": {
+    "url": "https://en.wikipedia.org/wiki/Oregon_school_shooting",
+    "title": "Oregon school shooting - Wikipedia"
+   }
+  },
+  {
+   "keyword": "ドジャース 対 ブルワーズ",
+   "url": "https://baseball.yahoo.co.jp/mlb/game/2026101501/stats",
+   "text_len": 2225,
+   "top1": {
+    "url": "https://www.sportingnews.com/jp/mlb/news/20261015-mlb-post-season-dodgers-vs-brewers-live-highlight/1d4d5772a11c92d233669ec9",
+    "title": "【試合結果速報】ドジャースのお株を奪うHR攻勢でブルワーズがスネル攻略、3連勝でWS進出に王手 大谷は1安打2四死球｜試合経過・結果・ハイライト動画｜MLB ポストシーズン2026 NLCS第3戦（10.15） - スポーティングニュース"
+   }
+  },
+  {
+   "keyword": "ドジャース 対 ブルワーズ",
+   "url": "https://baseball.yahoo.co.jp/mlb/game/2026101501/top",
+   "text_len": 1326,
+   "top1": {
+    "url": "https://www.sportingnews.com/jp/mlb/news/20261015-mlb-post-season-dodgers-vs-brewers-live-highlight/1d4d5772a11c92d233669ec9",
+    "title": "【試合結果速報】ドジャースのお株を奪うHR攻勢でブルワーズがスネル攻略、3連勝でWS進出に王手 大谷は1安打2四死球｜試合経過・結果・ハイライト動画｜MLB ポストシーズン2026 NLCS第3戦（10.15） - スポーティングニュース"
+   }
+  },
+  {
+   "keyword": "ドジャース 対 ブルワーズ",
+   "url": "https://www.dazn.com/ja-JP/news/%E9%87%8E%E7%90%83/dodgers-brewers-mlb2026-20260815/9rkvc6a34ap913a3vxgtd81y1",
+   "text_len": 4906,
+   "top1": {
+    "url": "https://www.sportingnews.com/jp/mlb/news/20261015-mlb-post-season-dodgers-vs-brewers-live-highlight/1d4d5772a11c92d233669ec9",
+    "title": "【試合結果速報】ドジャースのお株を奪うHR攻勢でブルワーズがスネル攻略、3連勝でWS進出に王手 大谷は1安打2四死球｜試合経過・結果・ハイライト動画｜MLB ポストシーズン2026 NLCS第3戦（10.15） - スポーティングニュース"
+   }
+  },
+  {
+   "keyword": "ドジャース 対 ブルワーズ",
+   "url": "https://topics.smt.docomo.ne.jp/article/sdaa/sports/sdaa-sdaa.jp-article-81704",
+   "text_len": 783,
+   "top1": {
+    "url": "https://www.sportingnews.com/jp/mlb/news/20261015-mlb-post-season-dodgers-vs-brewers-live-highlight/1d4d5772a11c92d233669ec9",
+    "title": "【試合結果速報】ドジャースのお株を奪うHR攻勢でブルワーズがスネル攻略、3連勝でWS進出に王手 大谷は1安打2四死球｜試合経過・結果・ハイライト動画｜MLB ポストシーズン2026 NLCS第3戦（10.15） - スポーティングニュース"
+   }
+  },
+  {
+   "keyword": "pesquisa",
+   "url": "https://veja.abril.com.br/politica/lula-contesta-pesquisa-eles-sabem-que-eu-poderia-ter-mais/",
+   "text_len": 8776,
+   "top1": {
+    "url": "https://paranapesquisas.com.br/",
+    "title": "Paraná Pesquisas - Especialista em Opinião Pública | Paraná Pesquisas"
+   }
+  },
+  {
+   "keyword": "pesquisa",
+   "url": "https://veja.abril.com.br/economia/nova-pesquisa-quaest-economistas-alertam-para-o-fator-que-deve-definir-as-eleicoes/",
+   "text_len": 9020,
+   "top1": {
+    "url": "https://paranapesquisas.com.br/",
+    "title": "Paraná Pesquisas - Especialista em Opinião Pública | Paraná Pesquisas"
+   }
+  },
+  {
+   "keyword": "roma x real madrid",
+   "url": "https://www.youtube.com/watch?v=8Iis-XfiI6M",
+   "text_len": 49,
+   "top1": {
+    "url": "https://www.skysports.com/football/roma-vs-real-madrid/577630",
+    "title": "Form and head to head stats Roma vs Real Madrid"
+   }
+  }
+ ]
+}

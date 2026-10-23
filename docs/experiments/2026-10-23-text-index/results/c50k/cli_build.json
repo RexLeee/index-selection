@@ -1,0 +1,27 @@
+{
+  "alias": "isel-text",
+  "bytes_per_doc": 1788.8122785500136,
+  "bytes_per_text_byte": 0.43482752164463945,
+  "code_version": "dev",
+  "config_sha256": "6758c1e3e1da80dbe21464a4c4ab712c89488b662f2f765dd9c43248377bd645",
+  "deleted": [
+    "isel-text-20261023t062110032911z"
+  ],
+  "docs": 44028,
+  "docs_per_s_load": 3055.5,
+  "index": "isel-text-20261023t065638728667z",
+  "indexed": 44028,
+  "load_s": 14.41,
+  "previous": [
+    "isel-text-20261023t063913382139z"
+  ],
+  "recovery_source_pruned": true,
+  "rows": 44028,
+  "segment_bytes": 78757827,
+  "segments": 1,
+  "settings_sha256": "55a62aa74f3d8c730c2d7c2ca5c2559877492cc74792878afa500c3b124708ad",
+  "store_bytes": 78758193,
+  "text_bytes": 181124292,
+  "text_root": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/c50k/text",
+  "total_s": 32.612
+}

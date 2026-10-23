@@ -1,0 +1,64 @@
+{
+ "old": {
+  "docs": 44028,
+  "segment_bytes": 78607553,
+  "bytes_per_doc": 1785.3991323703099,
+  "bytes_per_text_byte": 0.43399784828420473,
+  "recovery_source_pruned": true
+ },
+ "new": {
+  "docs": 44028,
+  "segment_bytes": 81019112,
+  "bytes_per_doc": 1840.172435722722,
+  "bytes_per_text_byte": 0.4473122357325764,
+  "recovery_source_pruned": true
+ },
+ "added_bytes_per_doc": 54.773303352412086,
+ "ratio": 1.0306784641928748,
+ "tb_at_128m": {
+  "old": 0.22853108894339966,
+  "new": 0.2355420717725084
+ },
+ "new_freqs": {
+  "docs": 44028,
+  "segment_bytes": 44146930,
+  "bytes_per_doc": 1002.7012355773599,
+  "bytes_per_text_byte": 0.24373831644846403,
+  "recovery_source_pruned": true
+ },
+ "projection_tb": {
+  "old": {
+   "one": 0.229,
+   "peak": [
+    0.46,
+    0.87
+   ],
+   "peak_keep_prev": [
+    0.69,
+    1.1
+   ]
+  },
+  "new": {
+   "one": 0.236,
+   "peak": [
+    0.47,
+    0.9
+   ],
+   "peak_keep_prev": [
+    0.71,
+    1.13
+   ]
+  },
+  "new_freqs": {
+   "one": 0.128,
+   "peak": [
+    0.26,
+    0.57
+   ],
+   "peak_keep_prev": [
+    0.39,
+    0.7
+   ]
+  }
+ }
+}
