@@ -1,0 +1,14 @@
+drwxrws---    1 1014     1015             0 Oct 23 15:46 /d
+health: {"status":"green"}
+force_merge pool: force_merge fixed 1
+memory lock: {"nodes":{"B-Mwtw_1RuCh1OJ6Nf6Okg":{"process":{"mlockall":true}}}}
+auto-create isel-text-x: 404
+auto-create other-x: 201
+data directory:
+total 20
+-rw-rw-r-- 1 1000 1000 5 Oct 23 15:46 batch_metrics_enabled.conf
+-rw-rw-r-- 1 1000 1000 5 Oct 23 15:46 logging_enabled.conf
+drwxrwxr-x 1 1000 1000 2 Oct 23 15:46 nodes
+-rw-rw-r-- 1 1000 1000 5 Oct 23 15:46 performance_analyzer_enabled.conf
+uid=1000(opensearch) gid=1000(opensearch) groups=1000(opensearch),1015
+removed isel-os-host2-smoke and isel-os-host2-smoke

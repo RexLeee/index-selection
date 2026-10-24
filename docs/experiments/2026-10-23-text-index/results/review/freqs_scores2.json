@@ -1,0 +1,19 @@
+{
+ "segments": 1,
+ "docs": 54370,
+ "live10_vs_freqs10": {
+  "same_ids": 1948,
+  "same_scores": 1948,
+  "max_relative_diff": 0.0
+ },
+ "live11_vs_freqs11": {
+  "same_ids": 1948,
+  "same_scores": 1948,
+  "max_relative_diff": 0.0
+ },
+ "freqs10_vs_freqs11": {
+  "same_ids": 1948,
+  "same_scores": 1948,
+  "max_relative_diff": 0.0
+ }
+}

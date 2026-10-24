@@ -418,9 +418,79 @@ search_settings:
   - 索引只有 54k 篇。文件數每加倍，recall 約掉 2 個百分點，所以 128M 時的絕對值會低很多。
   - 社群網站被 robots.txt 擋掉，沒有量到。
 
-### 10.6 下一步
+### 10.6 審查、部署準備和官方口徑（10-23 晚上）
+
+依據是同一個分支的 `TEXT_INDEX.md`，三節："S and the shared disk"、"Golden batch 20 as the official metric counts it"、"Before Host2"。這些改動還沒 commit。
+
+**程式審查。** 找到 15 個問題：修掉 12 個並補上測試，3 個延後並寫明觸發條件。
+
+| 問題 | 影響 | 處理 |
+|---|---|---|
+| force merge 時，舊 segment 要等最後一次 refresh 才釋放；flood stage 擋不住執行中的 merge | 重建時磁碟上有三份索引，可能把 crawler 共用的 `/data` 寫滿 | 每次輪詢都 refresh；Host2 一次只合併一個 shard；載入前和 merge 前各檢查一次剩餘空間 |
+| 連線中斷和逾時不會重送 | 一次網路錯誤就讓幾小時的建置失敗 | 可以重跑的請求退避重送；建立、刪除、alias 和 merge 不重送 |
+| `_aliases` 的回應遺失時，新索引會被刪掉 | alias 指向空的索引 | 先讀 alias，再決定要不要刪 |
+| 被殺掉的建置留下索引；兩個建置會互刪 | 下一次的峰值變大；正在載入的索引被刪掉 | 加檔案鎖；建立前先刪殘留；清理時只刪比較舊的索引 |
+| retention lease 逾時只記一個旗標 | 索引可能大 1.8 倍 | merge 前直接失敗 |
+| 搜尋不檢查失敗的 shard；欄位名打錯會被默默忽略；item 層級的 503 不重送；沒有進度 log | 結果悄悄變差，或看不到進度 | 全部修掉 |
+| 延後：只索引清單內的 doc、壓縮正文 Parquet、`url.text` 的 percent-encoding | 換清單後 ranked 可能超過 indexed；正文每 30 天多一份 | 寫進 `RECRAWL.md` §13，附觸發條件 |
+
+**body 改成 `freqs`。** body 不再記錄詞的位置。
+- 用調好的查詢比對，1,948 個關鍵字的前 10 名完全相同，id 和分數都一樣。NanoMIRACL 的 1,600 題也全部相同。
+- 54k golden 索引從每篇 2,165 bytes 降到 1,072 bytes。推估 128M 篇是 0.13 TB。
+- 例外：OrbStack VM 重啟後的第一次建置，id 全部相同，但 955 個關鍵字的分數略有不同。之後三次建置都完全一致，原因沒有找到。
+
+**Host2 資源（10-23 14:36–14:58 UTC，唯讀）**
+
+| 項目 | 數值 |
+|---|---|
+| `/data` | 7.62 TB，已用 77%，可用 1.73 TB；ext4 另外保留 0.38 TB 給 root |
+| `/data` 的內容 | crawler 最近 8 小時的暫存 5.42 TB：抓取結果 2.48 TB、router 輸出 2.94 TB。prune 每小時刪約 0.66 TB |
+| prune 前的可用空間 | 10-20 到 10-22 是 1.1–1.3 TiB，10-23 是 1.3–1.6 TiB |
+| 記憶體 | 811 GB，可用 380 GB；swap 用了 7.5/8 GB |
+| CPU 和核心參數 | 144 核；`vm.max_map_count` 1,048,576 |
+| 其他 | 9200 和 9300 沒有程式在用；`/data/isel` 還不存在；Docker root 在 `/`，剩 367 GiB |
+
+重建峰值（128M 篇，不保留前一版）：
+
+| body | 一份索引 | 第一次建置 | 修正前的重建 | 現在的重建 |
+|---|---|---|---|---|
+| `freqs`（現在） | 0.13 TB | 0.14–0.33 TB | 0.38–0.57 TB | 0.27–0.46 TB |
+| 保留 positions | 0.24 TB | 0.27–0.45 TB | 0.71–0.90 TB | 0.50–0.69 TB |
+
+- 扣掉 flood stage、正文 Parquet 和 HTML 暫存後，能放索引的空間在最差日是 0.41 TB，10-23 的低點是 0.63 TB。
+- 結論：body 用 `freqs`，加上 merge 的修正，就可以部署。保留 positions 的話，只有在 10-23 這種日子放得下。
+- 不論哪一種，建置都會自己檢查空間。空間不夠時，它會停下來，不會越過 flood stage。
+
+**Host2 部署檔（只寫檔，沒有部署）**
+- `deploy/compose.compute.yaml` 新增 `opensearch` 服務，profile 是 `search`：
+  - 只綁 127.0.0.1，不開 security plugin，比照 crawler API；
+  - 資料放在 `/data/isel/opensearch`，heap 31 GB，開 `memory_lock`；
+  - force merge 只用 1 個執行緒，並禁止自動建立 `isel-text-*`。
+- 同一個檔案新增 `text-index` 工作服務，另外新增 `config/text_index/host2.toml`：8 個 shard，不保留前一版。
+- 本機 smoke test 通過：
+  - 權限 2770 的目錄可以寫入；
+  - force merge 是 1 個執行緒；
+  - `mlockall` 是 true；
+  - 自動建立 `isel-text-*` 會被拒絕。
+
+**官方口徑的 golden 指標（batch 20）**
+- 官方旗標從 metricdb 唯讀讀出，重現了官方數字：head 24.75%，random 23.06%。
+- 索引只放清單內的 golden 頁面，再加上 44k 爬蟲頁面，算法和官方 coverage 表相同。
+
+| tag | 官方 crawled | 官方 indexed | 清單內且有正文 | 其中進前 10 | **預估 ranked rate** |
+|---|---|---|---|---|---|
+| head（test 半） | 27.9% | 26.5% | 90.2% | 79.4% | **0.190** [0.173, 0.207] |
+| random（test 半） | 25.5% | 23.3% | 88.9% | 85.0% | **0.176** [0.160, 0.191] |
+
+- 用全部關鍵字算是 head 0.182、random 0.175。這只是描述，因為查詢是在 dev 半挑的。
+- 天花板是 indexed rate：四分之三的 golden URL 不在清單裡。這要靠 selection 改善，索引幫不上。
+- 調好的查詢比調整前高：head 0.175 → 0.190，random 0.167 → 0.176。
+- 這是 44k 背景下的上限。背景每加倍，「其中進前 10」約降 1.5 個百分點。128M 還要再加倍約 11 次，所以這裡不給 128M 的數字。
+
+### 10.7 下一步
 
 1. commit 並更新 WSE 的 PR。這一步要先經過你同意。
-2. 部署到 Host2 前，先完成 `TEXT_INDEX.md` 的 "Before Host2" 清單。
-3. 真正的 Recall@10 要等 PR #84 部署，而且 recrawl 抓到清單的正文之後才能量。
-4. 下一期 golden 出來後，用同樣方法再驗證一次查詢設定。
+2. 部署到 Host2：照 `TEXT_INDEX.md` 的 "Before Host2" 步驟做，先建約 1,000 萬篇並量峰值。
+3. recrawl 開始後，有兩件事要在期限前完成：第一次換清單前，改成只索引清單內的 doc；30 天內完成正文 Parquet 的壓縮。
+4. 11-01 的 batch 21 出來後，用同樣方法驗證查詢，並量官方口徑的 ranked rate。
+5. 真正的 Recall@10 要等 PR #84 部署，而且 recrawl 抓到清單的正文之後才能量。
