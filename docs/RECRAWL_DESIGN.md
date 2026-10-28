@@ -2,6 +2,8 @@
 
 調研日期：2026-10-12。所有數字都來自唯讀查詢，查詢方法列在附錄 A。
 
+程式在 `RexLeee/WebSearchEngine` 的 `IndexSelectionV2/`。實作細節以該目錄的 `docs/RECRAWL.md` 為準。
+
 ## 0. 結論
 
 2026-10-18 更新：入口改成 WebCrawler PR #84 的 manual-bulk-crawl job API。提案的 C5、C6、C8、C10 由它取代，C9 改寫成 API job 的 lane 分配。politeness（C1–C4、C7）不再提出，沿用 crawler 現行的 AutoThrottle。理由見 §4.1 和 §8。同日 PR 更新到 `4dce38f`，加上 `ttl_days`、DELETE 和 FIFO 的 job 順序，isel 跟著改用它們（§4.4）。
