@@ -1,0 +1,16 @@
+{
+ "keywords": 1948,
+ "tie_at_cutoff": 310,
+ "freqs": {
+  "same_top10_ids": 1401,
+  "same_top10_set": 1742,
+  "same_top10_scores": 1948,
+  "store_bytes": 41420792
+ },
+ "rebuild": {
+  "same_top10_ids": 1402,
+  "same_top10_set": 1753,
+  "same_top10_scores": 1948,
+  "store_bytes": 78202321
+ }
+}

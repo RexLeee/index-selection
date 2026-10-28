@@ -1,0 +1,63 @@
+{
+ "settings": "icu.json + body index_options freqs",
+ "langs": {
+  "bn": {
+   "questions": 200,
+   "same_ndcg": 200,
+   "changed": [],
+   "ndcg": 0.5597046963033198,
+   "recorded_ndcg": 0.5597046963033199
+  },
+  "de": {
+   "questions": 200,
+   "same_ndcg": 200,
+   "changed": [],
+   "ndcg": 0.4807799271239642,
+   "recorded_ndcg": 0.4807799271239645
+  },
+  "en": {
+   "questions": 200,
+   "same_ndcg": 200,
+   "changed": [],
+   "ndcg": 0.6399779664103233,
+   "recorded_ndcg": 0.6399779664103237
+  },
+  "es": {
+   "questions": 200,
+   "same_ndcg": 200,
+   "changed": [],
+   "ndcg": 0.6544891129121849,
+   "recorded_ndcg": 0.6544891129121849
+  },
+  "fr": {
+   "questions": 200,
+   "same_ndcg": 200,
+   "changed": [],
+   "ndcg": 0.4523197200080877,
+   "recorded_ndcg": 0.4523197200080879
+  },
+  "hi": {
+   "questions": 200,
+   "same_ndcg": 200,
+   "changed": [],
+   "ndcg": 0.5540574312693782,
+   "recorded_ndcg": 0.5540574312693787
+  },
+  "ja": {
+   "questions": 200,
+   "same_ndcg": 200,
+   "changed": [],
+   "ndcg": 0.6864026347426635,
+   "recorded_ndcg": 0.6864026347426639
+  },
+  "zh": {
+   "questions": 200,
+   "same_ndcg": 200,
+   "changed": [],
+   "ndcg": 0.4865967196860238,
+   "recorded_ndcg": 0.4865967196860238
+  }
+ },
+ "same_ndcg": 1600,
+ "questions": 1600
+}

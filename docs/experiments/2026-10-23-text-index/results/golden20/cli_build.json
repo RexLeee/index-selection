@@ -1,0 +1,27 @@
+{
+  "alias": "isel-text",
+  "bytes_per_doc": 2164.9443627000182,
+  "bytes_per_text_byte": 0.426902208112287,
+  "code_version": "dev",
+  "config_sha256": "b0c7fd1529f834009be80d26648d9c34eda18f16ff603ae0b74aff550b77be61",
+  "deleted": [
+    "isel-text-20261023t063913382139z"
+  ],
+  "docs": 54370,
+  "docs_per_s_load": 859.7,
+  "index": "isel-text-20261023t104016870764z",
+  "indexed": 54370,
+  "load_s": 63.244,
+  "previous": [
+    "isel-text-20261023t065638728667z"
+  ],
+  "recovery_source_pruned": true,
+  "rows": 54370,
+  "segment_bytes": 117708025,
+  "segments": 1,
+  "settings_sha256": "e870e93aa3cc377914c09da2402232d4a1c9f73e2e77d93b4c61dd9dd39a5e9c",
+  "store_bytes": 224024275,
+  "text_bytes": 275725969,
+  "text_root": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/roots/bg44k",
+  "total_s": 96.671
+}

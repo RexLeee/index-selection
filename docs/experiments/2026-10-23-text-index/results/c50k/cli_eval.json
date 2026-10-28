@@ -1,0 +1,62 @@
+{
+  "alias": "isel-text",
+  "all": {
+    "ndcg": 0.0,
+    "pairs": 15328,
+    "presence": 0.00019572025052192068,
+    "queries": 1948,
+    "recall_given_present": 0.0,
+    "recall_pairs": 0.0,
+    "recall_pairs_ci95": [
+      0.0,
+      0.0
+    ],
+    "recall_unique": 0.0,
+    "took_ms_p50": 1.0,
+    "took_ms_p95": 2.0,
+    "zero_hit_rate": 0.05082135523613963
+  },
+  "batch_id": 20,
+  "fields": [
+    "title^2",
+    "description",
+    "body"
+  ],
+  "head": {
+    "ndcg": 0.0,
+    "pairs": 7681,
+    "presence": 0.0,
+    "queries": 1000,
+    "recall_given_present": null,
+    "recall_pairs": 0.0,
+    "recall_pairs_ci95": [
+      0.0,
+      0.0
+    ],
+    "recall_unique": 0.0,
+    "took_ms_p50": 2.0,
+    "took_ms_p95": 2.0,
+    "zero_hit_rate": 0.024
+  },
+  "index": [
+    "isel-text-20261023t065638728667z"
+  ],
+  "k": 10,
+  "query_type": "combined_fields",
+  "random": {
+    "ndcg": 0.0,
+    "pairs": 8045,
+    "presence": 0.00037290242386575515,
+    "queries": 1000,
+    "recall_given_present": 0.0,
+    "recall_pairs": 0.0,
+    "recall_pairs_ci95": [
+      0.0,
+      0.0
+    ],
+    "recall_unique": 0.0,
+    "took_ms_p50": 1.0,
+    "took_ms_p95": 2.0,
+    "zero_hit_rate": 0.076
+  }
+}

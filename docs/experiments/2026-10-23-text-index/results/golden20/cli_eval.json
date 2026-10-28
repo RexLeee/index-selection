@@ -1,0 +1,63 @@
+{
+  "alias": "isel-text",
+  "all": {
+    "ndcg": 0.6467240169334979,
+    "pairs": 15328,
+    "presence": 0.6981993736951984,
+    "queries": 1948,
+    "recall_given_present": 0.8129321622126705,
+    "recall_pairs": 0.56758872651357,
+    "recall_pairs_ci95": [
+      0.5573770491803278,
+      0.5773269845411259
+    ],
+    "recall_unique": 0.5767777627850492,
+    "took_ms_p50": 1.0,
+    "took_ms_p95": 2.0,
+    "zero_hit_rate": 0.000513347022587269
+  },
+  "batch_id": 20,
+  "fields": [
+    "title^2",
+    "description",
+    "body",
+    "url.text"
+  ],
+  "head": {
+    "ndcg": 0.6196299820434745,
+    "pairs": 7681,
+    "presence": 0.7005598229397214,
+    "queries": 1000,
+    "recall_given_present": 0.7864709161865824,
+    "recall_pairs": 0.5509699257909126,
+    "recall_pairs_ci95": [
+      0.5373693042468052,
+      0.5645895668010927
+    ],
+    "recall_unique": 0.5640605812525583,
+    "took_ms_p50": 1.0,
+    "took_ms_p95": 2.0,
+    "zero_hit_rate": 0.001
+  },
+  "index": [
+    "isel-text-20261023t104016870764z"
+  ],
+  "k": 10,
+  "query_type": "best_fields",
+  "random": {
+    "ndcg": 0.6717184223544824,
+    "pairs": 8045,
+    "presence": 0.6963331261653201,
+    "queries": 1000,
+    "recall_given_present": 0.8361299535880042,
+    "recall_pairs": 0.582224984462399,
+    "recall_pairs_ci95": [
+      0.5698616477626823,
+      0.5953792933036818
+    ],
+    "recall_unique": 0.5828663927281783,
+    "took_ms_p50": 1.0,
+    "took_ms_p95": 2.0,
+    "zero_hit_rate": 0.0
+  }
+}

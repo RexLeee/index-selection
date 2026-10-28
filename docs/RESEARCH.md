@@ -263,6 +263,21 @@
 - follower reads 需要 `yb_read_from_followers = true` 加唯讀交易，而且要 RF > 1。兩個節點只能 RF 1。信心 HIGH。
 - `yb_read_time` 可讀過去時間點，預設歷史保留 900 秒（`timestamp_history_retention_interval_sec`）。信心 MED。
 - Voyager live migration 需要 `wal_level=logical`；fall-forward 需要第三份副本。信心 HIGH。
+- **2026-10-28 補充（實作前調研，§9.1）：**
+  - 切 chunk 策略的比較：
+    - ctid 只適用於 PG；
+    - `yb_hash_code` 等寬區間有 pushdown，本機 EXPLAIN 實測為 `Index Cond`；
+    - `yb_tablet_metadata` 可以對齊 tablet，2026.1.1 起 GA，但邊界會隨 split 移動；
+    - 在 hash 主鍵上用 keyset `ORDER BY url` 要掃全部 tablet 再排序；
+    - 整張表一個 COPY 無法在表內續傳。
+
+    信心 HIGH（官方文件，加上 Pachot 2023-01-06 的平行匯出文章）。
+  - Read restart：COPY 輸出超過 `ysql_output_buffer_size`（256 KB）後，YSQL 不再自動重試，應用端要重讀。follower read 讀過去時間點，可以避開。`SERIALIZABLE READ ONLY DEFERRABLE` 也能避開，代價是每個交易約等 500 ms。信心 HIGH。
+  - `pg_export_snapshot` 在 YSQL 由 `ysql_enable_pg_export_snapshot` 控制，2025.2.2 起預設開啟，只限 REPEATABLE READ。保留期預設 900 s，超過會出現 `Snapshot too old`。信心 HIGH。
+  - `pg_stat_statements` 從 2026.1.1 起有 `docdb_*` 欄位，例如 `docdb_rows_scanned`、`docdb_read_rpcs`，每個節點各自統計。`pg_stat_io` 不存在，因為 YSQL 是 PG15。信心 HIGH。
+  - 自動 tablet split：低階段時，超過 128 MiB 的 tablet 會一直 split，直到每個節點 1 個 shard。高階段時，超過 10 GiB 才 split，上限是每個節點 24 個 shard。split 之後要做 full compaction，CPU 和磁碟負擔都重。所以全量讀取要等 split 平息之後再跑。信心 HIGH。
+  - YSQL 全表掃描的速度沒有公開數字，要自己試跑。信心 LOW。
+  - 多節點連線：libpq 16+ 的 `load_balance_hosts=random` 就夠用，psycopg binary 內附 libpq 18。`psycopg-yugabytedb` 目前還是 rc。信心 MED。
 
 ### 10.5 來源（存取日期 2026-10-08）
 

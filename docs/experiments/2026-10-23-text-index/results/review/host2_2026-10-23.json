@@ -1,0 +1,113 @@
+{
+ "measured_utc": "2026-10-23T14:36Z..14:58Z",
+ "how": "read-only ssh: free, df, cat /proc, lsblk, ls, du, tail, docker ps/inspect",
+ "data_fs": {
+  "size_bytes": 7619779362816,
+  "used_bytes": 5507882946560,
+  "available_bytes": 1727804289024,
+  "root_reserve_bytes": 384092127232,
+  "disks": "LVM over 2x Samsung PM9A3 3.84 TB NVMe"
+ },
+ "crawl_result_tb": {
+  "crawler_*": 2.48,
+  "ingestor_*": 2.94,
+  "retention_h": 8,
+  "prune_per_hour_tib": 0.6
+ },
+ "other_data_dirs_gib": {
+  "yugabyte_data": 24,
+  "selection_tmp": 12,
+  "yugabyte": 10
+ },
+ "pre_prune_free_tib_by_local_day": {
+  "2026-10-07": [
+   6.6,
+   6.6
+  ],
+  "2026-10-08": [
+   6.6,
+   6.6
+  ],
+  "2026-10-09": [
+   6.6,
+   6.6
+  ],
+  "2026-10-10": [
+   6.6,
+   6.6
+  ],
+  "2026-10-11": [
+   6.6,
+   6.6
+  ],
+  "2026-10-12": [
+   6.6,
+   6.6
+  ],
+  "2026-10-13": [
+   6.5,
+   6.6
+  ],
+  "2026-10-14": [
+   6.5,
+   6.6
+  ],
+  "2026-10-15": [
+   6.5,
+   6.6
+  ],
+  "2026-10-16": [
+   6.5,
+   6.6
+  ],
+  "2026-10-17": [
+   6.5,
+   6.6
+  ],
+  "2026-10-18": [
+   6.5,
+   6.6
+  ],
+  "2026-10-19": [
+   6.5,
+   6.6
+  ],
+  "2026-10-20": [
+   1.1,
+   6.5
+  ],
+  "2026-10-21": [
+   1.1,
+   1.3
+  ],
+  "2026-10-22": [
+   1.2,
+   1.3
+  ],
+  "2026-10-23": [
+   1.3,
+   1.6
+  ]
+ },
+ "memory_bytes": {
+  "total": 810945462272,
+  "available": 379929989120
+ },
+ "swap_used_of_total_bytes": [
+  7487778816,
+  8589930496
+ ],
+ "cpus": 144,
+ "vm_max_map_count": 1048576,
+ "root_fs_available_bytes": 393357942784,
+ "docker_root": "/var/lib/docker on /",
+ "listening_9200_9300_4000": false,
+ "data_isel_exists": false,
+ "crawler_container_user": "root",
+ "host1_data": {
+  "used_pct": 95,
+  "available_bytes": 379244560384,
+  "io_psi_some_avg300": 28.2
+ },
+ "prune_log_days": "ts in +08:00, 2026-10-07..2026-10-23"
+}

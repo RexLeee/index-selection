@@ -1,0 +1,58 @@
+{
+ "keywords": 1948,
+ "tie_at_cutoff": 452,
+ "query_type": "best_fields",
+ "fields": [
+  "title^2",
+  "description",
+  "body",
+  "url.text"
+ ],
+ "live": {
+  "index": "isel-text-20261023t104016870764z",
+  "docs": 54370,
+  "segment_bytes": 117708025,
+  "bytes_per_doc": 2164.9443627000182
+ },
+ "freqs": {
+  "same_top10_ids": 1948,
+  "same_top10_set": 1948,
+  "same_top10_scores": 993,
+  "differ_examples": [
+   "0050",
+   "1. fc magdeburg – hannover 96",
+   "1980s",
+   "1人5万円給付金 最新",
+   "2-euro-münze",
+   "2455",
+   "2891",
+   "2cv electrique",
+   "3035",
+   "49ers vs seahawks",
+   "6770",
+   "9984",
+   "a different world reboot netflix",
+   "a24",
+   "a27",
+   "a3",
+   "a39",
+   "aaj tak live",
+   "aargau",
+   "aatu raty"
+  ],
+  "docs": 54370,
+  "segment_bytes": 58354015,
+  "bytes_per_doc": 1073.2759794004046,
+  "recovery_source_pruned": true
+ },
+ "rebuild": {
+  "same_top10_ids": 1948,
+  "same_top10_set": 1948,
+  "same_top10_scores": 1948,
+  "differ_examples": [],
+  "docs": 54370,
+  "segment_bytes": 117805550,
+  "bytes_per_doc": 2166.7380908589294,
+  "recovery_source_pruned": true
+ }
+}

@@ -1,0 +1,93 @@
+{
+ "urls": 14822,
+ "hosts": 4772,
+ "window_utc": [
+  "2026-10-23T08:01:30.478217+00:00",
+  "2026-10-23T10:00:54.637192+00:00"
+ ],
+ "outcomes": {
+  "fetched": 10345,
+  "robots": 3628,
+  "http_403": 322,
+  "error": 264,
+  "http_404": 70,
+  "http_429": 40,
+  "non_html": 38,
+  "http_406": 23,
+  "http_402": 20,
+  "http_503": 18,
+  "http_401": 14,
+  "http_405": 10,
+  "http_500": 6,
+  "http_302": 6,
+  "http_307": 4,
+  "http_412": 3,
+  "http_417": 3,
+  "http_400": 2,
+  "http_522": 2,
+  "http_468": 1,
+  "http_504": 1,
+  "http_502": 1,
+  "http_410": 1
+ },
+ "robots_by_host": {
+  "www.facebook.com": 737,
+  "www.instagram.com": 694,
+  "x.com": 304,
+  "www.reddit.com": 262,
+  "www.imdb.com": 216,
+  "www.sofascore.com": 170,
+  "www.aiscore.com": 57,
+  "baike.baidu.com": 48,
+  "www.gettyimages.com": 46,
+  "www.cricbuzz.com": 42,
+  "www.cricinfo.com": 38,
+  "www.linkedin.com": 37,
+  "www.netflix.com": 33,
+  "www.pro-football-reference.com": 32,
+  "seatgeek.com": 28,
+  "www.reuters.com": 24,
+  "www.collinsdictionary.com": 22,
+  "dictionary.cambridge.org": 19,
+  "www.baseball-reference.com": 17,
+  "www.eliteprospects.com": 16
+ },
+ "http_403_by_host": {
+  "www.nytimes.com": 29,
+  "www.morningstar.com": 15,
+  "stock.adobe.com": 14,
+  "www.britannica.com": 13,
+  "www.bloomberg.com": 10,
+  "www.tapology.com": 10,
+  "www.cmoney.tw": 9,
+  "www.congress.gov": 8,
+  "www.fernsehserien.de": 7,
+  "www.sports-reference.com": 7
+ },
+ "text_len_quantiles": {
+  "p10": 49.0,
+  "p25": 329.0,
+  "p50": 2196.0,
+  "p75": 6183.0,
+  "p90": 15796.0
+ },
+ "text_len_under_200": 2263,
+ "lang": {
+  "en": 5189,
+  "zh": 1666,
+  "ja": 774,
+  "de": 421,
+  "null": 398,
+  "fr": 338,
+  "pt": 238,
+  "sv": 182,
+  "lb": 97,
+  "hi": 86,
+  "ko": 84,
+  "la": 83
+ },
+ "youtube": {
+  "fetched": 1150,
+  "text_len_median": 49.0
+ }
+}

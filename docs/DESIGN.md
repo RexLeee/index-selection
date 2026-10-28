@@ -1,6 +1,7 @@
 # Index Selection 設計文件
 
-- 程式位置：`src/isel/`，每節標出對應的模組
+- 程式位置：`RexLeee/WebSearchEngine` 的 `IndexSelectionV2/src/isel/`，每節標出對應的模組。下文的 `src/`、`config/`、`deploy/` 路徑都相對於該目錄
+- 實作細節以該目錄的 `docs/DESIGN.md` 為準。本文件保留中文的說明和理由
 - 調研依據：[`RESEARCH.md`](RESEARCH.md)
 - 所有參數：`config/isel.toml`
 
@@ -68,6 +69,15 @@ OUR selectdb :5445  ◄── publish (COPY FREEZE) → swap (rename) / rollback
 | `full/export/shard=NNN/part-<lo>-<hi>.parquet`、`_meta.json` | 全部已爬列，依 heap block 範圍分檔；`_meta.json` 記錄每個 shard 的 block 範圍、`frozen_probe`、`end_probe`，以及每個 shard 期間的全叢集 WAL 和寫入量（`io`） | `pull-full` |
 | `full/scored/shard=NNN.parquet`、`_meta.json` | 分數 ≥ τ 的列（url、shard、h、score）；`_meta.json` 記錄模型、K、τ、`kept_check` 和失敗原因（`failed`） | `score-full` |
 | `full/selection/run=<id>/` | 精確的 top-K，格式同 §7 的 manifest（`scope = "full"`）；`_MANIFEST.json` 最後寫 | `select-full` |
+
+recrawl 的檔案不在 `/work`，路徑由 `[recrawl]` 設定（Host2 的值見 `config/container.toml`）：
+
+| 路徑 | 內容 | 寫入者 |
+|---|---|---|
+| `/data/manual_bulk_crawls/pending/{job_id}.json` | 給 crawler 的 job 檔，一個 job 一個 | crawler 的 API（`recrawl-plan` 經 `POST /v1/manual-bulk-crawls` 送出，WebCrawler PR #84）；isel 不寫這個目錄 |
+| `/data/manual_bulk_crawls/results/{job_id}/` | `request.json`（`urls`、`crawler_ids`），以及每個 crawler 分區 `crawler_NN/` 裡每個 URL 的 `NNNNN.json`、原始 HTML `NNNNN.html` 和 `progress.json` | API 建立，crawler 寫入；`recrawl-archive` 只讀。job 完成與否只看 API 的 `GET`。保留機制是 PR #84 的 `ttl_days` 和 DELETE |
+| `/data/isel/text/fetch_date=YYYYMMDD/job-<batch_id>.parquet` | 抽出的正文，永久保存，建 inverted index 的來源 | `recrawl-archive` |
+| `/data/isel/log/YYYYMMDD/job-<batch_id>.jsonl.gz` | gzip 的逐 URL 結果，永久保存，重建 DB 的依據 | `recrawl-archive` |
 
 所有檔案都先寫成 `.tmp`，fsync 後才 rename（`io.py`）。
 
@@ -244,7 +254,7 @@ selection/run=<id>/
 | `url` | 要交給 metric 的拼法（目前是 crawler 的拼法） |
 | `canonical_url` | crawler 的正規化拼法（`w3lib.canonicalize_url`）。同一頁的不同拼法共用 `doc_id` |
 | `host`、`domain_id` | canonical URL 的 host；crawler `domain_state` 的 id（eTLD+1 或拆分的 host），來自 export |
-| `crawl_shard` | crawler 的 0–255 shard，取自該列被打分的 export shard。未來的 recrawl 依它找到負責的 crawler process |
+| `crawl_shard` | crawler 的 0–255 shard，取自該列被打分的 export shard。recrawl 不用它，路由由 crawler 的 API 決定 |
 | `index_shard` | `doc_id mod index_shards`，給 indexer 分工 |
 | `score`、`rank`、`reason` | 模型分數、名次（`manifest.RANK_ORDER`：score desc、URL 雜湊 asc、URL asc）、前幾名特徵貢獻（LightGBM SHAP；全量清單為 NULL） |
 | `content_hash`、`simhash`、`lang`、`text_len` | 預留給 Phase B 的內容回饋，目前是 NULL |
@@ -264,6 +274,7 @@ schema 只定義在 `src/isel/schema.py`（SQLAlchemy Core）。改動用 `src/i
 |---|---|---|
 | `public` | `selected_urls_current` | `url` PK、`score`、`first_seen`（NULL）、`run_id` FK（`ON DELETE RESTRICT`）、`selected_at`。欄位和 V1 相同 |
 | `public` | `model_runs` | V1 的欄位，加上 `status`（CHECK：loading、validated、live、retired、abandoned、rolled_back；最多一個 live）、`activated_at`、`config_sha256`、`code_version` |
+| `recrawl` | `host`、`doc`、`job`、`batch_seq` | recrawl 的 frontier：一個 hostname 一個 back queue，一個 doc 一列，一個送給 crawler API 的 job 一列。見 `docs/RECRAWL_DESIGN.md` §4.4。`select` 角色沒有這個 schema 的 USAGE |
 
 - `run_id`、`selected_at`、`first_seen` 每列都相同。這是刻意的反正規化，因為 V1 的讀者在每列讀這些欄位。
 - 清單表的約束一律叫 `<table>_pkey`、`<table>_run_id_fkey`。`swap` 和 `rollback` 改表名時一起改約束名。
@@ -318,7 +329,7 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 
 ### 8.4 recrawl 預算
 
-> 2026-10-12 的調研取代本節的估算。完整設計、每 host 0.2 qps 的容量分析和 recrawl 程式在 `feat/recrawl` 分支，還沒上線。
+> 2026-10-12 的調研取代本節的估算。完整設計和每 host 0.2 qps 的容量分析見 [`RECRAWL_DESIGN.md`](RECRAWL_DESIGN.md)；crawler 端的改動見 [`CRAWLER_RECRAWL_PROPOSAL.md`](CRAWLER_RECRAWL_PROPOSAL.md)。程式已實作，還沒上線。
 
 - 每兩週全量重抓 1.28 億頁，等於每天 9.1M 頁，佔 crawler 產能（每天 26–29M）約 34%。
 - 所以只抓 delta（`added`）和過期的頁。
@@ -346,14 +357,40 @@ manifest + deltas ──► fetch scheduler (politeness by crawl_shard / domain_
 
 ---
 
-### 9.1 crawlerdb 若遷移到 YugabyteDB（只規劃，未實作）
+### 9.1 crawlerdb 在 YugabyteDB 上（2026-10-28 實作）
 
-1. **觸發條件：** 助教確認切換日期之後才動工。
-2. **先看 schema：** 從 Voyager 產生的 DDL 確認 `url` 是 HASH 主鍵的第一欄，以及 256 張表是否保留。
-3. **抽樣：** sample 從 export 導出，不受 engine 影響。要改的只有 `pull-full` 的讀法：YB 沒有 ctid，改成依 `yb_hash_code(url)` 範圍分塊。先用 `EXPLAIN` 確認條件會下推到 DocDB。
-4. **設定：** session GUC 依 engine 分開。`pg_class.relpages` 沒有意義，改用 `reltuples × p` 估讀取量。`yb_read_time` 預設只保留 900 秒歷史，不能拿來固定 S0；仍用 `frozen_probe`。兩個節點只能 RF 1，沒有 follower reads 可以分流。
-5. **驗證：** 本機用同版本 YugabyteDB 容器跑合約測試。PG 和 YB 並存時，golden URL 的主鍵查詢要逐筆一致，樣本只比較分布。
-6. **要提醒助教的風險：** Voyager export 目錄和 YB 資料目錄都在 Host1 `/data`（2026-10-08 剩 385 GB，crawlerdb 6.6 TB）。live migration 要把 `wal_level` 改成 logical（需重啟），replication slot 卡住會累積 WAL，可能再次寫滿 `/data`。
+crawlerdb 正從 Host1 的 PostgreSQL 16 遷到 YugabyteDB 2026.1.2。YB 叢集的 tserver 在 .2、.3、.4 上，RF 3。曾彥禎 10-28 開始遷移。`crawlerdb.engine` 決定 `pull-full` 和 `pull-dims` 用哪一種讀法：
+
+```bash
+isel --config config/isel.toml --config config/crawlerdb/yugabyte.toml pull-full --dry-run
+docker compose ... run --rm isel-yb pull-full --dry-run      # 容器裡的同一件事
+```
+
+- **切換方式：** overlay 改讀 `ISEL_CRAWLERDB_YB_DSN`。兩個 engine 的 DSN 可以同時設好，切換只差一個 `--config`。metricdb 和 selectdb 不遷移。
+- **切 chunk：** PG 照舊用 ctid block 範圍。YB 把 `yb_hash_code(url)` 的 [0, 65536) 等分成 `full.hash_chunks` 段，一段一個 COPY。EXPLAIN 是 `Index Scan using <表>_pkey` 加 `Index Cond: yb_hash_code(url) ...`，只問持有這段 hash 的 tablet。
+- **為什麼不對齊 tablet 邊界：** tablet 會隨資料量自動 split。續傳時，區間會跟著變動。
+- **一致性：** 每個 COPY 各自一致，跟 PG 相同。overlay 開 `yb_read_from_followers`，讀 30 秒前的副本，所以不會遇到 read restart（SQLSTATE 40001）。萬一還是遇到 40001，這個 chunk 會重讀，最多 `full.chunk_retries` 次。
+- **為什麼不做全域 snapshot：** `yb_read_time` 和 `pg_export_snapshot` 都只在保留期內有效，預設 900 秒。調到數小時，crawler 寫入時就會留下更多 MVCC 版本。
+- **速率和 timeout：** YB 事先不知道大小。所以 COPY 結束後，才按回傳的 CSV bytes 扣 `full.max_heap_mb_s`。timeout 用 `guard.timeout_cap_s`。
+- **統計：** YB 沒有 `pg_stat_io`，也不寫 PG WAL。所以 `_meta.json` 的 `io` 只有秒數。frozen probe 的 `tuple_changes` 記為 null，因為 YB 的 `n_tup_*` 只看單一節點。
+- **防護：** 讀取時間窗照舊，因為 metric 也會改讀 YB。IO 等待探測改看 `crawlerdb.io_wait_types`。YB 的 wait type 還沒量。
+- **續傳：** engine 寫進 `_meta.json` 的 layout。換了 engine 的 export 會被拒絕續傳。
+- **本機驗證：** `pytest -m yugabyte`，用跟正式環境同版的映像。驗證了五件事：
+  - 所有 session GUC 都能設定；
+  - server 拒絕寫入；
+  - hash 範圍有 pushdown：200,000 列取 1/8 的 hash 範圍，實際掃了 25,080 列；
+  - 同一份資料在 YB 和 PG 的匯出逐列相同；
+  - follower read 看不到 30 秒內剛寫的列。
+- **還沒驗證，需要課程叢集的唯讀帳號：**
+  - `COPY (SELECT ...) TO` 是否真的由 follower 服務；
+  - 每個節點的掃描速度；
+  - 要計算哪些 wait type。
+- **什麼時候讀：**
+  1. 遷移期間只讀 PG，條件是它起得來而且已凍結，也不能和 Voyager export 同時跑。
+  2. 資料載入、tablet 還在 split 的時候，兩邊都不讀。
+  3. 切換後，等 tablet 數連續數小時不變，先用一個 shard 試跑，量每個節點的 MB/s 和 crawler 的寫入延遲。
+  4. 依試跑結果設好 `full.max_heap_mb_s`，再跑全量。
+- **舊規劃的修正：** §9.1 原本寫「兩個節點只能 RF 1，沒有 follower reads」。現在叢集是 3 個節點、RF 3，follower reads 可以用。
 
 ## 10. 執行手冊（研究流程，Mac）
 
@@ -430,6 +467,7 @@ Mac 經 VPN 只有約 4 MB/s，全量匯出只能在伺服器上跑。
 | 設定 | 理由 |
 |---|---|
 | `profiles: [job]`，用 `run --rm` | 一個指令一個容器，跑完就刪；`up` 不會啟動它；不設 restart、不開 port |
+| 例外：`recrawl-plan`、`recrawl-archive`（`profiles: [recrawl]`） | 它們要持續送 job 和收結果，所以是常駐 service，`restart: unless-stopped`。每個只能跑一個實例，靠 advisory lock 保證。`recrawl-plan` 用 `network_mode: host` 連 `127.0.0.1:4000` 的 crawler API，限制 2 CPU、4 GB；`recrawl-archive` 有 `archive_workers` 個抽取 process，限制 8 CPU、8 GB。兩者都唯讀掛載 `/data/manual_bulk_crawls/results`，可寫掛載 `/data/isel` |
 | `init: true` | Ctrl-C 和 `docker stop` 能傳到 isel；所有指令都可續跑 |
 | `read_only: true`、`tmpfs: /tmp` | 只有 `/work` 可寫 |
 | secret 檔 + `<NAME>_FILE` | DSN 不出現在 `docker inspect`、env 或 log（V1 的 cron 檔就外洩過 DSN） |
@@ -455,10 +493,10 @@ Mac 經 VPN 只有約 4 MB/s，全量匯出只能在伺服器上跑。
 ### 12.5 部署和執行（每一步都要使用者核准）
 
 ```bash
-# Mac: ship one commit (no repo access needed on the server)
+# Mac, in ../wse-idxsel: ship one commit (no repo access needed on the server)
 SHA=$(git rev-parse --short HEAD)
-git archive --format=tar "$SHA" | ssh ntu-sa2 "mkdir -p ~/isel/src-$SHA && tar -x -C ~/isel/src-$SHA"
-rsync -a work/golden work/dims ntu-sa2:isel/work/
+git archive --format=tar "$SHA:IndexSelectionV2" | ssh ntu-sa2 "mkdir -p ~/isel/src-$SHA && tar -x -C ~/isel/src-$SHA"
+rsync -a IndexSelectionV2/work/golden IndexSelectionV2/work/dims ntu-sa2:isel/work/
 
 # Host2
 cd ~/isel/src-$SHA
@@ -490,6 +528,12 @@ $J verify-live --batch 19                    # sanity: in-sample batch
 # after batch 20 exists (2026-10-16 20:00 UTC): pull-golden, rsync work/golden, then
 $J derive-positives --batches 20
 $J verify-live --batch 20
+# recrawl (docs/RECRAWL_DESIGN.md §7), each step a Hard Stop
+$J recrawl-sync                              # after each swap; refused in the freeze window
+$J recrawl-plan --dry-run                    # per-host capacity report; writes nothing
+# only after PR #84 (bd40191 or later: ttl_days, DELETE, per-crawler result partitions) is merged and deployed
+$D --profile recrawl up -d recrawl-plan recrawl-archive
+$D --profile recrawl stop recrawl-plan       # stops sending new jobs at once
 ```
 
 - 長指令用 `nohup`，或在 `tmux` 裡跑；中斷後重跑同一個指令就會續跑。

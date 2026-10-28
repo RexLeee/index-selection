@@ -1,0 +1,161 @@
+{
+ "icu:comb_t2": {
+  "index": "tune-icu-20261023t102824154668z",
+  "query_type": "combined_fields",
+  "fields": [
+   "title^2",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2115.819183373184,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T102933840339Z.queries.parquet"
+ },
+ "icu:comb_t3": {
+  "index": "tune-icu-20261023t102824154668z",
+  "query_type": "combined_fields",
+  "fields": [
+   "title^3",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2115.819183373184,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103003095539Z.queries.parquet"
+ },
+ "icu:most_t1": {
+  "index": "tune-icu-20261023t102824154668z",
+  "query_type": "most_fields",
+  "fields": [
+   "title",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2115.819183373184,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103016012506Z.queries.parquet"
+ },
+ "icu:most_t2": {
+  "index": "tune-icu-20261023t102824154668z",
+  "query_type": "most_fields",
+  "fields": [
+   "title^2",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2115.819183373184,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103022620646Z.queries.parquet"
+ },
+ "icu:most_t3": {
+  "index": "tune-icu-20261023t102824154668z",
+  "query_type": "most_fields",
+  "fields": [
+   "title^3",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2115.819183373184,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103029339119Z.queries.parquet"
+ },
+ "icu:most_t2_d05": {
+  "index": "tune-icu-20261023t102824154668z",
+  "query_type": "most_fields",
+  "fields": [
+   "title^2",
+   "description^0.5",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2115.819183373184,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103035949685Z.queries.parquet"
+ },
+ "icu:best_t2": {
+  "index": "tune-icu-20261023t102824154668z",
+  "query_type": "best_fields",
+  "fields": [
+   "title^2",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2115.819183373184,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103042967089Z.queries.parquet"
+ },
+ "icu:best_t1": {
+  "index": "tune-icu-20261023t102824154668z",
+  "query_type": "best_fields",
+  "fields": [
+   "title",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2115.819183373184,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103112237111Z.queries.parquet"
+ },
+ "icu:best_t3": {
+  "index": "tune-icu-20261023t102824154668z",
+  "query_type": "best_fields",
+  "fields": [
+   "title^3",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2115.819183373184,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103122627674Z.queries.parquet"
+ },
+ "kstem:best_t2": {
+  "index": "tune-kstem-20261023t103138975941z",
+  "query_type": "best_fields",
+  "fields": [
+   "title^2",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2080.2921096192754,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103213029046Z.queries.parquet"
+ },
+ "porter:best_t2": {
+  "index": "tune-porter-20261023t103219775945z",
+  "query_type": "best_fields",
+  "fields": [
+   "title^2",
+   "description",
+   "body"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2055.2471215743976,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103323336655Z.queries.parquet"
+ },
+ "en:best_t2+en": {
+  "index": "tune-en-20261023t103330012019z",
+  "query_type": "best_fields",
+  "fields": [
+   "title^2",
+   "description",
+   "body",
+   "title.en^2",
+   "description.en"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2235.6153761265405,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103406658805Z.queries.parquet"
+ },
+ "url:best_t2+url": {
+  "index": "tune-url-20261023t103417807340z",
+  "query_type": "best_fields",
+  "fields": [
+   "title^2",
+   "description",
+   "body",
+   "url.text"
+  ],
+  "docs": 54370,
+  "bytes_per_doc": 2165.493617803936,
+  "queries_file": "/private/tmp/claude-501/-Users-rex-ntu-------------------index-selection/984c8316-3083-4ffc-b6f3-51eba33aecab/scratchpad/textidx/tune/text_index/eval/20261023T103522555302Z.queries.parquet"
+ }
+}

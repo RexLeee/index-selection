@@ -1,0 +1,92 @@
+{
+ "ascii": {
+  "queries": 1433,
+  "zero_hit": 0.038,
+  "took_p50": 2.0,
+  "took_p95": 2.0
+ },
+ "han": {
+  "queries": 177,
+  "zero_hit": 0.011,
+  "took_p50": 1.0,
+  "took_p95": 2.0
+ },
+ "latin-ext": {
+  "queries": 131,
+  "zero_hit": 0.038,
+  "took_p50": 2.0,
+  "took_p95": 2.0
+ },
+ "kana": {
+  "queries": 106,
+  "zero_hit": 0.075,
+  "took_p50": 1.0,
+  "took_p95": 3.0
+ },
+ "devanagari": {
+  "queries": 38,
+  "zero_hit": 0.132,
+  "took_p50": 1.0,
+  "took_p95": 2.1499999999999986
+ },
+ "tamil": {
+  "queries": 20,
+  "zero_hit": 0.35,
+  "took_p50": 0.0,
+  "took_p95": 2.0
+ },
+ "telugu": {
+  "queries": 14,
+  "zero_hit": 0.714,
+  "took_p50": 0.0,
+  "took_p95": 1.3499999999999996
+ },
+ "malayalam": {
+  "queries": 10,
+  "zero_hit": 0.4,
+  "took_p50": 0.0,
+  "took_p95": 0.0
+ },
+ "kannada": {
+  "queries": 6,
+  "zero_hit": 0.5,
+  "took_p50": 0.0,
+  "took_p95": 0.75
+ },
+ "bengali": {
+  "queries": 4,
+  "zero_hit": 0.25,
+  "took_p50": 0.0,
+  "took_p95": 0.0
+ },
+ "gujarati": {
+  "queries": 3,
+  "zero_hit": 0.0,
+  "took_p50": 1.0,
+  "took_p95": 1.9
+ },
+ "arabic": {
+  "queries": 2,
+  "zero_hit": 0.0,
+  "took_p50": 1.5,
+  "took_p95": 1.95
+ },
+ "cyrillic": {
+  "queries": 2,
+  "zero_hit": 0.0,
+  "took_p50": 1.0,
+  "took_p95": 1.0
+ },
+ "greek": {
+  "queries": 1,
+  "zero_hit": 0.0,
+  "took_p50": 2.0,
+  "took_p95": 2.0
+ },
+ "thai": {
+  "queries": 1,
+  "zero_hit": 0.0,
+  "took_p50": 1.0,
+  "took_p95": 1.0
+ }
+}

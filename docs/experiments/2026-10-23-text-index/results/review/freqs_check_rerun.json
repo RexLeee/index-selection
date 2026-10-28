@@ -1,0 +1,37 @@
+{
+ "keywords": 1948,
+ "tie_at_cutoff": 452,
+ "query_type": "best_fields",
+ "fields": [
+  "title^2",
+  "description",
+  "body",
+  "url.text"
+ ],
+ "live": {
+  "index": "isel-text-20261023t104016870764z",
+  "docs": 54370,
+  "segment_bytes": 117708025,
+  "bytes_per_doc": 2164.9443627000182
+ },
+ "freqs": {
+  "same_top10_ids": 1948,
+  "same_top10_set": 1948,
+  "same_top10_scores": 1948,
+  "differ_examples": [],
+  "docs": 54370,
+  "segment_bytes": 58275925,
+  "bytes_per_doc": 1071.8397093985654,
+  "recovery_source_pruned": true
+ },
+ "rebuild": {
+  "same_top10_ids": 1948,
+  "same_top10_set": 1948,
+  "same_top10_scores": 1948,
+  "differ_examples": [],
+  "docs": 54370,
+  "segment_bytes": 117808828,
+  "bytes_per_doc": 2166.798381460364,
+  "recovery_source_pruned": true
+ }
+}
