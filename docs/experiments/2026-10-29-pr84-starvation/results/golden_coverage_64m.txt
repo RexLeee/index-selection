@@ -1,0 +1,19 @@
+Batch-20 golden coverage (official metric_rate: distinct canonical golden URLs found in the list),
+on the batch-20 live list (Host2 run=20261014T030855450365Z, 128,000,000 URLs, url and score only).
+Scripts: scripts/golden_cap.py (cap variants), scripts/host_counts.py (per-host counts of the chosen list).
+Keys: head 7,329, random 8,031 distinct canonical URLs of batch 20.
+
+128M (live list)               head 1814/7329 = 24.75%  random 1852/8031 = 23.06%
+64M, top by score              head 1736/7329 = 23.69%  random 1766/8031 = 21.99%
+  64,000,005 URLs (ties at the 64M score -5.278653) on 1,204,079 hostnames; www.espn.com 638,981 = 37.0 d at 0.2 qps
+
+64M with a per-hostname cap of R qps x 14 d; the freed places go to the next URLs by score:
+uncapped                     list 64,000,005 head 23.69% random 21.99% capped hosts 0 largest 638,981 = 37.0 d at 0.2 req/s
+R=0.2 req/s, cap 241,920     list 64,000,065 head 23.58% random 21.85% capped hosts 23 largest 247,195 = 14.3 d at 0.2 req/s
+R=0.3 req/s, cap 362,880     list 64,001,143 head 23.65% random 21.93% capped hosts 6 largest 375,904 = 14.5 d at 0.3 req/s
+R=0.4 req/s, cap 483,840     list 64,000,001 head 23.67% random 21.98% capped hosts 1 largest 483,950 = 14.0 d at 0.4 req/s
+(The script cuts a host at the score of its cap-th URL, so score ties keep a few more, e.g. 247,195;
+select_full cuts by row_number and keeps exactly the cap.)
+
+Chosen: R = 0.2 qps (recrawl.min_gap_s 5), cap 241,920 (full.max_host_days 14). It keeps every hostname's
+mean total at most u + 0.2 <= 0.51 req/s, against 0.307 for today's busiest big hostname.

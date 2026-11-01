@@ -1,0 +1,25 @@
+Round-5 local smoke, 2026-10-31, MacBook (M4), Python 3.12, Scrapy 2.19.0.
+One lane each: 60 s warm-up, 300 s of jobs; iselsim 1399a297c637 with HOST_DOCS_PER_JOB=240
+MAX_JOBS_INFLIGHT=32 MIN_GAP_S=4.8 STATUS_POLL_S=15 ARCHIVE_INTERVAL_S=15; interval 4.8 s;
+MOCK_LINKS=342 MOCK_TEXT_REPEAT=4560 MEDIAN_S=1.3. 32 jobs of 240 docs, one host each.
+
+== A3, WebCrawler 2436f4b
+A3: 4 min, interval 4.8 s, 32 recrawl hosts, 1502 gaps
+gap p1 1.61 p5 2.50 p50 4.91 s; shorter than 4.3 s: 209 (13.91%)
+busiest 60 s, recrawl only: 15; normal + recrawl: 51
+steady state (submit + 120 s to end, 183 s): 1199 recrawl requests, .204 per host per s
+
+== B3, WebCrawler 804632f
+B3: 4 min, interval 4.8 s, 32 recrawl hosts, 1205 gaps
+gap p1 5.18 p5 5.34 p50 5.77 s; shorter than 4.3 s: 1 (0.08%)
+busiest 60 s, recrawl only: 12; normal + recrawl: 47
+steady state (submit + 120 s to end, 183 s): 973 recrawl requests, .166 per host per s
+
+== C3, WebCrawler d61e4bf
+C3: 4 min, interval 4.8 s, 32 recrawl hosts, 1416 gaps
+gap p1 2.74 p5 3.83 p50 4.98 s; shorter than 4.3 s: 132 (9.32%)
+busiest 60 s, recrawl only: 13; normal + recrawl: 49
+steady state (submit + 120 s to end, 183 s): 1129 recrawl requests, .192 per host per s
+
+== B3: request.end log time - download_latency - mock web receive time, per recrawl request
+1345 p5 -0.00 p50 0.24 p95 0.56 mean 0.26

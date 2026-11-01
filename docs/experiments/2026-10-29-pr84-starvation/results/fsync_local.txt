@@ -1,0 +1,11 @@
+Cost of one manual result save (scripts/fsync_bench.py), 2026-10-29, this Mac only
+Apple M4, internal SSD (Apple Fabric), APFS, scratchpad on /System/Volumes/Data (94 % used)
+One save = 40 KB page + fsync; item JSON .tmp + fsync + rename; progress.json .tmp + fsync + rename
+
+saves 1000 mode fsync: p50 0.31 ms, p90 0.39 ms, p99 0.45 ms, mean 0.33 ms
+saves 1000 mode F_FULLFSYNC: p50 13.85 ms, p90 15.78 ms, p99 18.08 ms, mean 13.73 ms
+
+macOS fsync() does not flush the drive cache; F_FULLFSYNC does, as Linux fsync() does on
+most disks. Host2 /data (where results go) was not measured: the user asked that all
+verification run on this computer. At ~9.5 saves/s per process (50 % share, CPU-bound
+production estimate), F_FULLFSYNC-like cost blocks the reactor ~132 ms per second.

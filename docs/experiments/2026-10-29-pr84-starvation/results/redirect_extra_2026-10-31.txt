@@ -1,0 +1,137 @@
+Host2 Loki, 2026-10-29T20:00Z - 10-30T02:00Z, normal crawl, the 232 hostnames with >= 50k URLs in the
+capped 64M list (scripts/prod5_extra.py). extra = request.start - request.end - fail0, where fail0 is
+request.fail without a response and not a robots.txt refusal. A redirect or retry starts a request that
+never reaches response_received, so extra/URL is the requests RedirectMiddleware and RetryMiddleware add
+per finished URL. Normal URLs are raw outlinks; the 64M list holds post-redirect URLs (spider.parse stores
+canonicalize_url(response.url)), so these shares are an upper bound for recrawl. A redirect to another
+hostname also counts here, on the source hostname.
+
+extra/URL  host  finished  extra  fail0/URL  robots  URLs in 64M
+ 1.323 www.itatiaia.com.br                  3330    4405 0.000     25   74378
+ 0.728 www.oricon.co.jp                      622     453 0.002      0  102116
+ 0.710 weather.com                          3718    2640 0.000      1   68553
+ 0.664 www.rtl.fr                           1450     963 0.000   1247   77543
+ 0.651 www.hbomax.com                       3308    2152 0.000      0   57192
+ 0.562 www.nba.com                          1972    1109 0.002     50   88730
+ 0.502 www.ea.com                           3285    1648 0.001      0   72215
+ 0.378 www.cnnbrasil.com.br                 3588    1355 0.000     18  241920
+ 0.286 www.aljazeera.com                    4911    1404 0.000    109  124187
+ 0.282 www.abc.net.au                       4314    1215 0.003      0  120265
+ 0.254 www.tagesschau.de                    3865     981 0.000      0  118294
+ 0.246 www.eonline.com                      4082    1006 0.000      0   72094
+ 0.236 www.hollywoodreporter.com            3924     927 0.001      0  101150
+ 0.232 www.xbox.com                         4316    1000 0.000      0   66285
+ 0.215 en.pons.com                          3433     739 0.000      0  132118
+ 0.213 www.welt.de                          4976    1061 0.000      0   97904
+ 0.205 www.amazon.com                       3438     704 0.000      7  121438
+ 0.204 www.un.org                           2624     534 0.006      0   64345
+ 0.189 www.nytimes.com                      2388     452 0.000      1   72568
+ 0.170 www.billboard.com                    3653     622 0.001      1  156787
+ 0.162 www.gov.br                           3334     540 0.046     22   77792
+ 0.145 www.skysports.com                    4174     606 0.000      0  173095
+ 0.140 www.ndr.de                           4903     684 0.000      2   78865
+ 0.137 www.weatherbug.com                   4369     599 0.000   1277   57004
+ 0.114 www.lefigaro.fr                      3101     354 0.000      0   66546
+ 0.112 www.cbc.ca                           4184     469 0.000      0  153267
+ 0.111 globalnews.ca                        5253     584 0.000      0   63311
+ 0.111 note.com                             4038     448 0.000   1710   53234
+ 0.108 www.broadwayworld.com                4780     514 0.000      0   72326
+ 0.088 www.the-independent.com              4386     386 0.001     29  134100
+ 0.086 www.espn.com                         2586     222 0.064     13  241920
+ 0.082 www.cartacapital.com.br              5432     445 0.000      1   60090
+ 0.078 www.sportsmole.co.uk                 5332     415 0.000      6  129304
+ 0.076 www.justwatch.com                    4566     348 0.000      0   89184
+ 0.071 newsdig.tbs.co.jp                    3896     278 0.000      0  161104
+ 0.066 www.standard.co.uk                   4204     277 0.000      0   96546
+ 0.063 www.gov.uk                           5189     328 0.000     64  172803
+ 0.061 www.fifa.com                         1823     111 0.000      1   55002
+ 0.058 www.si.com                           4953     286 0.000      0   99801
+ 0.050 www.mlb.com                          5575     280 0.000      0  196953
+ 0.050 www.nikkansports.com                 4653     231 0.000      0  235893
+ 0.049 www.fotmob.com                       5527     270 0.000      0  241920
+ 0.049 www.thehindu.com                     4755     231 0.000     63   93471
+ 0.049 www.nbcsports.com                    5669     275 0.000      0  113911
+ 0.044 www.nfl.com                          3974     175 0.000      0  241920
+ 0.042 kids.kiddle.co                       4261     180 0.000      2  115123
+ 0.042 www.flashscore.com                   4249     177 0.000      0  241920
+ 0.040 www.flashscoreusa.com                5109     203 0.000      0  241920
+ 0.039 www.metropoles.com                   4518     175 0.000     58   93834
+ 0.038 www.fandango.com                     5685     214 0.000      5  139512
+ 0.036 www.forbes.com                       1099      40 0.000      0   71364
+ 0.036 www.livemint.com                     5696     207 0.000      8   82687
+ 0.036 www.rottentomatoes.com               5347     194 0.000      0  241920
+ 0.035 www.foxnews.com                      4221     149 0.000      0   68668
+ 0.035 www.goal.com                         5825     201 0.000      0  195570
+ 0.031 www.yardbarker.com                   4359     133 0.000      2   55297
+ 0.030 www.law.cornell.edu                  4403     134 0.000      0   53340
+ 0.029 www.theguardian.com                  5418     156 0.001      2  241920
+ 0.029 www.franceinfo.fr                    4328     124 0.000      0   97173
+ 0.027 variety.com                          4869     131 0.000      1  121157
+ 0.027 www.cmoney.tw                        4438     118 0.000      4  136817
+ 0.026 www.terra.com.br                     4211     110 0.000      0  123268
+ 0.025 www.actionnetwork.com                 634      16 0.000  11653   71648
+ 0.024 www.programme-tv.net                 5776     141 0.000    243   97218
+ 0.022 www.tiktok.com                       5036     110 0.000    166  222067
+ 0.021 www.cnbc.com                         3402      72 0.000      1  106613
+ 0.021 genius.com                           5162     107 0.000      0  129311
+ 0.021 www.bbc.co.uk                        5409     112 0.000      0  166935
+ 0.021 sportstar.thehindu.com                728      15 0.000      3   70191
+ 0.019 en.wikipedia.org                     2063      39 0.000      0  241920
+ 0.016 www.rtl.de                           5019      80 0.000      0   67931
+ 0.015 ameblo.jp                            6629     100 0.000      0  241920
+ 0.013 www.livescore.com                    6335      85 0.000      0  147766
+ 0.013 www.365scores.com                    6322      84 0.000      0  142003
+ 0.013 store.steampowered.com               5515      72 0.000      0  116818
+ 0.012 bolavip.com                          2661      33 0.000      6  103050
+ 0.012 www.moneycontrol.com                 3470      43 0.000    259   99723
+ 0.012 www.flashscore.co.za                 6071      74 0.000      0   57078
+ 0.011 www.flashscore.co.jp                 4359      50 0.000      0   61577
+ 0.011 www.gala.de                          5703      63 0.000      0   87756
+ 0.011 www.dw.com                           6333      68 0.000      0  177642
+ 0.008 www.bbc.com                          5734      47 0.000      0  241920
+ 0.008 www.jalan.net                        6009      48 0.000      0   58813
+ 0.008 www.cbsnews.com                      4509      36 0.000      0  147651
+ 0.007 www.morgenpost.de                     839       6 0.000      0   82166
+ 0.006 actu.fr                              5401      34 0.000      1   91110
+ 0.005 open.spotify.com                     5518      29 0.000      4  241920
+ 0.005 onefootball.com                      4414      23 0.000      0   96040
+ 0.005 www.gymglish.com                     5346      27 0.000      2   81253
+ 0.005 www.flashscore.fr                    4397      20 0.000      1  102756
+ 0.004 en.wiktionary.org                    6225      28 0.000      0  241920
+ 0.004 www.jansatta.com                     4914      21 0.000      0   98428
+ 0.003 www.cna.com.tw                       6613      23 0.000      0   84226
+ 0.003 www.youtube.com                      5384      18 0.000      0  241920
+ 0.003 www.20minutes.fr                     2469       8 0.000      0   94797
+ 0.003 www.larousse.fr                      4050      12 0.000      0  129874
+ 0.003 bleacherreport.com                   5429      16 0.000      6   74363
+ 0.003 www.hindustantimes.com               4893      14 0.000      2  105259
+ 0.002 fr.mappy.com                         5544      13 0.000      0   70598
+ 0.002 www.dazn.com                         4256       8 0.000      7   98244
+ 0.002 sportsdata.usatoday.com              4533       8 0.000      0   52914
+ 0.001 sports.ettoday.net                    682       1 0.000      0   99084
+ 0.001 www.vocabulary.com                   4947       7 0.000      0  124483
+ 0.001 www.nbcnews.com                      6041       8 0.000      3   63612
+ 0.001 www.n-tv.de                          5346       7 0.000      0   62068
+ 0.001 www.mirror.co.uk                     5211       6 0.000      0  127299
+ 0.001 game8.jp                             5377       6 0.000      0   63963
+ 0.001 www.statmuse.com                     5209       5 0.000      0  241920
+ 0.001 ctinews.com                          5396       5 0.000      0   62115
+ 0.001 thetv.jp                             5636       5 0.000      0   55838
+ 0.001 www.espn.com.au                      4663       4 0.000   1285  127240
+ 0.001 diamond.jp                           4923       4 0.000      0   91061
+ 0.001 ballotpedia.org                      2790       2 0.000      0  112859
+ 0.001 letterboxd.com                       2821       2 0.000    116   90092
+ 0.001 www.bhaskar.com                      4314       3 0.000      0   54247
+ 0.001 www.amarujala.com                    4745       3 0.000     10  135949
+ 0.000 en.langenscheidt.com                 5405       2 0.000      0  187566
+ 0.000 natalie.mu                           3675       1 0.000      0  181347
+ 0.000 pacificleague.com                    4684       1 0.000      0  241920
+ 0.000 www.asianetnews.com                  1736       0 0.000      0  136012
+ 0.000 www.foxsports.com                    6175       0 0.000      0  241920
+-0.000 www.dailyrecord.co.uk                6268      -1 0.000      0   93356
+-0.000 www.manchestereveningnews.co.uk      6026      -1 0.000      0  112156
+-0.000 www.wunderground.com                 5495      -2 0.000      0   69665
+-0.000 www.fantasypros.com                  6364      -3 0.000      0  191833
+-0.001 dictionary.cambridge.org             3262      -2 0.000      0  116914
+-0.001 www.vividseats.com                   4708      -3 0.000      0  241920
+-0.001 www.espn.co.uk                       3137      -3 0.000   2628  182593

@@ -1,0 +1,148 @@
+Host2 production facts, read-only, 2026-10-30 ~02:14-03:30Z. Scripts: scripts/prod3_*.py, route_demand.py.
+
+== Deployed code and settings
+/opt/WebCrawler HEAD 39e1363 (pulled 2026-10-29T17:24:12Z); crawler image rebuilt and started 17:29:58Z.
+api container on 127.0.0.1:4000; /data/manual_bulk_crawls empty (no jobs); GC removed 0 jobs every hour.
+MANUAL_BULK_CRAWL_SCHEDULING_POLICY: unset in the container -> settings.py default manual_first.
+Python 3.12.16, Scrapy 2.19.0, Twisted 26.4.0 (requirements.txt pins Scrapy>=2.13). Before the rebuild: 3.12.13, 2.16.0, 26.4.0.
+Throttle mode: AutoThrottle on all 16 processes. Source: /etc/supervisor/conf.d/supervisord.conf environment= per program,
+  /proc/<pid>/environ, and every process's crawler.config log line (throttle_mode=autothrottle). docker inspect shows
+  no CRAWLER_* env because supervisord sets it per program. domain_qps.json is read only in fixed mode.
+  processes 00-06, 08-15: CONCURRENT_REQUESTS 256, SCRAPER_SLOT_MAX_ACTIVE_SIZE 100M, 16 per domain, DOWNLOAD_DELAY 0.25,
+  AUTOTHROTTLE start 0.5, max 10.0, target 2.0
+  process 07 (crawler_canary_07, since cacfd29 2026-05-30): CONCURRENT_REQUESTS 384, SCRAPER_SLOT_MAX_ACTIVE_SIZE 150M
+CPU: all 16 scrapy processes at ~100 % (top, 10-30 02:19Z).
+
+== Throughput, request.end per minute (5 min means)
+2026-10-29T04:00Z 19663 | 10:00Z 19432 | 15:00Z 20696 | 17:20Z 18169
+2026-10-29T19:00Z 34094 | 22:00Z 33717 | 10-30T01:00Z 33847 | 02:15Z 33118
+request.fail per minute: ~1,650 before, ~3,900 after (robots.txt 1,212, 403 923, 404 790, 405 184, timeout 141 at 02:15Z)
+status share of request.end at 02:15Z: 200 91.7 %, 403 2.8 %, 404 2.4 %, 202 1.3 %, 405 0.6 %
+
+== Per process req/s / active_domains (10 min)
+worker  10-28T12:00  10-29T04:00  10-29T15:00  10-29T22:00  10-30T02:15   (req/s / active_domains)
+   0     25.0/  144   19.4/  144   24.4/  144   37.7/  144   39.7/  136
+   1     22.1/  144   22.0/  144   18.7/  144   29.7/  144   28.7/  143
+   2     20.3/  144   21.9/  144   22.7/  144   35.9/  144   33.9/  139
+   3     20.4/  144   18.2/  144   18.6/  144   26.7/  144   25.4/  144
+   4     24.0/  144   23.0/  144   20.8/  144   27.6/  144   27.4/  137
+   5     21.6/  144   24.5/  144   23.3/  144   33.4/  144   27.1/   88
+   6     22.0/  144   26.8/  144   22.6/  144   38.7/  142   34.2/  100
+   7      0.0/    1    0.0/    1    0.0/    1   32.6/  144   32.1/  110
+   8     24.3/  144   20.8/  144   20.1/  144   37.5/  144   33.6/  143
+   9     19.7/  144   19.1/  144   17.5/  144   33.8/  144   31.8/  142
+  10     24.1/  144   19.7/  144   23.6/  144   38.4/  144   36.7/  133
+  11     19.1/  144   21.8/  144   25.1/  144   38.0/  144   38.1/  125
+  12     17.3/  144   20.7/  144   20.5/  144   31.9/  144   28.8/  143
+  13     22.7/  144   28.1/  144   28.3/  144   42.4/  144   36.9/  122
+  14     25.8/  144   26.1/  144   25.6/  144   40.6/  144   40.4/  132
+  15     20.8/  144   24.1/  144   24.5/  144   37.1/  144   38.9/  140
+sum           329.2        336.2        336.3        561.9        533.7
+
+== Process 07 and 03, 6 h mean active_domains (07 idle 10-26 ~12Z until the 10-29 restart; all were down 10-26 12Z-10-28 ~06Z)
+2026-10-22T00:00 {'3': 144.0, '7': 143.6}
+2026-10-22T12:00 {'3': 144.0, '7': 143.6}
+2026-10-23T00:00 {'3': 143.9, '7': 140.8}
+2026-10-23T12:00 {'3': 143.7, '7': 142.4}
+2026-10-24T00:00 {'3': 144.0, '7': 142.1}
+2026-10-24T12:00 {'3': 144.0, '7': 141.7}
+2026-10-25T00:00 {'3': 143.5, '7': 143.9}
+2026-10-25T12:00 {'3': 143.9, '7': 142.3}
+2026-10-26T00:00 {'3': 139.7, '7': 141.7}
+2026-10-26T12:00 {'3': 19.8, '7': 1.0}
+2026-10-27T00:00 {'3': 1.0, '7': 1.0}
+2026-10-27T12:00 {'3': 1.0, '7': 1.0}
+2026-10-28T00:00 {'3': 1.0, '7': 1.0}
+2026-10-28T12:00 {'3': 102.3, '7': 1.0}
+2026-10-29T00:00 {'3': 144.0, '7': 1.0}
+2026-10-29T12:00 {'3': 144.0, '7': 1.0}
+2026-10-30T00:00 {'3': 143.8, '7': 135.6}
+
+== Download latency (median over processes of each process's quantile, 10 min)
+2026-10-29T15:00:00 p50 median-over-workers   3357 ms; p90 median-over-workers   6275 ms; p99 median-over-workers  11052 ms
+2026-10-30T02:00:00 p50 median-over-workers   2137 ms; p90 median-over-workers   4260 ms; p99 median-over-workers   6881 ms
+
+== Per (hostname, process) 60 s peaks, 5 min windows
+2026-10-29T14:00Z: max 23; hostnames at >= 12/min: 526, >= 24: 0; active hostnames/min 2,597
+2026-10-29T22:00Z: max 40; >= 12: 1,573, >= 24: 157, >= 36: 5, >= 48: 0; active 3,227
+2026-10-30T01:00Z: max 56; >= 12: 1,562, >= 24: 77, >= 36: 27, >= 48: 6; active 3,369
+2026-10-30T02:20Z: max 41; >= 12: 1,566, >= 24: 60, >= 36: 1; active 3,410
+
+== Big hostnames of the 64M list (batch 20), normal crawl only, 6 h windows
+64M hostnames with >= 50k URLs: 232; with normal traffic: pre 188, post 193
+hostname                           URLs |  u pre u post procs   top lat ms max60
+www.espn.com                    638,981 |  0.102  0.112     3   99%   1182    25
+www.youtube.com                 459,486 |  0.140  0.249    10   88%   1978    30
+pacificleague.com               398,879 |  0.141  0.217     1  100%   2129    26
+en.wiktionary.org               387,974 |  0.171  0.288     1  100%   1779    29
+open.spotify.com                378,231 |  0.174  0.255     4  100%   1610    26
+www.merriam-webster.com         372,322 |  0.000  0.000     0    0%      0     0
+www.foxsports.com               357,644 |  0.163  0.286     1  100%   1747    31
+en.wikipedia.org                331,727 |  0.140  0.096     4   97%   1908    25
+www.flashscore.com              329,785 |  0.145  0.197     1  100%   2724    19
+www.nfl.com                     322,094 |  0.133  0.184     1  100%   2246    23
+www.fotmob.com                  315,511 |  0.161  0.256     1  100%   2757    24
+zh.wikipedia.org                313,422 |  0.003  0.006     1  100%   3027    15
+www.cnnbrasil.com.br            299,919 |  0.101  0.166     1  100%   2142    28
+www.bbc.com                     295,082 |  0.166  0.265     2   99%   2101    26
+www.flashscoreusa.com           291,110 |  0.165  0.237     1  100%   2420    21
+www.rottentomatoes.com          282,224 |  0.172  0.248     1  100%   1526    31
+www.britannica.com              272,340 |  0.000  0.000     0    0%      0     0
+ameblo.jp                       266,460 |  0.173  0.307     1  100%   1568    33
+www.lance.com.br                260,480 |  0.014  0.000     0    0%      0     0
+www.theguardian.com             259,767 |  0.169  0.251     2  100%   1974    25
+sports.yahoo.com                243,175 |  0.023  0.013     1  100%   2034    15
+www.statmuse.com                236,255 |  0.170  0.241     1  100%   2144    24
+www.nikkansports.com            229,521 |  0.138  0.215     1  100%   1732    27
+www.vividseats.com              227,668 |  0.139  0.218     1  100%   1995    24
+www.tiktok.com                  214,634 |  0.000  0.233     2  100%   2084    36
+www.imdb.com                    213,677 |  0.000  0.000     0    0%      0     0
+www.tokyo-sports.co.jp          209,970 |  0.003  0.001     1  100%   4204     5
+www.mlb.com                     194,119 |  0.170  0.258     1  100%   1894    32
+www.fantasypros.com             190,806 |  0.191  0.295     1  100%   1814    36
+www.nhl.com                     189,570 |  0.000  0.000     0    0%      0     0
+pre (10-29 09-15Z): u p50 0.106 p90 0.171 max 0.208; 60 s peak per process p50 13 max 31; latency p50 3542 p90 5584 ms; on > 1 process 26/188
+post (10-29 20Z-10-30 02Z): u p50 0.170 p90 0.262 max 0.307; 60 s peak per process p50 21 max 61; latency p50 2190 p90 3691 ms; on > 1 process 31/193
+
+== Recrawl demand of the 64M list capped at 241,920 per hostname (0.2 qps x 14 d)
+recrawl demand over 14 d: 52.9 req/s, 3.31 per process on average
+  process 00:  3.25 req/s, 74,858 hostnames
+  process 01:  2.75 req/s, 77,212 hostnames
+  process 02:  3.96 req/s, 84,868 hostnames
+  process 03:  3.78 req/s, 69,599 hostnames
+  process 04:  2.86 req/s, 74,923 hostnames
+  process 05:  3.16 req/s, 83,551 hostnames
+  process 06:  3.19 req/s, 73,801 hostnames
+  process 07:  3.28 req/s, 93,183 hostnames
+  process 08:  3.74 req/s, 87,656 hostnames
+  process 09:  2.99 req/s, 66,065 hostnames
+  process 10:  3.22 req/s, 80,094 hostnames
+  process 11:  3.62 req/s, 72,455 hostnames
+  process 12:  3.07 req/s, 68,033 hostnames
+  process 13:  3.49 req/s, 70,380 hostnames
+  process 14:  3.07 req/s, 75,985 hostnames
+  process 15:  3.46 req/s, 72,991 hostnames
+capped hostnames: URLs, routed process, Loki top process, normal u, p50 latency, slot r, r - u
+  ameblo.jp                       241,920 02 02 0.307  1568 1.05 0.74
+  www.flashscoreusa.com           241,920 15 15 0.237  2420 0.68 0.44
+  pacificleague.com               241,920 03 03 0.217  2129 0.77 0.55
+  www.foxsports.com               241,920 08 08 0.286  1747 0.94 0.65
+  en.wikipedia.org                241,920 00 00 0.096  1908 0.86 0.76
+  www.espn.com                    241,920 10 10 0.112  1182 1.39 1.28
+  www.vividseats.com              241,920 03 03 0.218  1995 0.82 0.61
+  www.lance.com.br                241,920 02 (no normal traffic in the Loki window)
+  www.theguardian.com             241,920 11 11 0.251  1974 0.83 0.58
+  en.wiktionary.org               241,920 08 08 0.288  1779 0.92 0.63
+  open.spotify.com                241,920 15 15 0.255  1610 1.02 0.76
+  www.merriam-webster.com         241,920 06 (no normal traffic in the Loki window)
+  www.fotmob.com                  241,920 00 00 0.256  2757 0.60 0.34
+  www.statmuse.com                241,920 15 15 0.241  2144 0.77 0.52
+  sports.yahoo.com                241,920 14 14 0.013  2034 0.81 0.79
+  www.flashscore.com              241,920 12 12 0.197  2724 0.60 0.41
+  www.britannica.com              241,920 00 (no normal traffic in the Loki window)
+  www.bbc.com                     241,920 11 11 0.265  2101 0.78 0.52
+  www.nfl.com                     241,920 11 11 0.184  2246 0.73 0.55
+  www.rottentomatoes.com          241,920 13 13 0.248  1526 1.08 0.83
+  zh.wikipedia.org                241,920 00 00 0.006  3027 0.54 0.54
+  www.cnnbrasil.com.br            241,920 03 03 0.166  2142 0.77 0.60
+  www.youtube.com                 241,920 04 04 0.249  1978 0.83 0.58

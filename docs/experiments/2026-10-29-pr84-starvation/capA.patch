@@ -1,0 +1,26 @@
+--- a/containers/crawler/crawler/manual_bulk_crawls.py
++++ b/containers/crawler/crawler/manual_bulk_crawls.py
+@@ -1,4 +1,5 @@
+ """Feed bounded API work into the existing downloader and domain slots."""
++import math
+ from collections import deque
+ from collections.abc import Iterable
+ from dataclasses import dataclass, field
+@@ -39,6 +40,7 @@
+         settings = spider.crawler.settings
+         self.pending_dir = Path(settings["MANUAL_BULK_CRAWL_QUEUE_DIR"])
+         self.concurrency = settings.getint("CONCURRENT_REQUESTS", 64)
++        self.host_headroom = settings.getint("MANUAL_BULK_CRAWL_HOST_HEADROOM", 1)
+         self.max_active_jobs = (settings["MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS"]
+                                 if "MANUAL_BULK_CRAWL_MAX_ACTIVE_JOBS" in settings else 64)
+         if (isinstance(self.max_active_jobs, bool) or not isinstance(self.max_active_jobs, int)
+@@ -104,6 +106,9 @@
+                                   else settings.getfloat("DOWNLOAD_DELAY"))
+         # Inverse QPS: delay-bound or latency/concurrency-bound, whichever is slower.
+         seconds_per_url = max(delay, domain.latency / max(1, concurrency))
++        if delay > 0:
++            # A slot starts one request per delay; more outstanding requests only wait in it.
++            concurrency = min(concurrency, math.ceil(domain.latency / delay) + self.host_headroom)
+         return concurrency, seconds_per_url
+ 
+     def _refresh_priorities(self, hosts: Iterable[str] | None = None) -> None:

@@ -1,0 +1,8 @@
+Local smoke, 2026-11-01, M4: WebCrawler 498a195, TARGET 4.0, MOCK_429_EVERY 10, MOCK_REDIRECT_FRAC 0.05,
+the first 40 hosts of w03_sizes.txt, warm 30 s + 100 s, window = last 40 s (short: per-minute means are extrapolated).
+
+smoke6: 22 hosts with >= 20 manual requests
+  manual in flight, per-host max: p50 4 p90 5 max 5
+  normal + manual in flight, per-host mean: p50 2.15 p90 2.35 max 2.40
+  429 hosts: 4, manual per minute mean p50 51.8 max 64.5; busiest 60 s max 43
+  other manual hosts: 18, manual per minute mean p50 57.0 max 85.5; busiest 60 s max 57

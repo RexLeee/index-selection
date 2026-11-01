@@ -1,0 +1,15 @@
+Host2 crawler container, 2026-10-29 ~03:00 UTC, scripts/qshape.py (read-only; copied in, run, removed)
+Python 3.12.13, Scrapy 2.16.0, Twisted 26.4.0 (docker exec crawler python -c ...)
+
+/data/ipc/url_queue/crawler_00
+files_in_dir 180 sampled 180 keys {'generated_at': 180, 'domain_id': 180, 'urls': 180}
+urls/file mean 88.0 p50 100 p90 100 max 100
+hosts/file mean 1.66 max 20
+
+/data/ipc/url_queue/crawler_05
+files_in_dir 174 sampled 174 keys {'generated_at': 174, 'domain_id': 174, 'urls': 174}
+urls/file mean 85.4 p50 100 p90 100 max 100
+hosts/file mean 3.44 max 83
+
+Host2 top, two samples 3 s apart: 16 scrapy processes, mean 93.45 % CPU each.
+metricdb crawler_stat_total, 2026-10-21..25: fetch_total 28.1M-30.0M per day (~336 req/s).

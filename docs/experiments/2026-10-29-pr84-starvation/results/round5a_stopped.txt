@@ -1,0 +1,28 @@
+Round 5a, 2026-10-31, Host3: started 03:22Z, jobs from 03:37Z, stopped 03:46Z (about 8 min of jobs).
+Lanes as in scripts/main5.lanes of that time: A1-A5 on WebCrawler d61e4bf (one paced request per
+host outstanding), N3 = A3's settings on 2436f4b (paced, outstanding capped at ceil(latency / delay) + 1).
+Warm-up check (minutes 5-14): R0 36.9 req/s, A2-A5 and N3 36.8-37.2, all at 100 % CPU. A1 24.0:
+minutes 1-12 ran at 16-26 req/s while another user's cat ran on CPU 112, the sibling of A1's CPU 40;
+from minute 13 A1 ran at 34-38 req/s.
+
+Window: submit + 120 s to the last access-log line. Gaps: consecutive recrawl requests of one host at
+the mock web. Outstanding: heartbeat manual_outstanding, all hosts together.
+
+lane tree       jobs hosts  window s  recrawl/s  per host  gap p10/p50/p90 s  latency p50/p90 ms  outstanding p50
+A1   d61e4bf    16    32       433       3.84     0.120  5.5 / 8.0 / 11.6      3305 / 5272         32
+A2   d61e4bf    32    32       435       3.85     0.120  5.5 / 7.9 / 11.3      3230 / 5201         32
+A3   d61e4bf    32    32       434       3.79     0.119  5.6 / 8.1 / 11.6      3282 / 5390         32
+A4   d61e4bf    38    38       432       4.63     0.122  5.4 / 7.7 / 11.0      3335 / 5537         38
+A5   d61e4bf    48    96       433       8.84     0.092  7.0 / 9.7 / 13.5      3660 / 5284         96
+N3   2436f4b    32    32       432       5.69     0.178  2.7 / 5.2 / 8.5      3054 / 5180         49
+
+Reading:
+- d61e4bf: outstanding equals the number of hosts in jobs (32, 38, 96), so the cap of one held every
+  host. The next request waited for the previous save. At 100 % CPU, responses queue for the scraper
+  (engine_slot_inprogress 340-410 against 253-256 in flight), so a save came about 5 s after the
+  response (median gap 8 s minus latency p50 3.3 s). Median gap 7.7-8.1 s for an
+  interval of 4.8-5 s, so 0.12 requests/s per host.
+- N3 (2436f4b): about 1.5 outstanding per host, under its cap of 3. The rate is 0.178 against 1 / 4.8 =
+  0.208: hand-offs counted from the actual dispatch, and timers fired late on the busy reactor.
+- Fix (381c08d, round 5b): no cap of one; hand-offs on a fixed grid, so late timers do not lower the rate.
+- Raw data: 856 MB in the 2026-10-31 session's scratchpad (r5a/); on Host3 in /data/r14725023/r3/main5/.
