@@ -46,9 +46,11 @@ Findings
   more than 80 % of its rate.
 - Process 03 needs 3.78 req/s; B1 gives 7.64.
 - Per host, the 20 % is spread over the 32-60 hosts in jobs: about 8-12 manual requests a minute
-  per host (0.13-0.20 req/s), busiest 60 s 22-28. The burst of rounds 3-4 (a 120-doc batch at the
-  slot's rate, 68-81 a minute on Host2's espn estimate) does not appear while the share is full.
-  A host gets its slot's full rate only when few hosts have jobs.
+  per host on average (0.13-0.20 req/s). Bursts still go at the slot's rate: a big host's busiest
+  minute is 0.60-0.91 x its slot rate in B1 (mean 0.70; T4 0.65-1.01). The absolute 22-28 a minute
+  is small only because the simulated slots are slow (20-34 a minute). On Host2, www.espn.com's
+  slot is about 83 a minute, so its busiest recrawl minute would be about 50-75, against a
+  6-hour normal peak of 56 per host on 2026-10-30 (an estimate, not measured).
 - Cap: manual in flight per host stays at or below 3 (B1) and mostly 2 with headroom 0 (B2). The
   +1 is worth 9 % of recrawl (7.64 vs 6.99). T4 also peaks at 3: the share, not the cap, limits a
   host here, so the cap of 5 is not reached. The local smoke (40 hosts, 200 s, share not yet full)
